@@ -85,7 +85,7 @@ These are reported in the summary as blind spots where they occur.
 
 | Variable | Default | |
 |---|---|---|
-| `FENCEPOST_LOG` | stderr | append reports to this file |
+| `FENCEPOST_LOG` | stderr | append reports to this file; `%p` in the name becomes the process id |
 | `FENCEPOST_MAX_REPORTS` | 200 | detailed reports printed; the rest are counted |
 | `FENCEPOST_POSSIBLE` | 1 | 0 hides "possible" reports |
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |

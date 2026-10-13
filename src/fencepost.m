@@ -1643,7 +1643,7 @@ static void on_device(id dev)
     if (first) {
         fp_log("fencepost: watching Metal in pid %d (%s); reports go to %s\n", getpid(),
                [[NSProcessInfo processInfo] processName].UTF8String,
-               getenv("FENCEPOST_LOG") ? getenv("FENCEPOST_LOG") : "stderr");
+               g_out ? "FENCEPOST_LOG" : "stderr");
         g_last_summary = time(NULL);
         atexit(final_summary);
     }
@@ -1674,7 +1674,15 @@ INTERPOSE(fp_MTLCopyAllDevices, MTLCopyAllDevices);
 __attribute__((constructor)) static void fp_init(void)
 {
     const char *p = getenv("FENCEPOST_LOG");
-    if (p && *p) g_out = fopen(p, "a");
+    if (p && *p) {   /* %p in the name becomes the process id: one file per process */
+        char path[1024], *o = path;
+        for (; *p && o < path + sizeof path - 16; p++) {
+            if (p[0] == '%' && p[1] == 'p') { o += snprintf(o, 16, "%d", getpid()); p++; }
+            else *o++ = *p;
+        }
+        *o = 0;
+        g_out = fopen(path, "a");
+    }
     if ((p = getenv("FENCEPOST_MAX_REPORTS"))) g_max_reports = atol(p);
     if ((p = getenv("FENCEPOST_POSSIBLE"))) g_show_possible = atoi(p);
     if ((p = getenv("FENCEPOST_SUMMARY_SECS"))) g_summary_secs = atoi(p);
