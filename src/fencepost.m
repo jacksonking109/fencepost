@@ -1626,7 +1626,12 @@ static void hook_encoder(Class cls, int kind)
     else install(cls, kind, blit_hooks, N(blit_hooks));
 }
 
-static void final_summary(void) { summary(1); }
+static void final_summary(void)
+{
+    static atomic_int once;
+    if (atomic_exchange(&once, 1) || !g_st[ST_NODES]) return;   /* helper processes that never encoded: quiet */
+    summary(1);
+}
 
 static void on_device(id dev)
 {
