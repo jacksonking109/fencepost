@@ -17,6 +17,7 @@ static NSMutableArray *gates, *cbs;
 static int (*fp_stats)(long *, int);
 static void (*fp_flush)(void);
 static void (*fp_barrier)(id);
+static void (*fp_exempt)(id);
 static long base[4];
 enum { S_RACE = 0, S_POSS = 1, S_ORDER = 15, S_PARTIAL = 17 };   /* fencepost's counter indices */
 static int fails, total;
@@ -124,7 +125,8 @@ int main(void)
         fp_stats = (int (*)(long *, int))dlsym(RTLD_DEFAULT, "fencepost_stats");
         fp_flush = (void (*)(void))dlsym(RTLD_DEFAULT, "fencepost_flush");
         fp_barrier = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_barrier");
-        if (!fp_stats || !fp_flush || !fp_barrier) {
+        fp_exempt = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_exempt");
+        if (!fp_stats || !fp_flush || !fp_barrier || !fp_exempt) {
             fprintf(stderr, "fencepost is not loaded: run with DYLD_INSERT_LIBRARIES=out/libfencepost.dylib\n");
             return 2;
         }
@@ -264,6 +266,13 @@ int main(void)
         f = [dev newFence];
         a = newcb([dev newCommandQueue], 0); cuse(a, scratch, RD, nil, f); fp_barrier(a); ruse(a, scratch, VERT, f, FRAG); [a commit];
         check4("barrier, render after it waits only before fragment", 0, 0, 0, 1);
+
+        {   /* an exempt encoder (fencepost_exempt) is not required before a barrier */
+            id<MTLCommandBuffer> c = newcb([dev newCommandQueue], 0);
+            id<MTLBlitCommandEncoder> e = [c blitCommandEncoder]; fp_exempt(e); [e endEncoding];
+            fp_barrier(c); cuse(c, scratch, RD, nil, nil); [c commit];
+            check4("barrier after an exempt encoder, nothing waited for", 0, 0, 0, 0);
+        }
 
         t = tex(1, 1); f = [dev newFence];
         { id<MTLCommandQueue> qb = [dev newCommandQueue];

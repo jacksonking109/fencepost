@@ -83,7 +83,7 @@ typedef struct fp_node {
     uint64_t cb_uid, commit_tick, done_tick, pend_since;
     int kind, state, idx;           /* state: 1 encoding, 2 ended, 3 committed, 4 analysed */
     void *enc;
-    uint8_t uncertain;
+    uint8_t uncertain, exempt;
     int att[10];                    /* acc index of colour 0-7, depth, stencil attachments */
     char label[64];
     fp_acc *acc;     int nacc, cacc;
@@ -117,7 +117,7 @@ typedef struct fp_queue {
 } fp_queue;
 
 typedef struct { fp_acc a; uint64_t uid, aseq; } fp_ent;
-typedef struct { void *key; fp_ent *e; int n, cap; } fp_obj;
+typedef struct { void *key; fp_ent *w; int nw, cw; fp_ent *r; int nr, cr; } fp_obj;   /* writes (incl. may-write) and pure reads */
 typedef struct { void *ev; int known, gpu; uint64_t cpu_max; struct { uint64_t val, uid; } h[FP_EVHIST]; unsigned nh; } fp_ev;
 
 #define PUSH(arr, n, cap, val) do { if ((n) == (cap)) { (cap) = (cap) ? (cap) * 2 : 8; \
@@ -138,7 +138,7 @@ static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
 static long g_st[ST_COUNT];
 static FILE *g_out;
 static long g_max_reports = 200, g_printed;
-static int g_show_possible = 1, g_summary_secs = 10, g_started;
+static int g_show_possible = 1, g_summary_secs = 10, g_started, g_bind_maywrite;
 static time_t g_last_summary;
 static long g_last_summary_hits = -1;
 
@@ -187,7 +187,7 @@ static fp_node *node_new(int kind)   /* lock held */
     fp_node *n = &g_pool[uid % FP_POOL];
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
-    n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->label[0] = 0;
+    n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
     for (int i = 0; i < 10; i++) n->att[i] = -1;
@@ -259,7 +259,7 @@ static fp_obj *obj_get(void *key)   /* lock held */
     for (unsigned i = 0; i < FP_OBJMAP; i++) {
         fp_obj *o = &g_obj[(h + i) & (FP_OBJMAP - 1)];
         if (o->key == key) return o;
-        if (!o->key) { o->key = key; o->n = 0; return o; }
+        if (!o->key) { o->key = key; o->nw = o->nr = 0; return o; }
     }
     return NULL;
 }
@@ -457,38 +457,58 @@ static int ordered(const fp_ent *e, fp_node *x, const fp_node *y, int sf)
     return bit_test(&y->anc[sf], 2 * d + e->a.sl);
 }
 
-static void check_access(fp_node *y, const fp_acc *a)
+static int same_range(const fp_acc *a, const fp_acc *b)
 {
-    fp_obj *o = obj_get(a->store);
-    int i, j, merged = 0;
-    if (!o) return;
-    for (i = 0, j = 0; i < o->n; i++) {
-        fp_ent *e = &o->e[i];
+    return a->a0 == b->a0 && a->a1 == b->a1 && a->s0 == b->s0 && a->s1 == b->s1;
+}
+
+/* Check a against one shadow list, dropping entries that no longer matter (gone, retired,
+ * out of the window, or superseded by an ordered write that covers them). */
+static void scan(fp_ent *list, int *n, fp_node *y, const fp_acc *a, int *merged)
+{
+    int i, j;
+    for (i = 0, j = 0; i < *n; i++) {
+        fp_ent *e = &list[i];
         fp_node *x = node_get(e->uid);
         int keep = 1;
         if (!x || (x->done_tick && x->done_tick < y->commit_tick) || y->aseq - e->aseq >= FP_W) keep = 0;
         else if (overlap(&e->a, a)) {
             if (e->uid == y->uid) {
-                if (e->a.a0 == a->a0 && e->a.a1 == a->a1 && e->a.s0 == a->s0 && e->a.s1 == a->s1) {
+                if (merged && same_range(&e->a, a)) {
                     e->a.rw |= a->rw;
                     if (a->sl > e->a.sl) e->a.sl = a->sl;
-                    merged = 1;
+                    *merged = 1;
                 }
             } else if ((e->a.rw | a->rw) & (FP_WR | FP_MAYBE)) {
                 if (!ordered(e, x, y, a->sf)) report(x, &e->a, y, a);
                 else if ((a->rw & FP_WR) && covers(a, &e->a)) keep = 0;   /* superseded by an ordered write */
             }
         }
-        if (keep) o->e[j++] = *e;
+        if (keep) list[j++] = *e;
     }
-    o->n = j;
+    *n = j;
+}
+
+/* A read is checked against earlier writes only; a write against reads and writes. Most
+ * accesses are reads, so they never walk the (long) list of earlier reads. */
+static void check_access(fp_node *y, const fp_acc *a)
+{
+    fp_obj *o = obj_get(a->store);
+    int merged = 0;
+    if (!o) return;
+    int writes = a->rw & (FP_WR | FP_MAYBE);
+    scan(o->w, &o->nw, y, a, writes ? &merged : NULL);
+    if (writes) scan(o->r, &o->nr, y, a, NULL);
+    else if (o->nr && o->r[o->nr - 1].uid == y->uid && same_range(&o->r[o->nr - 1].a, a)) merged = 1;
     if (merged) return;
-    if (o->n >= FP_ENTCAP) {
-        memmove(o->e, o->e + FP_ENTCAP / 2, (size_t)(o->n - FP_ENTCAP / 2) * sizeof *o->e);
-        o->n -= FP_ENTCAP / 2;
+    fp_ent **list = writes ? &o->w : &o->r;
+    int *n = writes ? &o->nw : &o->nr, *cap = writes ? &o->cw : &o->cr;
+    if (*n >= FP_ENTCAP) {
+        memmove(*list, *list + FP_ENTCAP / 2, (size_t)(*n - FP_ENTCAP / 2) * sizeof **list);
+        *n -= FP_ENTCAP / 2;
     }
     fp_ent ne = { *a, y->uid, y->aseq };
-    PUSH(o->e, o->n, o->cap, ne);
+    PUSH(*list, *n, *cap, ne);
 }
 
 /* A barrier the program declared (fencepost_barrier): every node of the queue submitted
@@ -503,7 +523,7 @@ static void check_barrier(fp_node *y)
     long nbad = 0;
     for (uint64_t k = hi; k-- > lo;) {
         fp_node *x = node_get(q->recent[k % FP_QRECENT]);
-        if (!x || x == y || x->kind == FPK_SIGNAL || !x->aseq || x->aseq >= y->aseq) continue;
+        if (!x || x == y || x->kind == FPK_SIGNAL || x->exempt || !x->aseq || x->aseq >= y->aseq) continue;
         if (x->done_tick && x->done_tick < y->commit_tick) continue;
         uint64_t d = y->aseq - x->aseq;
         if (d >= FP_W) continue;
@@ -750,7 +770,7 @@ static fp_node *cur_node(id enc)
 
 static void push_acc(fp_node *n, const fp_acc *a)
 {
-    for (int i = n->nacc - 1; i >= 0 && i >= n->nacc - 8; i--) {
+    for (int i = n->nacc - 1; i >= 0 && i >= n->nacc - 32; i--) {
         fp_acc *p = &n->acc[i];
         if (p->store == a->store && p->a0 == a->a0 && p->a1 == a->a1 && p->s0 == a->s0 && p->s1 == a->s1 && p->via == a->via) {
             p->rw |= a->rw;
@@ -1374,20 +1394,22 @@ static void h_r_ssa(id self, SEL _cmd, MTLStoreAction sa)
     if (OUTER) store_action(self, 9, sa);
 }
 
-/* compute bindings: a texture or buffer bound directly may be written by the kernel; we
- * cannot tell without the pipeline's reflection, so writable ones are "may write" */
+/* compute bindings: reads. A kernel may write a texture or buffer bound directly, which we
+ * cannot tell without the pipeline's reflection; translation layers bind argument buffers
+ * this way and declare writes with useResource. FENCEPOST_BIND_MAYWRITE=1 makes writable
+ * bindings "may write" (for programs that write through direct bindings). */
 static void cbind_tex(id self, id t)
 {
     fp_node *n = cur_node(self);
     if (!n || !t) return;
     id<MTLTexture> tt = t;
-    int rw = (tt.usage & MTLTextureUsageShaderWrite) ? (FP_RD | FP_MAYBE) : FP_RD;
+    int rw = (g_bind_maywrite && (tt.usage & MTLTextureUsageShaderWrite)) ? (FP_RD | FP_MAYBE) : FP_RD;
     acc_tex(n, tt, 0, tt.mipmapLevelCount, 0, tex_slices(tt), rw, 0, 1, VIA_BIND);
 }
 static void cbind_buf(id self, id b, NSUInteger off)
 {
     fp_node *n = cur_node(self);
-    if (n && b) acc_buf(n, b, off, UINT64_MAX, FP_RD | FP_MAYBE, 0, 1, VIA_BIND);
+    if (n && b) acc_buf(n, b, off, UINT64_MAX, g_bind_maywrite ? (FP_RD | FP_MAYBE) : FP_RD, 0, 1, VIA_BIND);
 }
 static void h_c_tex(id self, SEL _cmd, id t, NSUInteger i)
 {
@@ -1686,6 +1708,7 @@ __attribute__((constructor)) static void fp_init(void)
     if ((p = getenv("FENCEPOST_MAX_REPORTS"))) g_max_reports = atol(p);
     if ((p = getenv("FENCEPOST_POSSIBLE"))) g_show_possible = atoi(p);
     if ((p = getenv("FENCEPOST_SUMMARY_SECS"))) g_summary_secs = atoi(p);
+    if ((p = getenv("FENCEPOST_BIND_MAYWRITE"))) g_bind_maywrite = atoi(p);
 }
 
 /* For tests and tools: dlsym these. out[] gets ST_COUNT counters (see the enum). */
@@ -1706,6 +1729,16 @@ __attribute__((visibility("default"))) void fencepost_barrier(id cb)
     fp_cb *c = cb_find_open((void *)cb);
     if (c) { fp_item it = { 3, 0, NULL, (uint64_t)c->nenc }; PUSH(c->it, c->nit, c->cit, it); }
     pthread_mutex_unlock(&g_lock);
+}
+
+/* Leave an encoder out of declared-barrier checks as an earlier encoder: the runtime
+ * orders it by other means, e.g. it touches only tracked resources it names itself
+ * (a present blit), which Metal orders against every later encoder naming them. Call it
+ * while the encoder is open. Its resource accesses are still checked. */
+__attribute__((visibility("default"))) void fencepost_exempt(id encoder)
+{
+    fp_node *n = cur_node(encoder);
+    if (n) n->exempt = 1;
 }
 
 /* Analyse everything committed so far, settling event waits that are still open. */
