@@ -90,7 +90,10 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_POSSIBLE` | 1 | 0 hides "possible" reports |
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
 
-Each distinct race is printed once and counted after that. macOS strips `DYLD_*` variables when a system binary (`/bin/sh`,
+Each distinct race is printed once and counted after that.
+
+macOS only injects into programs without the hardened runtime (or with the `com.apple.security.cs.allow-dyld-environment-variables`
+entitlement): your own builds, command-line tools and Wine, not most notarised or App Store apps. It also strips `DYLD_*` variables when a system binary (`/bin/sh`,
 `/usr/bin/time`, `arch`) starts the program; use `arch -e DYLD_INSERT_LIBRARIES=...` or export the variable inside the
 script that starts the program.
 
@@ -128,7 +131,7 @@ races or barrier violations fencepost must report. Examples:
 - a fence that must be resolved in enqueue order, not commit order;
 - mip levels written and read through views.
 
-## Results so far (wine-lab, 2026-10-13)
+## Results so far
 
 - **Our D3D12 runtime, 14 test programs:** 5,300 declared barriers checked, 0 reports, the same check results with and
   without fencepost.
@@ -145,3 +148,5 @@ races or barrier violations fencepost must report. Examples:
 ## Licence
 
 MIT, see [LICENSE](LICENSE).
+
+Written with AI assistance (Claude); the commits say so too.
