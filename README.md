@@ -140,11 +140,11 @@ races or barrier violations fencepost must report. Examples:
   encoders, "waits: nothing"). `d3d12-m2` shows a blit-to-render read-after-write race that the fix removes. The bug
   took a night of frame captures to find in the game; here it shows in a 0.3-second test run.
 - **DXMT (D3D11) cube demo:** 1,127 encoders and 2,787 resource accesses checked, 0 reports.
-- **Rise of the Tomb Raider benchmark, full run under fencepost (2026-10-15):**
-  - DX11 (DXMT): 489,523 encoders and 36.5 million resource accesses checked, 0 reports. 53.63 fps, against ~53.9
-    without fencepost; 6.3 s of analysis over the whole run.
-  - DX12 (our runtime): 759,000 declared barriers checked, 0 reports. ~48 fps, the same as without.
 
+
+## Human Input
+This was originally made in my testing suite for porting madeira over to macos as I do like their d3d12 implementation.  Ran into a few snags of course and in turn this tool plus some others help me get past those while picking up significant performance gains along the way.  Thought it would help the vibecoders out a little bit.
+  
 ## Licence
 
 MIT, see [LICENSE](LICENSE).
