@@ -294,6 +294,17 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n)
     return h;
 }
 
+/* Labels often carry a running count ("R#15 clear"): leave out "#<digits>" so every
+ * instance of the same pass groups into one report. */
+static uint64_t fnv_label(uint64_t h, const char *l)
+{
+    for (; *l; l++) {
+        if (l[0] == '#' && l[1] >= '0' && l[1] <= '9') { while (l[1] >= '0' && l[1] <= '9') l++; continue; }
+        h ^= (unsigned char)*l; h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
 static int sig_seen(uint64_t s)   /* lock held; returns 1 if already reported */
 {
     if (!s) s = 1;
@@ -374,8 +385,8 @@ static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
     h = fnv(h, &certain, sizeof certain);
     h = fnv(h, what, strlen(what));
     h = fnv(h, &ya->store, sizeof ya->store);
-    h = fnv(h, &f->kind, sizeof f->kind); h = fnv(h, &fa->via, 1); h = fnv(h, f->label, strlen(f->label));
-    h = fnv(h, &s->kind, sizeof s->kind); h = fnv(h, &sa->via, 1); h = fnv(h, s->label, strlen(s->label));
+    h = fnv(h, &f->kind, sizeof f->kind); h = fnv(h, &fa->via, 1); h = fnv_label(h, f->label);
+    h = fnv(h, &s->kind, sizeof s->kind); h = fnv(h, &sa->via, 1); h = fnv_label(h, s->label);
     g_st[certain ? ST_RACE_HITS : ST_POSS_HITS]++;
     if (sig_seen(h)) return;
     g_st[certain ? ST_RACE_UNIQ : ST_POSS_UNIQ]++;
@@ -584,8 +595,8 @@ static void check_barrier(fp_node *y)
     fp_node *x = bad ? bad : part;
     if (!x) return;
     uint64_t h = 0x84222325cbf29ce4ull;
-    h = fnv(h, &y->kind, sizeof y->kind); h = fnv(h, y->label, strlen(y->label));
-    h = fnv(h, &x->kind, sizeof x->kind); h = fnv(h, x->label, strlen(x->label));
+    h = fnv(h, &y->kind, sizeof y->kind); h = fnv_label(h, y->label);
+    h = fnv(h, &x->kind, sizeof x->kind); h = fnv_label(h, x->label);
     h ^= bad ? 0x5bd1e995ull : 0;
     g_st[bad ? ST_ORDER_HITS : ST_PARTIAL_HITS]++;
     if (sig_seen(h)) return;
