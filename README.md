@@ -94,6 +94,20 @@ Each distinct race is printed once and counted after that. macOS strips `DYLD_*`
 `/usr/bin/time`, `arch`) starts the program; use `arch -e DYLD_INSERT_LIBRARIES=...` or export the variable inside the
 script that starts the program.
 
+## Download
+
+Prebuilt (universal: Apple Silicon and x86_64/Rosetta, macOS 13+) on the
+[Releases](https://github.com/jacksonking109/fencepost/releases) page. A browser marks downloads as quarantined and
+macOS then refuses to load the library ("library load disallowed by system policy"); clear the mark after extracting:
+
+```
+tar -xzf fencepost-0.1.0-macos.tar.gz
+xattr -dr com.apple.quarantine fencepost-0.1.0-macos
+DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.1.0-macos/libfencepost.dylib  your-metal-program
+```
+
+The library is signed ad hoc, not by an Apple developer ID; building it yourself (below) takes seconds.
+
 ## Build and test
 
 Needs macOS 13 or later and Apple's command-line tools (`xcode-select --install`; full Xcode is not required).
@@ -101,6 +115,7 @@ Needs macOS 13 or later and Apple's command-line tools (`xcode-select --install`
 ```
 git clone https://github.com/jacksonking109/fencepost && cd fencepost
 ./build.sh                                                   # universal arm64 + x86_64, signed ad hoc
+./build.sh release 0.1.0                                     # also a release archive, without debug information
 DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
 arch -x86_64 -e DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest   # the Rosetta slice
 ```
