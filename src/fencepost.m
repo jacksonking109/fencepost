@@ -41,7 +41,10 @@
 #define FP_OPENENC      256
 #define FP_QRECENT      1024
 #define FP_MAXQ         32
-#define FP_OBJMAP       (1 << 16)
+#define FP_OBJBITS      18
+#define FP_OBJMAP       (1 << FP_OBJBITS)
+#define FP_OBJPROBE     4096            /* give up a lookup after this many slots */
+#define FP_SWEEP        2048            /* shadow slots cleaned per commit */
 #define FP_FENCEMAP     8192
 #define FP_EVMAP        2048
 #define FP_EVHIST       64
@@ -61,7 +64,8 @@ static const char *const via_name[] = { "attachment load", "attachment", "MSAA r
 
 enum { ST_RACE_UNIQ, ST_POSS_UNIQ, ST_RACE_HITS, ST_POSS_HITS, ST_NODES, ST_ACCESSES, ST_CBS,
        ST_HEAP_USES, ST_PARALLEL, ST_TRACKED, ST_TIMEOUTS, ST_UNCERTAIN, ST_WINDOW, ST_LOST,
-       ST_ORDER_UNIQ, ST_ORDER_HITS, ST_PARTIAL_UNIQ, ST_PARTIAL_HITS, ST_BARRIERS, ST_COUNT };
+       ST_ORDER_UNIQ, ST_ORDER_HITS, ST_PARTIAL_UNIQ, ST_PARTIAL_HITS, ST_BARRIERS,
+       ST_OBJS, ST_OBJ_DROPS, ST_ANALYSIS_NS, ST_COUNT };
 
 typedef struct { uint64_t w[FP_WORDS]; } fp_bits;
 
@@ -255,13 +259,30 @@ static int fence_slot(void *f, int create)   /* lock held */
 
 static fp_obj *obj_get(void *key)   /* lock held */
 {
-    unsigned h = ptr_hash(key, 16);
-    for (unsigned i = 0; i < FP_OBJMAP; i++) {
+    unsigned h = ptr_hash(key, FP_OBJBITS);
+    for (unsigned i = 0; i < FP_OBJPROBE; i++) {
         fp_obj *o = &g_obj[(h + i) & (FP_OBJMAP - 1)];
         if (o->key == key) return o;
-        if (!o->key) { o->key = key; o->nw = o->nr = 0; return o; }
+        if (!o->key) { o->key = key; o->nw = o->nr = 0; g_st[ST_OBJS]++; return o; }
     }
+    g_st[ST_OBJ_DROPS]++;
     return NULL;
+}
+
+/* Remove slot i (linear probing: later entries of its run move back so lookups still find them). */
+static void obj_del(unsigned i)
+{
+    free(g_obj[i].w); free(g_obj[i].r);
+    memset(&g_obj[i], 0, sizeof g_obj[i]);
+    g_st[ST_OBJS]--;
+    for (unsigned j = (i + 1) & (FP_OBJMAP - 1); g_obj[j].key; j = (j + 1) & (FP_OBJMAP - 1)) {
+        unsigned k = ptr_hash(g_obj[j].key, FP_OBJBITS);
+        int stays = i <= j ? (k > i && k <= j) : (k > i || k <= j);
+        if (stays) continue;
+        g_obj[i] = g_obj[j];
+        memset(&g_obj[j], 0, sizeof g_obj[j]);
+        i = j;
+    }
 }
 
 /* ---------------------------------------------------------------- reporting */
@@ -425,6 +446,8 @@ static void summary(int final)
                g_st[ST_PARTIAL_UNIQ], g_st[ST_PARTIAL_HITS]);
     if (g_st[ST_TRACKED])
         fp_log("fencepost:   %ld uses of tracked resources skipped (Metal orders those itself)\n", g_st[ST_TRACKED]);
+    fp_log("fencepost:   cost: %.2f s analysing at commit; %ld resources with live history%s\n",
+           g_st[ST_ANALYSIS_NS] / 1e9, g_st[ST_OBJS], g_st[ST_OBJ_DROPS] ? " (TABLE FULL: some accesses not checked)" : "");
     if (g_st[ST_HEAP_USES] || g_st[ST_PARALLEL] || g_st[ST_TIMEOUTS] || g_st[ST_UNCERTAIN] || g_st[ST_WINDOW] || g_st[ST_LOST])
         fp_log("fencepost:   blind spots: %ld useHeap calls (resources inside heaps not seen), %ld parallel render "
                "encoders (not followed), %ld event waits timed out, %ld nodes with unresolved event waits, "
@@ -509,6 +532,32 @@ static void check_access(fp_node *y, const fp_acc *a)
     }
     fp_ent ne = { *a, y->uid, y->aseq };
     PUSH(*list, *n, *cap, ne);
+}
+
+/* Forget history that can no longer race: entries of encoders that are gone, finished
+ * (any later commit is ordered after them) or out of the window. A resource left with no
+ * history leaves the table, so resources that come and go (streamed textures, transient
+ * buffers) do not fill it. A slice per commit. */
+static unsigned g_sweep;
+static int stale(const fp_ent *e)
+{
+    fp_node *x = node_get(e->uid);
+    return !x || (x->done_tick && x->done_tick < g_tick) || g_aseq - e->aseq >= FP_W;
+}
+static void sweep(void)   /* lock held */
+{
+    for (unsigned n = 0; n < FP_SWEEP; n++) {
+        unsigned i = g_sweep++ & (FP_OBJMAP - 1);
+        fp_obj *o = &g_obj[i];
+        if (!o->key) continue;
+        int j = 0;
+        for (int k = 0; k < o->nw; k++) if (!stale(&o->w[k])) o->w[j++] = o->w[k];
+        o->nw = j;
+        j = 0;
+        for (int k = 0; k < o->nr; k++) if (!stale(&o->r[k])) o->r[j++] = o->r[k];
+        o->nr = j;
+        if (!o->nw && !o->nr) { obj_del(i); g_sweep--; }   /* a later entry may have moved into i */
+    }
 }
 
 /* A barrier the program declared (fencepost_barrier): every node of the queue submitted
@@ -1160,8 +1209,11 @@ static void h_cb_commit(id self, SEL _cmd)
             c->state = 2;
             c->commit_tick = ++g_tick;
             if (!c->enq) c->enq = ++c->q->enq_assign;
+            uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             queue_submit(c->q, c);
             process_pending(0);
+            sweep();
+            g_st[ST_ANALYSIS_NS] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
         }
         pthread_mutex_unlock(&g_lock);
         if (uid) {
