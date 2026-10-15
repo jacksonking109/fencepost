@@ -123,8 +123,7 @@ races or barrier violations fencepost must report. Examples:
   - DX11 (DXMT): 489,523 encoders and 36.5 million resource accesses checked, 0 reports. 53.63 fps, against ~53.9
     without fencepost; 6.3 s of analysis over the whole run.
   - DX12 (our runtime): 759,000 declared barriers checked, 0 reports. ~48 fps, the same as without.
-- **What the games taught fencepost:**
-  - A present blit outside the fence chain is fine, because Metal tracks both of its textures: `fencepost_exempt`.
-  - Directly bound compute buffers are argument buffers in translation layers: they count as reads.
-  - A resource table that never forgets fills up in a streaming scene (29 fps, 0.5 fps minimums); it now cleans
-    itself as it goes.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).
