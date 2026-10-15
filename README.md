@@ -119,3 +119,12 @@ races or barrier violations fencepost must report. Examples:
   encoders, "waits: nothing"). `d3d12-m2` shows a blit-to-render read-after-write race that the fix removes. The bug
   took a night of frame captures to find in the game; here it shows in a 0.3-second test run.
 - **DXMT (D3D11) cube demo:** 1,127 encoders and 2,787 resource accesses checked, 0 reports.
+- **Rise of the Tomb Raider benchmark, full run under fencepost (2026-10-15):**
+  - DX11 (DXMT): 489,523 encoders and 36.5 million resource accesses checked, 0 reports. 53.63 fps, against ~53.9
+    without fencepost; 6.3 s of analysis over the whole run.
+  - DX12 (our runtime): 759,000 declared barriers checked, 0 reports. ~48 fps, the same as without.
+- **What the games taught fencepost:**
+  - A present blit outside the fence chain is fine, because Metal tracks both of its textures: `fencepost_exempt`.
+  - Directly bound compute buffers are argument buffers in translation layers: they count as reads.
+  - A resource table that never forgets fills up in a streaming scene (29 fps, 0.5 fps minimums); it now cleans
+    itself as it goes.
