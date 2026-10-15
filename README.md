@@ -96,7 +96,10 @@ script that starts the program.
 
 ## Build and test
 
+Needs macOS 13 or later and Apple's command-line tools (`xcode-select --install`; full Xcode is not required).
+
 ```
+git clone https://github.com/jacksonking109/fencepost && cd fencepost
 ./build.sh                                                   # universal arm64 + x86_64, signed ad hoc
 DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
 arch -x86_64 -e DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest   # the Rosetta slice
