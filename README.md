@@ -53,6 +53,31 @@ Every encoder submitted to that queue before the call must then be ordered befor
 checks the encoded fences and events against that, resource by resource or not at all. A render encoder that waits
 only before its fragment stage is reported separately: its vertex stage can still overlap.
 
+An encoder the runtime orders by other means (a present blit that touches only tracked resources, say) can be left out
+of these checks as an earlier encoder with `fencepost_exempt(encoder)`, called while it is open. Its resource accesses
+are still checked.
+
+**How parallel each frame is.** Too much synchronisation costs as well: encoders chained one after another leave the
+GPU nothing to overlap. For every frame (a `presentDrawable`), fencepost counts the encoders and the longest chain of
+them the encoded fences and events force to run in order, and prints the medians with the running summary:
+
+```
+fencepost:   frames: 833; median of the last 833: 4 encoders, longest ordered chain 2 (parallelism 2.00); the GPU had run out of work at 1.3 commits per frame
+```
+
+Parallelism 1.00 means every encoder waits for the one before it. "Run out of work" counts commits made when every
+earlier command buffer had already completed: the GPU sat idle, waiting for the CPU (or for vsync). `FENCEPOST_CHAIN=N`
+lists frame N's chain, with runs of the same pass folded (labels compared without `#<number>`):
+
+```
+fencepost: CHAIN frame 300: 4 encoders; the longest chain the synchronisation forces to run one after another has 2 (parallelism 2.00)
+  1           render  "R#301 MainVS|MainPS 640x480"
+  2           blit    "B f6 join"
+```
+
+A program that does not present, or wants its own frame boundaries, calls `fencepost_frame(commandBuffer)` (found with
+`dlsym` like `fencepost_barrier`); from its first call, presents no longer end frames.
+
 ## How it works
 
 - **Nodes:** every encoder is one. A render encoder has two stages, vertex and fragment.
@@ -74,12 +99,17 @@ These are reported in the summary as blind spots where they occur.
   the ordering, not the data.
 - **`useHeap`:** the resources inside a heap are not seen. Aliasing between resources placed in the same heap memory
   is not modelled.
-- **Direct compute bindings and read+write `useResource`:** a kernel may or may not write them. Conflicts that rest
-  only on such a "may write" are reported as *possible*, not as races.
+- **Direct compute bindings** count as reads: whether a kernel writes them needs its pipeline's reflection, and
+  translation layers declare their writes with `useResource` (`FENCEPOST_BIND_MAYWRITE=1` changes this).
+- **Read+write `useResource`:** a kernel may or may not write the resource. Conflicts that rest only on such a "may
+  write" are reported as *possible*, not as races.
 - **Not followed:** parallel render encoders and Metal 4 (`MTL4CommandQueue`) encoders.
 - **Event signals** are taken to follow all earlier work on their queue.
 - **Retired work:** a command buffer that completed before the next commit is treated as ordered. A race whose window
   closed that way on this run is missed.
+- **Frame chains** follow fences and events only. Ordering Metal adds itself between encoders using tracked resources
+  is not counted, so parallelism can read higher than the GPU really gets. "Run out of work" is a lower bound:
+  completion handlers run a little after the GPU finishes.
 
 ## Knobs (environment)
 
@@ -89,6 +119,8 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_MAX_REPORTS` | 200 | detailed reports printed; the rest are counted |
 | `FENCEPOST_POSSIBLE` | 1 | 0 hides "possible" reports |
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
+| `FENCEPOST_CHAIN` | 0 | list the longest ordered chain of this frame (counted from 1) |
+| `FENCEPOST_BIND_MAYWRITE` | 0 | 1: direct compute bindings of writable resources count as "may write", not reads |
 
 Each distinct race is printed once and counted after that.
 
@@ -104,9 +136,9 @@ Prebuilt (universal: Apple Silicon and x86_64/Rosetta, macOS 13+) on the
 macOS then refuses to load the library ("library load disallowed by system policy"); clear the mark after extracting:
 
 ```
-tar -xzf fencepost-0.1.0-macos.tar.gz
-xattr -dr com.apple.quarantine fencepost-0.1.0-macos
-DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.1.0-macos/libfencepost.dylib  your-metal-program
+tar -xzf fencepost-0.1.1-macos.tar.gz
+xattr -dr com.apple.quarantine fencepost-0.1.1-macos
+DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.1.1-macos/libfencepost.dylib  your-metal-program
 ```
 
 The library is signed ad hoc, not by an Apple developer ID; building it yourself (below) takes seconds.
@@ -123,13 +155,14 @@ DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
 arch -x86_64 -e DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest   # the Rosetta slice
 ```
 
-`tests/fptest.m` holds 29 small Metal programs with and without the synchronisation they need, each with the number of
-races or barrier violations fencepost must report. Examples:
+`tests/fptest.m` holds 34 small Metal programs with and without the synchronisation they need, each with the number of
+races, barrier violations or frame chain lengths fencepost must report. Examples:
 - a fence updated after the vertex stage while the write happens in the fragment stage;
 - a fence re-updated by an unrelated encoder before the wait;
 - a wait committed before its signal on another queue;
 - a fence that must be resolved in enqueue order, not commit order;
-- mip levels written and read through views.
+- mip levels written and read through views;
+- a fence wait that crosses a frame boundary, which must not lengthen the new frame's chain.
 
 ## Results so far
 
@@ -140,6 +173,12 @@ races or barrier violations fencepost must report. Examples:
   encoders, "waits: nothing"). `d3d12-m2` shows a blit-to-render read-after-write race that the fix removes. The bug
   took a night of frame captures to find in the game; here it shows in a 0.3-second test run.
 - **DXMT (D3D11) cube demo:** 1,127 encoders and 2,787 resource accesses checked, 0 reports.
+- **The Last of Us Part I through our D3D12 runtime:** 2.1 million encoders and 3.6 million declared barriers in one
+  session, 0 reports.
+- **A new bug caught in a game:** an experiment let command lists in one D3D12 submission overlap on the GPU. The run
+  was faster, black blotches appeared on a wall, and fencepost reported 23 encoders not ordered after their barrier,
+  naming the passes (ambient shadows, then their blur). A barrier at the end of one list must still hold for the next
+  list, and the change had dropped it. Fixed the same evening; once fixed, most of the speed-up went away.
 
 
 ## Human Input

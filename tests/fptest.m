@@ -18,8 +18,10 @@ static int (*fp_stats)(long *, int);
 static void (*fp_flush)(void);
 static void (*fp_barrier)(id);
 static void (*fp_exempt)(id);
+static void (*fp_frame)(id);
 static long base[4];
-enum { S_RACE = 0, S_POSS = 1, S_ORDER = 15, S_PARTIAL = 17 };   /* fencepost's counter indices */
+enum { S_RACE = 0, S_POSS = 1, S_ORDER = 15, S_PARTIAL = 17,   /* fencepost's counter indices */
+       S_FRAMES = 22, S_FRAME_ENC = 23, S_FRAME_CHAIN = 24, S_GPU_IDLE = 25 };
 static int fails, total;
 static id<MTLTexture> scratch;   /* tracked: a render target for passes that only read */
 
@@ -114,6 +116,22 @@ static void check4(const char *name, long want_races, long want_possible, long w
 }
 #define check(name, r, p) check4(name, r, p, 0, 0)
 
+/* frames finished since the last call, and the encoders and longest chain of the last one */
+static void checkframe(const char *name, long want_frames, long want_enc, long want_chain)
+{
+    static long frames0;
+    long s[32];
+    fp_flush();
+    fp_stats(s, 32);
+    long got = s[S_FRAMES] - frames0;
+    frames0 = s[S_FRAMES];
+    int ok = got == want_frames && s[S_FRAME_ENC] == want_enc && s[S_FRAME_CHAIN] == want_chain;
+    total++;
+    if (!ok) fails++;
+    fprintf(stderr, "%s %-58s frames %ld/%ld, encoders %ld/%ld, chain %ld/%ld (got/want)\n\n", ok ? "[ok]  " : "[FAIL]",
+            name, got, want_frames, s[S_FRAME_ENC], want_enc, s[S_FRAME_CHAIN], want_chain);
+}
+
 #define MAIN_VIS 0
 #define FRAG MTLRenderStageFragment
 #define VERT MTLRenderStageVertex
@@ -126,7 +144,8 @@ int main(void)
         fp_flush = (void (*)(void))dlsym(RTLD_DEFAULT, "fencepost_flush");
         fp_barrier = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_barrier");
         fp_exempt = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_exempt");
-        if (!fp_stats || !fp_flush || !fp_barrier || !fp_exempt) {
+        fp_frame = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_frame");
+        if (!fp_stats || !fp_flush || !fp_barrier || !fp_exempt || !fp_frame) {
             fprintf(stderr, "fencepost is not loaded: run with DYLD_INSERT_LIBRARIES=out/libfencepost.dylib\n");
             return 2;
         }
@@ -286,8 +305,41 @@ int main(void)
           b = newcb(qb, 0); fp_barrier(b); cuse(b, scratch, RD, nil, nil); [b commit]; }
         check4("barrier at the start of the next command buffer, not fenced", 0, 0, 1, 0);
 
+        /* frames (fencepost_frame): the encoders in each, and the longest chain of them the
+         * synchronisation forces to run one after another */
+        { id<MTLCommandQueue> qf = [dev newCommandQueue];
+          id<MTLFence> f1 = [dev newFence], f2 = [dev newFence];
+          a = newcb(qf, 0); fp_frame(a); [a commit];   /* ends a frame holding every test above */
+          a = newcb(qf, 0); bfill(a, nil, 0, 0, nil, f1); cuse(a, scratch, RD, f1, f2); cuse(a, scratch, RD, f2, nil);
+          cuse(a, scratch, RD, nil, nil); fp_frame(a); [a commit]; }
+        checkframe("frame: a fenced chain of 3 and one free encoder", 2, 4, 3);
+
+        { id<MTLCommandQueue> qa = [dev newCommandQueue], qb = [dev newCommandQueue];
+          id<MTLSharedEvent> ev = [dev newSharedEvent];
+          a = newcb(qa, 0); cuse(a, scratch, RD, nil, nil); cuse(a, scratch, RD, nil, nil);
+          [a encodeSignalEvent:ev value:1]; [a commit];
+          b = newcb(qb, 0); [b encodeWaitForEvent:ev value:1]; cuse(b, scratch, RD, nil, nil); fp_frame(b); [b commit]; }
+        checkframe("frame: two free encoders, then one after an event", 1, 3, 2);
+
+        { id<MTLCommandQueue> qa = [dev newCommandQueue], qb = [dev newCommandQueue];
+          id<MTLFence> f1 = [dev newFence];
+          a = newcb(qa, 0); bfill(a, nil, 0, 0, nil, f1); cuse(a, scratch, RD, f1, nil); [a commit];
+          b = newcb(qb, 0); fp_frame(b); [b commit];   /* the frame ends on another queue */
+          a = newcb(qa, 0); cuse(a, scratch, RD, f1, nil); fp_frame(a); [a commit]; }
+        checkframe("frame: a fence wait across frames is not part of the chain", 2, 1, 1);
+
         for (id<MTLSharedEvent> g in gates) g.signaledValue = 1;
         for (id<MTLCommandBuffer> c in cbs) [c waitUntilCompleted];
+        {   /* everything has completed: the next commit finds the GPU out of work */
+            long s0[32], s1[32];
+            usleep(300000);   /* completion handlers run a little after waitUntilCompleted returns */
+            fp_stats(s0, 32);
+            a = [q1 commandBuffer]; cuse(a, scratch, RD, nil, nil); [a commit]; [a waitUntilCompleted];
+            fp_stats(s1, 32);
+            long got = s1[S_GPU_IDLE] - s0[S_GPU_IDLE];
+            total++; if (got != 1) fails++;
+            fprintf(stderr, "%s %-58s idle %ld/1 (got/want)\n\n", got == 1 ? "[ok]  " : "[FAIL]", "commit after the GPU ran dry", got);
+        }
         fprintf(stderr, "fptest: %d/%d passed\n", total - fails, total);
     }
     return fails ? 1 : 0;

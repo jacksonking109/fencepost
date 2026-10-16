@@ -65,7 +65,9 @@ static const char *const via_name[] = { "attachment load", "attachment", "MSAA r
 enum { ST_RACE_UNIQ, ST_POSS_UNIQ, ST_RACE_HITS, ST_POSS_HITS, ST_NODES, ST_ACCESSES, ST_CBS,
        ST_HEAP_USES, ST_PARALLEL, ST_TRACKED, ST_TIMEOUTS, ST_UNCERTAIN, ST_WINDOW, ST_LOST,
        ST_ORDER_UNIQ, ST_ORDER_HITS, ST_PARTIAL_UNIQ, ST_PARTIAL_HITS, ST_BARRIERS,
-       ST_OBJS, ST_OBJ_DROPS, ST_ANALYSIS_NS, ST_COUNT };
+       ST_OBJS, ST_OBJ_DROPS, ST_ANALYSIS_NS,
+       ST_FRAMES, ST_FRAME_ENC, ST_FRAME_CHAIN, ST_GPU_IDLE,   /* last finished frame's encoders and chain */
+       ST_COUNT };
 
 typedef struct { uint64_t w[FP_WORDS]; } fp_bits;
 
@@ -98,10 +100,12 @@ typedef struct fp_node {
     struct fp_queue *req_q;         /* declared barrier: must follow req_q's nodes before req_mark */
     uint64_t req_mark, bar_cb;
     int bar_idx;
+    uint64_t frame, chain_prev;     /* chain_prev: the node before this one on its longest ordered chain */
+    uint32_t depth;                 /* encoders on that chain within the frame, this one included */
     fp_bits anc[2];                 /* what is ordered before this node's vertex / fragment work */
 } fp_node;
 
-typedef struct { uint8_t type; uint64_t uid; void *ev; uint64_t val; } fp_item;   /* 0 encoder, 1 signal, 2 wait, 3 barrier */
+typedef struct { uint8_t type; uint64_t uid; void *ev; uint64_t val; } fp_item;   /* 0 encoder, 1 signal, 2 wait, 3 barrier, 4 frame end */
 typedef struct {
     uint64_t uid, enq, commit_tick;
     void *cb;
@@ -144,7 +148,19 @@ static FILE *g_out;
 static long g_max_reports = 200, g_printed;
 static int g_show_possible = 1, g_summary_secs = 10, g_started, g_bind_maywrite;
 static time_t g_last_summary;
-static long g_last_summary_hits = -1;
+static long g_last_summary_hits = -1, g_last_summary_frames;
+
+/* Frames: a present (or fencepost_frame) ends one. For each, the encoders in it and the
+ * longest chain of them that synchronisation forces to run one after another. */
+#define FP_FRAMES 16             /* frames still being analysed */
+#define FP_FHIST  1024           /* finished frames the summary takes medians over */
+typedef struct { uint64_t key; long queued, analysed, nenc, idle; uint32_t depth; uint64_t tail; } fp_frame;
+static fp_frame g_fr[FP_FRAMES];
+static uint64_t g_frame_cur, g_frame_next;   /* frame phase 1 is filling; next frame to finish */
+static struct { long nenc, idle; uint32_t depth; } g_fhist[FP_FHIST]; static uint64_t g_nfhist;
+static long g_inflight;                      /* command buffers committed and not completed */
+static long g_chain_frame;                   /* FENCEPOST_CHAIN: the frame whose chain to print */
+static int g_frame_api;                      /* fencepost_frame was called: presents no longer end frames */
 
 static __thread int tl_depth;   /* >0 inside a hooked Metal call: nested hooked calls pass through */
 static __thread struct { void *enc; uint64_t uid; } tl_cache;
@@ -193,6 +209,7 @@ static fp_node *node_new(int kind)   /* lock held */
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
+    n->frame = 0; n->chain_prev = 0; n->depth = 0;
     n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
     for (int i = 0; i < 10; i++) n->att[i] = -1;
     return n;
@@ -441,12 +458,108 @@ static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
                "outside its view\n");
 }
 
+/* ---------------------------------------------------------------- frames */
+
+static fp_frame *frame_get(uint64_t f)
+{
+    fp_frame *r = &g_fr[f % FP_FRAMES];
+    if (r->key != f + 1) { memset(r, 0, sizeof *r); r->key = f + 1; }
+    return r;
+}
+static fp_frame *frame_of(uint64_t f)   /* NULL once the frame is finished */
+{
+    return f < g_frame_next || f + FP_FRAMES <= g_frame_cur ? NULL : frame_get(f);
+}
+
+static uint64_t run_hash(const fp_node *n)
+{
+    return fnv_label(fnv(0xcbf29ce484222325ull, &n->kind, sizeof n->kind), n->label);
+}
+
+/* The longest chain of frame f, oldest first, with runs of the same pass folded. */
+static void print_chain(uint64_t f, const fp_frame *r)
+{
+    int cap = (int)r->depth, n = 0, via_ev = 0;
+    fp_node **st = calloc((size_t)cap + 1, sizeof *st);
+    uint8_t *ev_in = calloc((size_t)cap + 1, 1);   /* ev_in[i]: st[i] follows st[i + 1] through an event */
+    for (fp_node *x = node_get(r->tail); x && x->frame == f && n < cap; x = node_get(x->chain_prev)) {
+        if (x->kind == FPK_SIGNAL) { via_ev = 1; continue; }
+        if (n) ev_in[n - 1] = (uint8_t)via_ev;
+        st[n++] = x; via_ev = 0;
+    }
+    fp_log("fencepost: CHAIN frame %llu: %ld encoders; the longest chain the synchronisation forces to run one after "
+           "another has %u (parallelism %.2f)%s\n", (unsigned long long)f + 1, r->nenc, r->depth,
+           r->depth ? (double)r->nenc / r->depth : 0.0, n < (int)r->depth ? "; its oldest steps were recycled" : "");
+    int lines = 0, step = (int)r->depth - n + 1;
+    for (int i = n - 1; i >= 0; lines++) {
+        uint64_t h = run_hash(st[i]);
+        int j = i, fences = 0, events = 0;
+        while (j > 0 && run_hash(st[j - 1]) == h) { j--; if (ev_in[j]) events++; else fences++; }
+        if (lines < 100) {
+            char steps[32], links[64] = "";
+            if (i == j) snprintf(steps, sizeof steps, "%d", step);
+            else snprintf(steps, sizeof steps, "%d-%d", step, step + i - j);
+            if (i > j) snprintf(links, sizeof links, ", one after another through %s",
+                                fences && events ? "fences and events" : events ? "events" : "fences");
+            fp_log("  %-11s %-7s \"%s\"%s%s\n", steps, kind_name[st[i]->kind], st[i]->label[0] ? st[i]->label : "(no label)",
+                   i < n - 1 && ev_in[i] ? " (after an event wait)" : "", links);
+        } else if (lines == 100) fp_log("  ... more steps not shown\n");
+        step += i - j + 1;
+        i = j - 1;
+    }
+    free(st); free(ev_in);
+}
+
+static void frame_done(uint64_t f, const fp_frame *r)
+{
+    if (!r->nenc) return;
+    g_st[ST_FRAMES]++; g_st[ST_FRAME_ENC] = r->nenc; g_st[ST_FRAME_CHAIN] = r->depth;
+    uint64_t k = g_nfhist++ % FP_FHIST;
+    g_fhist[k].nenc = r->nenc; g_fhist[k].depth = r->depth; g_fhist[k].idle = r->idle;
+    if (g_chain_frame && (uint64_t)g_chain_frame == f + 1) print_chain(f, r);
+}
+
+/* Finish frames whose nodes are all analysed (force: whatever is left). */
+static void frames_settle(int force)   /* lock held */
+{
+    while (g_frame_next < g_frame_cur) {
+        fp_frame *r = frame_get(g_frame_next);
+        if (!force && r->analysed < r->queued && g_frame_cur - g_frame_next < FP_FRAMES / 2) break;
+        frame_done(g_frame_next, r);
+        g_frame_next++;
+    }
+}
+
+static int cmp_long(const void *a, const void *b) { long x = *(const long *)a, y = *(const long *)b; return (x > y) - (x < y); }
+static int cmp_dbl(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+
+static void frame_line(void)   /* lock held */
+{
+    int m = g_nfhist < FP_FHIST ? (int)g_nfhist : FP_FHIST;
+    if (!m) return;
+    static long enc[FP_FHIST], ch[FP_FHIST]; static double par[FP_FHIST];
+    long idle = 0;
+    for (int i = 0; i < m; i++) {
+        enc[i] = g_fhist[i].nenc; ch[i] = g_fhist[i].depth; idle += g_fhist[i].idle;
+        par[i] = ch[i] ? (double)enc[i] / ch[i] : 0;
+    }
+    qsort(enc, m, sizeof *enc, cmp_long); qsort(ch, m, sizeof *ch, cmp_long); qsort(par, m, sizeof *par, cmp_dbl);
+    fp_log("fencepost:   frames: %ld; median of the last %d: %ld encoders, longest ordered chain %ld (parallelism "
+           "%.2f); the GPU had run out of work at %.1f commits per frame\n", g_st[ST_FRAMES], m, enc[m / 2], ch[m / 2],
+           par[m / 2], (double)idle / m);
+}
+
 static void summary(int final)
 {
     pthread_mutex_lock(&g_lock);
     long hits = g_st[ST_RACE_HITS] + g_st[ST_POSS_HITS];
-    if (!final && hits == g_last_summary_hits) { pthread_mutex_unlock(&g_lock); return; }
+    if (!final && hits == g_last_summary_hits) {   /* nothing new to report: just the frame line, if it moved */
+        if (g_st[ST_FRAMES] != g_last_summary_frames) { g_last_summary_frames = g_st[ST_FRAMES]; frame_line(); }
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
     g_last_summary_hits = hits;
+    g_last_summary_frames = g_st[ST_FRAMES];
     fp_log("fencepost: %s: %ld race(s) (%ld hits), %ld possible (%ld hits); %ld encoders analysed, "
            "%ld command buffers, %ld accesses\n", final ? "final" : "so far",
            g_st[ST_RACE_UNIQ], g_st[ST_RACE_HITS], g_st[ST_POSS_UNIQ], g_st[ST_POSS_HITS],
@@ -459,6 +572,7 @@ static void summary(int final)
         fp_log("fencepost:   %ld uses of tracked resources skipped (Metal orders those itself)\n", g_st[ST_TRACKED]);
     fp_log("fencepost:   cost: %.2f s analysing at commit; %ld resources with live history%s\n",
            g_st[ST_ANALYSIS_NS] / 1e9, g_st[ST_OBJS], g_st[ST_OBJ_DROPS] ? " (TABLE FULL: some accesses not checked)" : "");
+    frame_line();
     if (g_st[ST_HEAP_USES] || g_st[ST_PARALLEL] || g_st[ST_TIMEOUTS] || g_st[ST_UNCERTAIN] || g_st[ST_WINDOW] || g_st[ST_LOST])
         fp_log("fencepost:   blind spots: %ld useHeap calls (resources inside heaps not seen), %ld parallel render "
                "encoders (not followed), %ld event waits timed out, %ld nodes with unresolved event waits, "
@@ -625,10 +739,12 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
 {
     y->aseq = ++g_aseq;
     memset(y->anc, 0, sizeof y->anc);
+    uint32_t best = 0;
     for (int i = 0; i < y->ned; i++) {
         const fp_edge *e = &y->ed[i];
         fp_node *x = node_get(e->src);
         if (!x || !x->aseq || x->aseq >= y->aseq) continue;
+        if (x->frame == y->frame && x->depth > best) { best = x->depth; y->chain_prev = x->uid; }
         uint64_t d = y->aseq - x->aseq;
         if (d >= FP_W) continue;
         fp_bits *t = &y->anc[e->before];
@@ -638,6 +754,12 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
     }
     for (int i = 0; i < FP_WORDS; i++) y->anc[1].w[i] |= y->anc[0].w[i];   /* fragment work starts after vertex work */
     y->state = 4;
+    y->depth = best + (y->kind != FPK_SIGNAL);   /* an event signal passes its chain on */
+    fp_frame *r = frame_of(y->frame);
+    if (r) {
+        r->analysed++;
+        if (y->kind != FPK_SIGNAL) { r->nenc++; if (y->depth > r->depth) { r->depth = y->depth; r->tail = y->uid; } }
+    }
     if (y->kind != FPK_SIGNAL) g_st[ST_NODES]++;
     if (y->kind != FPK_SIGNAL && y->req_q && y->req_mark) check_barrier(y);
     for (int i = 0; i < y->nacc; i++) check_access(y, &y->acc[i]);
@@ -713,6 +835,7 @@ static void process_pending(int force)   /* lock held */
         for (int i = 0; i < g_npend; i++) { fp_node *n = node_get(g_pend[i]); if (n && n->state == 3) analyse(n); }
         g_npend = 0;
     }
+    frames_settle(force);
 }
 
 static void queue_recent(fp_queue *q, uint64_t uid)
@@ -734,6 +857,7 @@ static void phase1(fp_cb *c)
             g_st[ST_BARRIERS]++;
             continue;
         }
+        if (it->type == 4) { g_frame_cur++; continue; }
         if (it->type == 2) {
             if (nactive < 32) { active[nactive].ev = it->ev; active[nactive].val = it->val; active[nactive].before = 0; nactive++; }
             continue;
@@ -772,6 +896,7 @@ static void phase1(fp_cb *c)
         n->commit_tick = c->commit_tick;
         n->pend_since = g_tick;
         n->req_q = q; n->req_mark = q->bar_mark; n->bar_cb = q->bar_cb; n->bar_idx = q->bar_idx;
+        n->frame = g_frame_cur; frame_get(g_frame_cur)->queued++;
         n->state = 3;
         queue_recent(q, n->uid);
         PUSH(g_pend, g_npend, g_cpend, n->uid);
@@ -802,6 +927,7 @@ static void cb_done(uint64_t uid)
 {
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_get(uid);
+    g_inflight--;
     if (c)
         for (int i = 0; i < c->nit; i++) {
             fp_node *n = c->it[i].type != 2 ? node_get(c->it[i].uid) : NULL;
@@ -946,7 +1072,7 @@ enum {
     H_DEV_NEWQ, H_DEV_NEWQ_MAX, H_DEV_NEWQ_DESC, H_DEV_NEWSEV, H_DEV_NEWEV,
     H_Q_CB, H_Q_CBU, H_Q_CBD,
     H_CB_RENC, H_CB_PRENC, H_CB_CENC, H_CB_CENC_DT, H_CB_CENC_D, H_CB_BENC, H_CB_BENC_D,
-    H_CB_SIG, H_CB_WAIT, H_CB_COMMIT, H_CB_ENQ,
+    H_CB_SIG, H_CB_WAIT, H_CB_COMMIT, H_CB_ENQ, H_CB_PRES, H_CB_PRES_T, H_CB_PRES_D,
     H_EV_SET,
     H_END, H_USE, H_USES, H_HEAP, H_HEAPS, H_UPD, H_WAIT,
     H_R_USE_ST, H_R_USES_ST, H_R_HEAP_ST, H_R_HEAPS_ST, H_R_UPD, H_R_WAIT,
@@ -1196,6 +1322,23 @@ static void h_cb_enq(id self, SEL _cmd)
     LEAVE;
 }
 
+/* a present ends a frame, unless the program marks frames itself (fencepost_frame) */
+static void h_cb_pres(id self, SEL _cmd, id d)
+{
+    ENTER; ORIG(H_CB_PRES, void (*)(id, SEL, id))(self, _cmd, d); LEAVE;
+    if (OUTER && !g_frame_api) cb_item(self, 4, nil, 0);
+}
+static void h_cb_pres_t(id self, SEL _cmd, id d, CFTimeInterval t)
+{
+    ENTER; ORIG(H_CB_PRES_T, void (*)(id, SEL, id, CFTimeInterval))(self, _cmd, d, t); LEAVE;
+    if (OUTER && !g_frame_api) cb_item(self, 4, nil, 0);
+}
+static void h_cb_pres_d(id self, SEL _cmd, id d, CFTimeInterval t)
+{
+    ENTER; ORIG(H_CB_PRES_D, void (*)(id, SEL, id, CFTimeInterval))(self, _cmd, d, t); LEAVE;
+    if (OUTER && !g_frame_api) cb_item(self, 4, nil, 0);
+}
+
 static void maybe_summary(void)
 {
     time_t now = time(NULL);
@@ -1218,6 +1361,8 @@ static void h_cb_commit(id self, SEL _cmd)
             if (l) snprintf(c->label, sizeof c->label, "%s", l.UTF8String);
             cb_close((void *)self);
             c->state = 2;
+            if (!g_inflight && g_tick) { frame_get(g_frame_cur)->idle++; g_st[ST_GPU_IDLE]++; }   /* the GPU ran dry */
+            g_inflight++;
             c->commit_tick = ++g_tick;
             if (!c->enq) c->enq = ++c->q->enq_assign;
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -1619,6 +1764,9 @@ static const hook_def cb_hooks[] = {
     HD(H_CB_WAIT, "encodeWaitForEvent:value:", h_cb_wait),
     HD(H_CB_COMMIT, "commit", h_cb_commit),
     HD(H_CB_ENQ, "enqueue", h_cb_enq),
+    HD(H_CB_PRES, "presentDrawable:", h_cb_pres),
+    HD(H_CB_PRES_T, "presentDrawable:atTime:", h_cb_pres_t),
+    HD(H_CB_PRES_D, "presentDrawable:afterMinimumDuration:", h_cb_pres_d),
 };
 static const hook_def event_hooks[] = {
     HD(H_EV_SET, "setSignaledValue:", h_ev_set),
@@ -1772,6 +1920,7 @@ __attribute__((constructor)) static void fp_init(void)
     if ((p = getenv("FENCEPOST_POSSIBLE"))) g_show_possible = atoi(p);
     if ((p = getenv("FENCEPOST_SUMMARY_SECS"))) g_summary_secs = atoi(p);
     if ((p = getenv("FENCEPOST_BIND_MAYWRITE"))) g_bind_maywrite = atoi(p);
+    if ((p = getenv("FENCEPOST_CHAIN"))) g_chain_frame = atol(p);
 }
 
 /* For tests and tools: dlsym these. out[] gets ST_COUNT counters (see the enum). */
@@ -1791,6 +1940,18 @@ __attribute__((visibility("default"))) void fencepost_barrier(id cb)
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)cb);
     if (c) { fp_item it = { 3, 0, NULL, (uint64_t)c->nenc }; PUSH(c->it, c->nit, c->cit, it); }
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* End a frame at the current point of cb. Presents end frames by themselves; a program
+ * that presents some other way, or wants its own frame boundaries, calls this instead, and
+ * from its first call presents no longer count. */
+__attribute__((visibility("default"))) void fencepost_frame(id cb)
+{
+    pthread_mutex_lock(&g_lock);
+    g_frame_api = 1;
+    fp_cb *c = cb_find_open((void *)cb);
+    if (c) { fp_item it = { 4, 0, NULL, 0 }; PUSH(c->it, c->nit, c->cit, it); }
     pthread_mutex_unlock(&g_lock);
 }
 
