@@ -860,10 +860,14 @@ static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_tra
     trace_label(f, "first", link->first);
     trace_label(f, "second", link->second);
     trace_label(f, "why", link->why);
-    const char *overlap = "null";
-    if (from && from->sampled && to->sampled)
-        overlap = from->start < to->end && to->start < from->end ? "true" : "false";
-    fprintf(f, ",\"overlapped_on_gpu\":%s}}", overlap);
+    const char *overlap = "null", *order = "null";
+    if (from && from->sampled && to->sampled) {
+        int both = from->start < to->end && to->start < from->end;
+        overlap = both ? "true" : "false";
+        /* the second ran wholly before the first: the ordering was inverted on this run, not merely absent */
+        order = both ? "\"overlapped\"" : to->end <= from->start ? "\"reversed\"" : "\"in order\"";
+    }
+    fprintf(f, ",\"overlapped_on_gpu\":%s,\"gpu_order\":%s}}", overlap, order);
 }
 
 static void trace_marker_clear(fp_trace_link *link)

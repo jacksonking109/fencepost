@@ -201,6 +201,10 @@ def check_trace(events, args):
         if source and source["args"]["gpu_time"] and target["args"]["gpu_time"]:
             overlap = source["ts"] < slice_end(target) and target["ts"] < slice_end(source)
         assert data["overlapped_on_gpu"] is overlap, marker
+        order = None
+        if overlap is not None:
+            order = "overlapped" if overlap else "reversed" if slice_end(target) <= source["ts"] else "in order"
+        assert data["gpu_order"] == order, marker
     missing = 0
     for kind in MARKER_PREFIXES.values():
         assert counts[kind] == summary[f"{kind}_markers"]

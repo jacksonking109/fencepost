@@ -97,7 +97,10 @@ Arrows show fence waits, event waits and work that completed before the next com
 signalling command buffer. Each command buffer can receive one completed arrow from the latest observed completion
 per queue at commit. Race and declared-barrier markers carry the same detail as the log, including hits that repeat
 or exceed its report limit. The `overlapped_on_gpu` argument is `true` if the two sampled GPU spans intersect,
-`false` if both were sampled and did not intersect, and `null` if either sampled span is unavailable.
+`false` if both were sampled and did not intersect, and `null` if either sampled span is unavailable. `gpu_order`
+says which way round they ran on this run: `"overlapped"`, `"reversed"` (the second finished before the first
+started: the ordering the program needed was inverted, not just missing) or `"in order"` (the race did not show on
+this run), `null` without both spans.
 The streaming trace keeps up to 20,000 of these markers. Perfetto can omit arrows whose destination ran earlier than the
 source finished, or attach an arrow to a diagnostic marker at the destination's start. The JSON retains both
 endpoints. The **fencepost summary** gives the detector counters and trace counts.
