@@ -26,6 +26,9 @@
 #import <objc/runtime.h>
 #include <mach/mach_time.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -461,6 +464,8 @@ typedef struct fp_trace_cb {
     fp_trace_endpoint *completed_before;
     uint64_t *signals;
     int nsignals, csignals, refs;
+    char *gpu_error;
+    uint64_t error_time;
     uint64_t gpu_start, gpu_end;
     int queue, phased, completed, selected, has_encoder;
     char label[48];
@@ -553,7 +558,7 @@ typedef struct fp_trace_chunk {
     fp_trace_record *first, *last;
     size_t bytes;
     unsigned outstanding;
-    uint64_t marker_hits[4], end;
+    uint64_t marker_hits[4], start, end;
 } fp_trace_chunk;
 
 static fp_trace_chunk g_trace_metadata, *g_trace_chunks;
@@ -563,17 +568,25 @@ static size_t g_ring_bytes, g_ring_limit = 64u * 1024u * 1024u;
 static uint64_t g_ring_floor, g_ring_latest, g_ring_evictions, g_ring_cap_evictions;
 static fp_trace_endpoint *g_ring_history;
 static char *g_ring_prefix;
-static int g_ring_encoded;
+static int g_ring_encoded, g_ring_race = 1, g_ring_gpuerr = 1;
+static double g_spike_factor = 2, g_spike_min_ns = 8e6, g_cooldown_ns = 5e9;
+static uint64_t g_durations[120], g_duration_count;
+static uint64_t g_last_fire, g_last_poll, g_suppressed;
+static unsigned g_max_dumps = 20, g_dumps;
+static char *g_trigger_file;
+static struct timespec g_file_mtime;
 
 typedef struct {
     int active;
     uint64_t frame, first, last, timestamp;
     char reason[33];
     const char *source;
+    char *error;
 } fp_trigger;
 
 static fp_trigger g_trigger;
 static void ring_update(int final);
+static void ring_trigger(const char *reason, const char *source, uint64_t frame, uint64_t timestamp, const char *error);
 
 
 static fp_trace_chunk *trace_chunk(uint64_t frame)
@@ -635,18 +648,23 @@ static void ring_evict(int cap)
 }
 
 /* Budget whole records, including their separator, before publishing them. */
-static int trace_store(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events, int final,
+static int trace_store(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events,
                        unsigned type, uint64_t source)
 {
     int ok = !fclose(f);
-    if (!g_ring && !final && !g_trace_stopped && g_trace_bytes + *length + 2 + FP_TRACE_RESERVE > g_trace_limit) {
+    if (!g_ring && !g_trace_stopped && g_trace_bytes + *length + 2 + FP_TRACE_RESERVE > g_trace_limit) {
         g_trace_stopped = 1;
         fp_log("fencepost: trace size limit reached (FENCEPOST_TRACE_MB); recording stopped\n");
         trace_stream_flush();
         fflush(g_trace);
     }
-    if (ok && (final || !g_trace_stopped)) {
+    if (ok && !g_trace_stopped) {
         fp_trace_chunk *chunk = trace_chunk(frame);
+        if (!chunk) {
+            free(*record);
+            g_trace_dropped += events;
+            return 0;
+        }
         size_t bytes = sizeof(fp_trace_record) + *length + 1;
         if (g_ring) {
             while (g_trace_chunks && g_ring_bytes + bytes > g_ring_limit) ring_evict(1);
@@ -675,9 +693,9 @@ static int trace_store(uint64_t frame, FILE *f, char **record, size_t *length, u
     return 0;
 }
 
-static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events, int final)
+static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events)
 {
-    return trace_store(frame, f, record, length, events, final, REC_PLAIN, 0);
+    return trace_store(frame, f, record, length, events, REC_PLAIN, 0);
 }
 
 static void trace_header(FILE *f, char phase, int tid, uint64_t ts, const char *cat, const char *name)
@@ -704,7 +722,7 @@ static void trace_start(void)
     fputs(",\"ts\":0.000,\"args\":{\"name\":", f);
     trace_string(f, [[NSProcessInfo processInfo] processName].UTF8String);
     fputs("}}", f);
-    trace_write(TRACE_METADATA, f, &record, &length, 1, 0);
+    trace_write(TRACE_METADATA, f, &record, &length, 1);
 }
 
 static int trace_name_track(const char *name)
@@ -717,7 +735,7 @@ static int trace_name_track(const char *name)
     fputs(",\"args\":{\"name\":", f);
     trace_string(f, name);
     fputs("}}", f);
-    trace_write(TRACE_METADATA, f, &record, &length, 1, 0);
+    trace_write(TRACE_METADATA, f, &record, &length, 1);
     return tid;
 }
 
@@ -829,7 +847,7 @@ static void trace_flow(const fp_trace_link *link, const fp_trace_span *from, con
     trace_flow_event(f, 's', from, start, cat, id, link);
     fputs(",\n", f);
     trace_flow_event(f, 'f', to, to->start, cat, id, link);
-    if (trace_store(to->frame, f, &record, &length, 2, 0, REC_FLOW, from->frame)) g_trace_flows++;
+    if (trace_store(to->frame, f, &record, &length, 2, REC_FLOW, from->frame)) g_trace_flows++;
 }
 
 static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_trace_span *to,
@@ -861,7 +879,7 @@ static void trace_marker(fp_trace_link *link, const fp_trace_span *to, const fp_
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
     trace_marker_record(f, link, to, from);
-    if (trace_store(to->frame, f, &record, &length, 1, 0, REC_MARKER + link->kind - TR_RACE,
+    if (trace_store(to->frame, f, &record, &length, 1, REC_MARKER + link->kind - TR_RACE,
                     from ? from->frame : UINT64_MAX)) {
         g_trace_markers++;
         g_trace_marker_counts[link->kind - TR_RACE]++;
@@ -1166,7 +1184,7 @@ static void trace_place_encoder(fp_trace_encoder *e)
         trace_slice(f, &e->span, kind, name);
         fprintf(f, ",\"args\":{%s,\"gpu_time\":%s%s}}", e->args, gpu ? "true" : "false",
                 trace_estimated(&e->span) ? ",\"estimated\":true" : "");
-        if (trace_store(e->span.frame, f, &record, &length, count + 1, 0, gpu ? REC_SAMPLED : REC_ENCODER, 0)) {
+        if (trace_store(e->span.frame, f, &record, &length, count + 1, gpu ? REC_SAMPLED : REC_ENCODER, 0)) {
             g_trace_markers += count;
             for (int i = 0; i < 4; i++) g_trace_marker_counts[i] += markers[i];
             g_trace_encoders++;
@@ -1184,8 +1202,8 @@ static void trace_place_encoder(fp_trace_encoder *e)
             f = open_memstream(&record, &length);
             trace_slice(f, &cpu, "cpu encode", name);
             fprintf(f, ",\"args\":{\"uid\":%llu}}", TRACE_U64(e->uid));
-            trace_write(e->span.frame, f, &record, &length, 1, 0);
-        } else e->span.tid = 0;
+            trace_write(e->span.frame, f, &record, &length, 1);
+        } else if (!g_ring || e->span.frame >= g_ring_floor) e->span.tid = 0;
     } else g_trace_dropped++;
     free(e->args); e->args = NULL;
     trace_ready(&e->span);
@@ -1276,6 +1294,11 @@ static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *
 static void trace_cb_finish(fp_trace_cb *c)
 {
     if (!c->phased || !c->completed) return;
+    if (c->gpu_error) {
+        ring_trigger("gpu-error", "gpu-error", c->span.frame, c->error_time, c->gpu_error);
+        free(c->gpu_error);
+        c->gpu_error = NULL;
+    }
     trace_layout_encoders(c);
     if (c->selected) {
         c->span.start = c->gpu_start; c->span.end = c->gpu_end;
@@ -1289,7 +1312,8 @@ static void trace_cb_finish(fp_trace_cb *c)
             FILE *f = open_memstream(&record, &length);
             trace_slice(f, &c->span, "command buffer", name);
             fprintf(f, ",\"args\":{\"uid\":%llu,\"queue\":%d}}", TRACE_U64(c->uid), c->queue);
-            if (!trace_write(c->span.frame, f, &record, &length, 1, 0)) c->span.tid = 0;
+            if (!trace_write(c->span.frame, f, &record, &length, 1) &&
+                (!g_ring || c->span.frame >= g_ring_floor)) c->span.tid = 0;
         }
         trace_ready(&c->span);
     }
@@ -1324,6 +1348,10 @@ static void trace_cb_completed(fp_trace_cb *c, id<MTLCommandBuffer> cb)
 {
     if (!c) return;
     @autoreleasepool {
+        if (g_ring && g_ring_gpuerr && (cb.status == MTLCommandBufferStatusError || cb.error != nil)) {
+            c->error_time = trace_clock();
+            c->gpu_error = strdup(cb.error.localizedDescription.UTF8String ?: "command buffer error");
+        }
         double start = cb.GPUStartTime, end = cb.GPUEndTime;
         if (cb.status == MTLCommandBufferStatusCompleted && start > 0 && end >= start
                 && end <= (double)trace_clock() / 1e9 + 1) {
@@ -1340,11 +1368,33 @@ static void trace_cb_completed(fp_trace_cb *c, id<MTLCommandBuffer> cb)
     trace_cb_finish(c);
 }
 
+static int compare_duration(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void ring_frame_duration(uint64_t frame, uint64_t timestamp)
+{
+    if (!frame || !g_spike_factor) return; /* frame 1 starts at first CB, not at a boundary */
+    uint64_t duration = timestamp - g_trace_frame_start;
+    if (g_duration_count >= 120) {
+        uint64_t sorted[120];
+        memcpy(sorted, g_durations, sizeof sorted);
+        qsort(sorted, 120, sizeof *sorted, compare_duration);
+        double median = 0.5 * sorted[59] + 0.5 * sorted[60];
+        if (duration > MAX(g_spike_factor * median, median + g_spike_min_ns))
+            ring_trigger("spike", "spike", frame, timestamp, NULL);
+    }
+    g_durations[g_duration_count++ % 120] = duration;
+}
+
 static void trace_frame_boundary(uint64_t frame, uint64_t timestamp, fp_trace_cb *c)
 {
     if (g_ring) g_ring_latest = frame;
     if (!g_trace_frame_start) g_trace_frame_start = timestamp;
     if (timestamp < g_trace_frame_start) timestamp = g_trace_frame_start;
+    if (g_ring) ring_frame_duration(frame, timestamp);
     if (trace_frame_selected(frame) && !g_trace_stopped) {
         fp_trace_frame *item = malloc(sizeof *item);
         *item = (fp_trace_frame){ frame, g_trace_frame_start, timestamp, NULL };
@@ -1364,7 +1414,10 @@ static void trace_frame_done(uint64_t frame, const fp_frame *r)
     if (!g_frames_tid) g_frames_tid = trace_name_track("Frames");
     if (g_ring) {
         fp_trace_chunk *chunk = trace_chunk(frame);
-        if (chunk) chunk->end = item->end;
+        if (chunk) {
+            chunk->start = item->start;
+            chunk->end = item->end;
+        }
     }
     char name[40], *record = NULL;
     size_t length = 0;
@@ -1378,7 +1431,7 @@ static void trace_frame_done(uint64_t frame, const fp_frame *r)
     /* Ratio with six fractional digits, without a locale-dependent decimal point. */
     uint64_t ratio = r->depth ? (uint64_t)r->nenc * 1000000 / r->depth : 0;
     fprintf(f, "%llu.%06llu,\"gpu_idle_commits\":%ld}}", TRACE_U64(ratio / 1000000), TRACE_U64(ratio % 1000000), r->idle);
-    trace_write(frame, f, &record, &length, 1, 0);
+    trace_write(frame, f, &record, &length, 1);
 }
 
 static void trace_final_node(const void *key, const void *value, void *context)
@@ -1417,18 +1470,26 @@ static char *trace_summary(fp_trace_counts totals, size_t *length)
     for (int i = 0; i < 4; i++)
         fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(totals.hits[i]),
                 types[i], TRACE_U64(totals.counts[i]));
-    if (g_ring)
+    if (g_ring) {
+        fprintf(f, ",\"suppressed_triggers\":%llu", TRACE_U64(g_suppressed));
         fprintf(f, ",\"evicted_frames\":%llu,\"memory_evictions\":%llu,\"outside_flows\":%llu,\"outside_markers\":%llu",
                 TRACE_U64(g_ring_evictions), TRACE_U64(g_ring_cap_evictions),
                 TRACE_U64(totals.outside_flows), TRACE_U64(totals.outside_markers));
+    }
     fputs("}}", f);
     fclose(f);
     return record;
 }
 
-static void ring_trigger(const char *reason, const char *source, uint64_t frame, uint64_t timestamp)
+static void ring_trigger(const char *reason, const char *source, uint64_t frame, uint64_t timestamp, const char *error)
 {
-    if (!g_ring_encoded || g_trace_stopped || g_trigger.active || !trace_frame_selected(frame)) return;
+    if (!g_ring_encoded || g_trace_stopped || !trace_frame_selected(frame)) return;
+    uint64_t now = trace_clock();
+    if (g_trigger.active || g_dumps >= g_max_dumps || (g_last_fire && now - g_last_fire < g_cooldown_ns)) {
+        g_suppressed++;
+        return;
+    }
+    g_last_fire = now;
     fp_trigger trigger = { .active = 1, .frame = frame, .timestamp = timestamp, .source = source };
     trigger.first = frame >= g_ring ? frame - g_ring + 1 : 0;
     trigger.last = frame + g_ring_after;
@@ -1440,6 +1501,7 @@ static void ring_trigger(const char *reason, const char *source, uint64_t frame,
         trigger.reason[n++] = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ? c : '-';
     }
     if (!n) strcpy(trigger.reason, "manual");
+    if (error) trigger.error = strdup(error);
     g_trigger = trigger;
 }
 
@@ -1447,7 +1509,7 @@ __attribute__((visibility("default"))) void fencepost_trigger(const char *reason
 {
     if (!g_ring) return;
     pthread_mutex_lock(&g_lock);
-    ring_trigger(reason, "api", g_frame_cur, trace_clock());
+    ring_trigger(reason, "api", g_frame_cur, trace_clock(), NULL);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1455,14 +1517,14 @@ static int ring_write_dump(FILE *out)
 {
     int started = 0;
     fp_trace_counts totals = {0};
-    uint64_t first = MAX(g_trigger.first, g_ring_floor), timestamp = g_trigger.timestamp;
     if (!g_frames_tid) g_frames_tid = trace_name_track("Frames");
+    uint64_t first = MAX(g_trigger.first, g_ring_floor), timestamp = g_trigger.timestamp;
     if (fputc('[', out) == EOF) return 0;
     for (fp_trace_record *r = g_trace_metadata.first; r; r = r->next)
         if (!trace_emit(out, &started, r)) return 0;
     for (fp_trace_chunk *c = g_trace_chunks; c; c = c->next) {
         if (c->frame < first || c->frame > g_trigger.last) continue;
-        if (c->frame == g_trigger.frame && c->end) timestamp = MIN(timestamp, c->end);
+        if (c->frame == g_trigger.frame && c->end) timestamp = MAX(c->start, MIN(timestamp, c->end));
         for (int i = 0; i < 4; i++) totals.hits[i] += c->marker_hits[i];
         for (fp_trace_record *r = c->first; r; r = r->next) {
             if (r->type >= REC_FLOW && (r->source < first || r->source > g_trigger.last)) {
@@ -1491,6 +1553,7 @@ static int ring_write_dump(FILE *out)
     fprintf(out, ",\"s\":\"t\",\"args\":{\"frame\":%llu", TRACE_U64(g_trigger.frame + 1));
     trace_label(out, "reason", g_trigger.reason);
     trace_label(out, "source", g_trigger.source);
+    if (g_trigger.error) trace_label(out, "error", g_trigger.error);
     fputs("}},\n", out);
     size_t length = 0;
     char *summary = trace_summary(totals, &length);
@@ -1504,11 +1567,28 @@ static void ring_dump(void)
     char *path = NULL;
     if (asprintf(&path, "%s-%d-f%llu-%s.json", g_ring_prefix, g_trace_pid,
                  TRACE_U64(g_trigger.frame + 1), g_trigger.reason) < 0) return;
-    FILE *out = fopen(path, "wx");
-    int ok = out && ring_write_dump(out);
-    if (out && fclose(out)) ok = 0;
-    if (ok) fp_log("fencepost: timeline dump %s\n", path);
-    else fp_log("fencepost: could not write timeline dump %s: %s\n", path, strerror(errno));
+    char *temp = NULL;
+    int ok = 0;
+    if (asprintf(&temp, "%s.tmp.XXXXXX", path) >= 0) {
+        int fd = mkstemp(temp);
+        if (fd >= 0) {
+            FILE *out = fdopen(fd, "w");
+            if (out) {
+                ok = ring_write_dump(out);
+                if (fclose(out)) ok = 0;
+            } else close(fd);
+            /* Publish only a complete file, without replacing an earlier dump. */
+            if (ok) ok = renamex_np(temp, path, RENAME_EXCL) == 0;
+            int saved = errno;
+            if (!ok) unlink(temp);
+            errno = saved;
+        }
+        free(temp);
+    }
+    if (ok) {
+        g_dumps++;
+        fp_log("fencepost: timeline dump %s\n", path);
+    } else fp_log("fencepost: could not write timeline dump %s: %s\n", path, strerror(errno));
     free(path);
 }
 
@@ -1522,9 +1602,11 @@ static void ring_update(int final)
             if (c->frame >= g_trigger.first && c->frame <= g_trigger.last && c->outstanding) ready = 0;
         if (ready) {
             ring_dump();
-            g_trigger.active = 0;
+            free(g_trigger.error);
+            g_trigger = (fp_trigger){0};
         }
     }
+    while (g_trace_chunks && g_ring_bytes > g_ring_limit) ring_evict(1);
     uint64_t first = g_ring_latest >= g_ring ? g_ring_latest - g_ring + 1 : 0;
     if (g_trigger.active) first = MIN(first, g_trigger.first);
     while (g_trace_chunks && g_trace_chunks->frame < first) ring_evict(0);
@@ -1591,6 +1673,8 @@ static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
             print = 0;
         }
     }
+    if (g_ring && g_ring_race && (print || g_ring_race == 2))
+        ring_trigger("race", "race", s->frame, trace_clock(), NULL);
     if (!print && !marker) return;
 
     const char *prefix = certain ? "RACE" : "possible race";
@@ -1921,6 +2005,8 @@ static void check_barrier(fp_node *y)
         print = g_printed < g_max_reports;
         if (print) g_printed++;
     }
+    if (g_ring && g_ring_race && (print || g_ring_race == 2))
+        ring_trigger("race", "race", y->frame, trace_clock(), NULL);
     if (!print && !marker) return;
     char d1[256], d2[256], barrier[96], second[384];
     describe_node(d1, sizeof d1, x);
@@ -2066,6 +2152,7 @@ static void process_pending(int force)   /* lock held */
         g_npend = 0;
     }
     frames_settle(force);
+    if (g_ring) ring_update(0);
 }
 
 static void queue_recent(fp_queue *q, uint64_t uid)
@@ -2700,6 +2787,36 @@ static void maybe_summary(void)
     }
 }
 
+static int ring_new_mtime(struct timespec stamp)
+{
+    return stamp.tv_sec > g_file_mtime.tv_sec ||
+           (stamp.tv_sec == g_file_mtime.tv_sec && stamp.tv_nsec > g_file_mtime.tv_nsec);
+}
+
+/* The file is shared by every interested process. Read a bounded first
+ * line from the same inode whose timestamp we acknowledge, even on rename. */
+static void ring_poll_file(void)
+{
+    if (!g_trigger_file || !g_ring_encoded) return;
+    uint64_t now = trace_clock();
+    if (now - g_last_poll < 250000000) return;
+    g_last_poll = now;
+    struct stat st;
+    if (stat(g_trigger_file, &st) || !S_ISREG(st.st_mode) || !ring_new_mtime(st.st_mtimespec)) return;
+    int fd = open(g_trigger_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return;
+    if (!fstat(fd, &st) && S_ISREG(st.st_mode) && ring_new_mtime(st.st_mtimespec)) {
+        char reason[33];
+        ssize_t n = read(fd, reason, sizeof reason - 1);
+        if (n >= 0) {
+            reason[n] = 0;
+            g_file_mtime = st.st_mtimespec;
+            ring_trigger(reason, "file", g_frame_cur, now, NULL);
+        }
+    }
+    close(fd);
+}
+
 static void h_cb_commit(id self, SEL _cmd)
 {
     ENTER;
@@ -2729,9 +2846,9 @@ static void h_cb_commit(id self, SEL _cmd)
             c->commit_tick = ++g_tick;
             if (!c->enq) c->enq = ++c->q->enq_assign;
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (g_ring) ring_poll_file();
             queue_submit(c->q, c);
             process_pending(0);
-            if (g_ring) ring_update(0);
             if (g_trace) trace_stream_flush();
             sweep();
             g_st[ST_ANALYSIS_NS] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
@@ -3296,6 +3413,32 @@ static unsigned trace_unsigned(const char *name, unsigned fallback)
     return *end || n > UINT_MAX ? fallback : (unsigned)n;
 }
 
+static void ring_init_triggers(void)
+{
+    const char *p = getenv("FENCEPOST_TRIGGER_RACE");
+    if (p && !strcmp(p, "all")) g_ring_race = 2;
+    else if (p && !strcmp(p, "0")) g_ring_race = 0;
+    g_ring_gpuerr = trace_unsigned("FENCEPOST_TRIGGER_GPUERR", 1) != 0;
+    g_max_dumps = trace_unsigned("FENCEPOST_MAX_DUMPS", 20);
+    char extra;
+    double factor, ms, seconds;
+    p = getenv("FENCEPOST_TRIGGER_SPIKE");
+    if (p && !strcmp(p, "0")) g_spike_factor = 0;
+    else if (p && sscanf(p, "%lf:%lf%c", &factor, &ms, &extra) == 2 &&
+             isfinite(factor) && factor > 0 && isfinite(ms) && ms >= 0) {
+        g_spike_factor = factor;
+        g_spike_min_ns = ms * 1e6;
+    }
+    p = getenv("FENCEPOST_TRIGGER_COOLDOWN");
+    if (p && sscanf(p, "%lf%c", &seconds, &extra) == 1 && isfinite(seconds) && seconds >= 0)
+        g_cooldown_ns = seconds * 1e9;
+    p = getenv("FENCEPOST_TRIGGER_FILE");
+    if (!p) asprintf(&g_trigger_file, "/tmp/fencepost-trigger-%u", getuid());
+    else if (*p) g_trigger_file = strdup(p);
+    struct stat st;
+    if (g_trigger_file && !stat(g_trigger_file, &st)) g_file_mtime = st.st_mtimespec;
+}
+
 static void trace_init(const char *path)
 {
     g_ring = trace_unsigned("FENCEPOST_RING", 0);
@@ -3303,6 +3446,7 @@ static void trace_init(const char *path)
         g_ring_after = trace_unsigned("FENCEPOST_RING_AFTER", 2);
         unsigned mb = trace_unsigned("FENCEPOST_RING_MB", 64);
         g_ring_limit = (size_t)(mb ? mb : 64) * 1024 * 1024;
+        ring_init_triggers();
         g_ring_prefix = strdup(path);
         g_ring_history = calloc(FP_POOL, sizeof *g_ring_history);
     } else g_trace = fp_open_path(path, "w");

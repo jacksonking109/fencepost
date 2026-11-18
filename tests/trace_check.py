@@ -223,6 +223,9 @@ def check_trace(events, args):
         trigger = triggers[0]
         data = trigger["args"]
         assert trigger["ph"] == "i" and trigger["s"] == "t" and track_names[trigger["tid"]] == "Frames"
+        for frame in frames:
+            if frame["args"]["frame"] == data["frame"]:
+                assert frame["ts"] <= trigger["ts"] <= slice_end(frame)
         assert trigger["name"] == "TRIGGER " + data["reason"] and data["source"]
         assert args.trace.name.endswith(f"-{trigger['pid']}-f{data['frame']}-{data['reason']}.json")
         if args.trigger:
