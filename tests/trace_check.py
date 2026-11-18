@@ -33,9 +33,13 @@ def marker_kind(event):
     return next((kind for prefix, kind in MARKER_PREFIXES.items() if event["name"].startswith(prefix)), None)
 
 
+def slice_end(event):
+    return event["ts"] + event["dur"]
+
+
 def check_shape(encoders, slices, flows, markers, frames, selected, summary):
     candidates = {
-        "fence update": 1, "fence wait": 1, "racing write": 1, "event wait": 2,
+        "fence update": 1, "empty blit": 1, "fence wait": 1, "racing write": 1, "event wait": 2,
     }
     want = {name: frame for name, frame in candidates.items() if frame in selected}
     by_name = {event["name"]: event for event in encoders.values()}
@@ -61,6 +65,15 @@ def check_shape(encoders, slices, flows, markers, frames, selected, summary):
             ("race", uid("fence wait"), uid("racing write")),
         ))
         assert by_name["fence wait"]["args"]["fence_waits"][0]["last_updater_uid"] == uid("fence update")
+        produce = next(event for event in command_buffers if event["name"] == "CB #1 produce")
+        empty = by_name["empty blit"]
+        before = by_name["fence update"]
+        assert empty["args"]["estimated"] is True and empty["args"]["cb"] == produce["args"]["uid"]
+        assert empty["ts"] == max(produce["ts"], min(slice_end(before), slice_end(produce)))
+        following = (by_name[name] for name in ("fence wait", "racing write"))
+        next_start = next((event["ts"] for event in following if event["args"]["gpu_time"]), slice_end(produce))
+        limit = min(next_start, slice_end(produce))
+        assert slice_end(empty) == max(empty["ts"], min(empty["ts"] + 1, limit))
         assert len(markers) == 1
         marker = markers[0]
         assert marker["name"] == "RACE write-after-write"
@@ -92,6 +105,11 @@ def check_trace(events, args):
 
     track_names = {event["tid"]: event["args"]["name"] for event in events if event["name"] == "thread_name"}
     slices = [event for event in events if event["ph"] == "X"]
+    command_buffers = {event["args"]["uid"]: event for event in slices if event["cat"] == "command buffer"}
+
+    def cpu_domain(event):
+        return "(CPU encode time)" in track_names[event["tid"]]
+
     intervals = defaultdict(list)
     encoders = {}
     frames = []
@@ -106,7 +124,15 @@ def check_trace(events, args):
                     "fence_waits", "fence_updates", "event_waits", "after_declared_barrier", "gpu_time"} <= data.keys()
             assert data["kind"] == event["cat"] and data["uid"] not in encoders
             assert type(data["gpu_time"]) is bool
-            assert ("(CPU encode time)" in track_names[tid]) == (not data["gpu_time"])
+            estimated = data.get("estimated", False)
+            assert type(estimated) is bool and not (estimated and data["gpu_time"])
+            assert cpu_domain(event) == (not (estimated or data["gpu_time"]))
+            if data["cb"] in command_buffers:
+                assert estimated or data["gpu_time"]
+            if estimated:
+                cb = command_buffers[data["cb"]]
+                assert cb["ts"] <= start <= slice_end(event) <= slice_end(cb)
+                assert event["dur"] <= 1
             encoders[data["uid"]] = event
         if event["cat"] == "frame":
             frames.append(event)
@@ -128,19 +154,38 @@ def check_trace(events, args):
         group[event["id"]] = event
     assert starts.keys() == finishes.keys() and len(starts) == summary["flows"]
     flows = [(start, finishes[flow_id]) for flow_id, start in starts.items()]
-    command_buffers = [event for event in slices if event["cat"] == "command buffer"]
+    completed = set()
+    backward = Counter()
     for start, finish in flows:
         assert start["cat"] == finish["cat"] and start["args"] == finish["args"]
-        source = (
-            [event for event in command_buffers if event["tid"] == start["tid"]]
-            if start["cat"] == "event" else [encoders[start["args"]["from_uid"]]]
-        )
-        assert any(
-            start["tid"] == event["tid"] and event["ts"] + event["dur"] - start["ts"] == Decimal("0.001")
-            for event in source
-        ), start
-        target = encoders[finish["args"]["to_uid"]]
+        cat = start["cat"]
+        first, second = start["args"]["from_uid"], start["args"]["to_uid"]
+        if cat == "completed":
+            assert (first, second) not in completed
+            completed.add((first, second))
+            source, target = command_buffers[first], command_buffers[second]
+        else:
+            target = encoders[second]
+            if cat == "event":
+                matches = [event for event in command_buffers.values()
+                           if event["tid"] == start["tid"] and event["ts"] <= start["ts"] < slice_end(event)]
+                assert len(matches) == 1, start
+                source = matches[0]
+            else:
+                source = encoders[first]
+        assert cpu_domain(start) == cpu_domain(finish), (start, finish)
+        expected_start = slice_end(source) - min(source["dur"], Decimal("0.001"))
+        if (cat in ("fence", "event") and source["ts"] <= target["ts"] < expected_start
+                and (source["args"].get("estimated") or target["args"].get("estimated"))):
+            expected_start = target["ts"]
+        assert (start["tid"], start["ts"]) == (source["tid"], expected_start), start
         assert (finish["tid"], finish["ts"]) == (target["tid"], target["ts"]), finish
+        if start["ts"] > finish["ts"]:
+            backward[cat] += 1
+            if cat in ("fence", "event"):
+                assert cat == "fence" and source["cat"] == target["cat"] == "render", (start, finish)
+                assert any(wait["last_updater_uid"] == first and wait["stage"] == "fragment"
+                           for wait in target["args"]["fence_waits"]), (start, finish)
 
     markers = [event for event in events if event["ph"] == "i" and marker_kind(event)]
     counts = Counter(marker_kind(event) for event in markers)
@@ -150,6 +195,11 @@ def check_trace(events, args):
         assert marker["s"] == "t" and all(data[k] for k in ("resource", "first", "second", "why"))
         target = encoders[data["to_uid"]]
         assert (marker["tid"], marker["ts"]) == (target["tid"], target["ts"])
+        source = encoders.get(data["from_uid"])
+        overlap = None
+        if source and source["args"]["gpu_time"] and target["args"]["gpu_time"]:
+            overlap = source["ts"] < slice_end(target) and target["ts"] < slice_end(source)
+        assert data["overlapped_on_gpu"] is overlap, marker
     missing = 0
     for kind in MARKER_PREFIXES.values():
         assert counts[kind] == summary[f"{kind}_markers"]
@@ -169,7 +219,8 @@ def check_trace(events, args):
         first, last = args.frames or (1, 2)
         check_shape(encoders, slices, flows, markers, frames, set(range(first, last + 1)) & {1, 2}, summary)
     print(f"{args.trace}: {len(slices)} X slices, {len(encoders)} encoders ({summary['sampled']} GPU), "
-          f"{len(flows)} flows, {len(markers)} markers, {summary['dropped']} dropped")
+          f"{len(flows)} flows ({len(completed)} completed, {sum(backward.values())} backward), "
+          f"{len(markers)} markers, {summary['dropped']} dropped")
 
 
 def main():
@@ -177,7 +228,7 @@ def main():
     parser.add_argument("trace", type=Path)
     parser.add_argument("--shape", action="store_true", help="check tracetest's exact encoders, flows and marker")
     parser.add_argument("--frames", metavar="A:B", help="expect only this inclusive capture range")
-    parser.add_argument("--cpu-only", action="store_true", help="expect CPU encode timing for every encoder")
+    parser.add_argument("--cpu-only", action="store_true", help="expect no sampled GPU encoder times")
     args = parser.parse_args()
     if args.frames:
         args.frames = tuple(map(int, args.frames.split(":")))

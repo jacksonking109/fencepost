@@ -88,12 +88,16 @@ In [Perfetto](https://ui.perfetto.dev/), choose **Open trace file** and select t
 the work. Chrome's `chrome://tracing` also reads it. The **Frames** track spans present to present (or the
 program's explicit frame boundaries) and carries the chain length, parallelism and idle-commit count. The first frame
 starts when fencepost sees the first command buffer. Each queue has command buffer and encoder tracks, with extra
-lanes for overlapping slices. Encoders without GPU timestamps have CPU encode intervals on a separate queue track.
+lanes for overlapping slices. In a GPU-timed command buffer, an encoder without GPU samples gets a short estimated
+slice after the preceding encoder or at the command buffer start. It has `gpu_time: false` and `estimated: true`.
+When the command buffer has no GPU span, its encoders use a separate CPU encode time queue track.
 The **CPU encode** tracks show the work of creating and ending encoders on each CPU thread.
 
 Arrows show fence waits, event waits and work that completed before the next commit. Event arrows start on the
-signalling command buffer. Completed arrows show the latest observed completion per queue at commit. Race and
-declared-barrier markers carry the same detail as the log, including hits that repeat or exceed its report limit.
+signalling command buffer. Each command buffer can receive one completed arrow from the latest observed completion
+per queue at commit. Race and declared-barrier markers carry the same detail as the log, including hits that repeat
+or exceed its report limit. The `overlapped_on_gpu` argument is `true` if the two sampled GPU spans intersect,
+`false` if both were sampled and did not intersect, and `null` if either sampled span is unavailable.
 The trace keeps up to 20,000 of these markers. Perfetto can omit arrows whose destination ran earlier than the
 source finished, or attach an arrow to a diagnostic marker at the destination's start. The JSON retains both
 endpoints. The **fencepost summary** gives the detector counters and trace counts.
@@ -101,9 +105,10 @@ endpoints. The **fencepost summary** gives the detector counters and trace count
 GPU timestamps require stage-boundary sampling and measure whole encoders. Render spans run from vertex start
 to fragment end. Empty passes, parallel render encoders and systems without usable counter samples have no
 per-encoder GPU timing. For timestamped passes fencepost passes Metal a descriptor copy (or makes a descriptor
-for the descriptorless calls). It leaves the app's descriptor intact and skips its own samples if the app
-already samples a boundary fencepost needs or all slots are occupied. A capture can change the timing of the
-work it observes. Set `FENCEPOST_TRACE_GPU=0` to keep command buffer GPU timing and use CPU timing for every encoder.
+for the descriptorless calls). A program that attaches its own counter sample buffers at the same stage boundaries,
+such as Madeira with `gpu-pass-profile`, keeps its samples. Fencepost skips sampling those encoders and also skips
+sampling if all attachment slots are occupied. A capture can change the timing of the work it observes.
+Set `FENCEPOST_TRACE_GPU=0` to disable encoder counter sampling and keep command buffer GPU timing.
 
 The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
 process stopped before writing the closing bracket.
@@ -154,7 +159,7 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_TRACE` | unset | write a Chrome trace JSON file here; `%p` becomes the process id |
 | `FENCEPOST_TRACE_FRAMES` | all | capture frames `a:b`, inclusive and counted from 1 |
 | `FENCEPOST_TRACE_MB` | 512 | stop recording when the file reaches this size in MiB |
-| `FENCEPOST_TRACE_GPU` | 1 | 0 uses CPU encode timing for encoder slices and leaves command buffer GPU timing on |
+| `FENCEPOST_TRACE_GPU` | 1 | 0 disables encoder counter sampling and leaves command buffer GPU timing on |
 
 Each distinct race is printed once and counted after that.
 

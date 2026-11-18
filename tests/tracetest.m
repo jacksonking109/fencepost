@@ -46,6 +46,9 @@ int main(int argc, char **argv)
 
         [produce encodeWaitForEvent:producer_gate value:1];
         fill([produce blitCommandEncoder], @"fence update", independent, nil, nil, fence);
+        id<MTLBlitCommandEncoder> empty = [produce blitCommandEncoder];
+        empty.label = @"empty blit";
+        [empty endEncoding];
         fill([produce blitCommandEncoder], @"fence wait", raced, tracked, fence, nil);
 
         MTLBlitPassDescriptor *pass = [MTLBlitPassDescriptor blitPassDescriptor];

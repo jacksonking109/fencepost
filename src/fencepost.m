@@ -398,7 +398,7 @@ static const char *const trace_categories[] = { "fence", "event", "completed", "
 typedef struct fp_trace_link fp_trace_link;
 typedef struct {
     uint64_t start, end;
-    int tid, ready, encoder;
+    int tid, ready, encoder, gpu;
     fp_trace_link *waiting;
 } fp_trace_span;
 
@@ -451,10 +451,11 @@ typedef struct fp_trace_encoder {
 
 typedef struct fp_trace_cb {
     fp_trace_span span;
-    fp_trace_encoder *encoders;
+    fp_trace_encoder *encoders, **encoder_tail;
     fp_trace_device *device;
     FPTraceOwner *owner;           /* owned by the Metal command buffer */
-    uint64_t uid, last_encoder, *completed_before;
+    uint64_t uid;
+    struct fp_trace_cb **completed_before;
     uint64_t gpu_start, gpu_end;
     int queue, phased, completed, selected;
     char label[48];
@@ -475,7 +476,7 @@ static uint64_t g_trace_origin, g_trace_first = 1, g_trace_last = UINT64_MAX, g_
 static uint64_t g_trace_encoders, g_trace_sampled, g_trace_skipped, g_trace_flows, g_trace_dropped;
 static uint64_t g_trace_pool_exhausted;
 static uint64_t g_trace_markers, g_trace_marker_candidates, g_trace_marker_hits[4], g_trace_marker_counts[4];
-static uint64_t g_trace_completed[FP_MAXQ];
+static fp_trace_cb *g_trace_completed[FP_MAXQ];
 static char g_trace_queue_labels[FP_MAXQ][64];
 static fp_trace_track g_trace_tracks[FP_MAXQ][TR_QUEUE_TRACKS];
 static fp_trace_frame *g_trace_frames, **g_trace_frame_tail = &g_trace_frames;
@@ -648,8 +649,18 @@ static fp_trace_span *trace_node(uint64_t uid)
     return (fp_trace_span *)CFDictionaryGetValue(g_trace_nodes, TRACE_KEY(uid));
 }
 
+static int trace_sampled(const fp_trace_encoder *e)
+{
+    return e->gpu_start && e->gpu_end > e->gpu_start;
+}
+
+static int trace_estimated(const fp_trace_span *span)
+{
+    return span->encoder && span->gpu && !trace_sampled((const fp_trace_encoder *)span);
+}
+
 static void trace_flow_event(FILE *f, char phase, const fp_trace_span *span, uint64_t ts, const char *cat,
-                             uint64_t id, fp_trace_link *link)
+                             uint64_t id, const fp_trace_link *link)
 {
     trace_header(f, phase, span->tid, ts, cat, cat);
     if (link->kind >= TR_RACE) fputs(",\"cname\":\"terrible\"", f);
@@ -657,13 +668,19 @@ static void trace_flow_event(FILE *f, char phase, const fp_trace_span *span, uin
             TRACE_U64(id), TRACE_U64(link->from), TRACE_U64(link->to));
 }
 
-static void trace_flow(fp_trace_link *link, const fp_trace_span *from, const fp_trace_span *to)
+static void trace_flow(const fp_trace_link *link, const fp_trace_span *from, const fp_trace_span *to)
 {
+    if (from->gpu != to->gpu) return;
     if (g_trace_stopped) { g_trace_dropped += 2; return; }
     const char *cat = trace_categories[link->kind];
     uint64_t id = g_trace_flows + 1;
     /* At a shared boundary, Perfetto otherwise attaches the start to the next slice. */
     uint64_t start = from->end > from->start ? from->end - 1 : from->end;
+    /* Clamping an estimate to the CB span can put it just inside a sampled
+     * span. Anchor the arrow inside the source at their shared timestamp. */
+    if ((link->kind == TR_FENCE || link->kind == TR_EVENT) && from->start <= to->start
+            && to->start < start && (trace_estimated(from) || trace_estimated(to)))
+        start = to->start;
     char *record = NULL;
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
@@ -673,7 +690,8 @@ static void trace_flow(fp_trace_link *link, const fp_trace_span *from, const fp_
     if (trace_write(f, &record, &length, 2, 0)) g_trace_flows++;
 }
 
-static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_trace_span *to)
+static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_trace_span *to,
+                                const fp_trace_span *from)
 {
     trace_header(f, 'i', to->tid, to->start, trace_categories[link->kind], link->title);
     fprintf(f, ",\"s\":\"t\",\"cname\":\"terrible\",\"args\":{\"from_uid\":%llu,\"to_uid\":%llu",
@@ -682,7 +700,12 @@ static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_tra
     trace_label(f, "first", link->first);
     trace_label(f, "second", link->second);
     trace_label(f, "why", link->why);
-    fputs("}}", f);
+    const fp_trace_encoder *a = from && from->encoder ? (const fp_trace_encoder *)from : NULL;
+    const fp_trace_encoder *b = (const fp_trace_encoder *)to;
+    const char *overlap = "null";
+    if (a && a->span.gpu && trace_sampled(a) && trace_sampled(b))
+        overlap = a->gpu_start < b->gpu_end && b->gpu_start < a->gpu_end ? "true" : "false";
+    fprintf(f, ",\"overlapped_on_gpu\":%s}}", overlap);
 }
 
 static void trace_marker_clear(fp_trace_link *link)
@@ -691,13 +714,13 @@ static void trace_marker_clear(fp_trace_link *link)
     link->title = NULL;
 }
 
-static void trace_marker(fp_trace_link *link, const fp_trace_span *to)
+static void trace_marker(fp_trace_link *link, const fp_trace_span *to, const fp_trace_span *from)
 {
     if (g_trace_stopped) { g_trace_dropped++; return; }
     char *record = NULL;
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
-    trace_marker_record(f, link, to);
+    trace_marker_record(f, link, to, from);
     if (trace_write(f, &record, &length, 1, 0)) {
         g_trace_markers++;
         g_trace_marker_counts[link->kind - TR_RACE]++;
@@ -709,11 +732,11 @@ static void trace_link_settle(fp_trace_link *link)
     fp_trace_span *to = trace_node(link->to), *from = trace_node(link->from);
     if (to && !to->ready) { link->next = to->waiting; to->waiting = link; return; }
     if (to && to->tid) {
+        if (from && !from->ready) { link->next = from->waiting; from->waiting = link; return; }
         if (link->title) {
-            trace_marker(link, to);
+            trace_marker(link, to, from);
             trace_marker_clear(link);
         }
-        if (from && !from->ready) { link->next = from->waiting; from->waiting = link; return; }
         if (from && from->tid && from != to) trace_flow(link, from, to);
     } else if (link->title) {
         trace_marker_clear(link);
@@ -838,7 +861,7 @@ static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue)
 {
     if (g_trace_stopped || g_frame_cur >= g_trace_last) return NULL;
     fp_trace_cb *c = calloc(1, sizeof *c);
-    c->uid = uid; c->queue = queue;
+    c->uid = uid; c->queue = queue; c->encoder_tail = &c->encoders;
     if (g_trace_gpu) c->device = trace_device([cb device]);
     if (!g_trace_origin) trace_start();
     FPTraceOwner *owner = [[FPTraceOwner alloc] init];
@@ -884,7 +907,7 @@ static fp_trace_encoder *trace_encoder_begin(id cb)
         e = calloc(1, sizeof *e);
         e->start = start; e->sample = -1; e->cb = c->trace; e->span.encoder = 1;
         pthread_threadid_np(NULL, &e->thread);
-        e->next = e->cb->encoders; e->cb->encoders = e;
+        *e->cb->encoder_tail = e; e->cb->encoder_tail = &e->next;
     }
     pthread_mutex_unlock(&g_lock);
     return e;
@@ -916,14 +939,43 @@ static void trace_encoder_end(const fp_node *n)
     if (e) e->end = trace_clock();
 }
 
+/* Lay out the selected encoders in encode order before any links are settled. */
+static void trace_layout_encoders(fp_trace_cb *c)
+{
+    if (!c->gpu_start || c->gpu_end <= c->gpu_start) return;
+    uint64_t prev_end = c->gpu_start;
+    uint64_t limit = 0;
+    for (fp_trace_encoder *e = c->encoders; e; e = e->next) {
+        if (!e->selected) continue;
+        e->span.gpu = 1;
+        if (trace_sampled(e)) {
+            e->span.start = e->gpu_start;
+            e->span.end = e->gpu_end;
+            limit = 0;
+        } else {
+            if (!limit) {
+                fp_trace_encoder *next = e->next;
+                while (next && (!next->selected || !trace_sampled(next))) next = next->next;
+                limit = next ? MIN(next->gpu_start, c->gpu_end) : c->gpu_end;
+            }
+            uint64_t start = MAX(c->gpu_start, MIN(prev_end, c->gpu_end));
+            e->span.start = start;
+            e->span.end = MAX(start, MIN(start + 1000, limit));
+        }
+        prev_end = e->span.end;
+    }
+}
+
 static void trace_place_encoder(fp_trace_encoder *e)
 {
     if (!e->args || e->span.ready) return;
-    int gpu = e->gpu_start && e->gpu_end > e->gpu_start;
-    e->span.start = gpu ? e->gpu_start : e->start;
-    e->span.end = gpu ? e->gpu_end : (e->end > e->start ? e->end : e->start + 1);
+    int gpu = e->span.gpu && trace_sampled(e);
+    if (!e->span.gpu) {
+        e->span.start = e->start;
+        e->span.end = e->end > e->start ? e->end : e->start + 1;
+    }
     if (!g_trace_stopped) {
-        e->span.tid = trace_queue_lane(e->cb->queue, gpu ? TR_GPU : TR_CPU, &e->span);
+        e->span.tid = trace_queue_lane(e->cb->queue, e->span.gpu ? TR_GPU : TR_CPU, &e->span);
         const char *kind = kind_name[e->kind];
         char name[96];
         if (e->label[0]) snprintf(name, sizeof name, "%s", e->label);
@@ -936,14 +988,18 @@ static void trace_place_encoder(fp_trace_encoder *e)
         unsigned markers[4] = {0}, count = 0;
         for (fp_trace_link *link = e->span.waiting; link; link = link->next) {
             if (link->to != e->uid || !link->title) continue;
-            trace_marker_record(f, link, &e->span);
+            fp_trace_span *from = trace_node(link->from);
+            /* A laid-out source has its timing even before its slice is written. */
+            if (from && !from->ready && !from->start) continue;
+            trace_marker_record(f, link, &e->span, from);
             fputs(",\n", f);
             markers[link->kind - TR_RACE]++;
             count++;
             trace_marker_clear(link);
         }
         trace_slice(f, &e->span, kind, name);
-        fprintf(f, ",\"args\":{%s,\"gpu_time\":%s}}", e->args, gpu ? "true" : "false");
+        fprintf(f, ",\"args\":{%s,\"gpu_time\":%s%s}}", e->args, gpu ? "true" : "false",
+                trace_estimated(&e->span) ? ",\"estimated\":true" : "");
         if (trace_write(f, &record, &length, count + 1, 0)) {
             g_trace_markers += count;
             for (int i = 0; i < 4; i++) g_trace_marker_counts[i] += markers[i];
@@ -1023,11 +1079,7 @@ static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *
     }
     fp_trace_encoder *e = (fp_trace_encoder *)trace_node(n->uid);
     if (!e) return;
-    c->last_encoder = n->uid;
     e->selected = 1;
-    if (c->completed_before)
-        for (int i = 0; i < FP_MAXQ; i++)
-            if (c->completed_before[i]) trace_ordering(c->completed_before[i], n->uid, TR_COMPLETED);
     if (count) {
         e->waits = malloc((size_t)count * sizeof *waits);
         memcpy(e->waits, waits, (size_t)count * sizeof *waits);
@@ -1039,9 +1091,11 @@ static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *
 static void trace_cb_finish(fp_trace_cb *c)
 {
     if (!c->phased || !c->completed) return;
+    trace_layout_encoders(c);
     if (c->selected) {
         c->span.start = c->gpu_start; c->span.end = c->gpu_end;
         if (c->gpu_start && c->gpu_end > c->gpu_start && !g_trace_stopped) {
+            c->span.gpu = 1;
             c->span.tid = trace_queue_lane(c->queue, TR_CB, &c->span);
             char name[96];
             snprintf(name, sizeof name, "CB #%llu%s%s", TRACE_U64(c->uid), c->label[0] ? " " : "", c->label);
@@ -1054,6 +1108,15 @@ static void trace_cb_finish(fp_trace_cb *c)
         }
         trace_ready(&c->span);
     }
+    if (c->span.tid)
+        for (int i = 0; i < FP_MAXQ; i++) {
+            fp_trace_cb *from = c->completed_before[i];
+            if (!from) continue;
+            fp_trace_link link = { .from = from->uid, .to = c->uid, .kind = TR_COMPLETED };
+            trace_flow(&link, &from->span, &c->span);
+        }
+    free(c->completed_before);
+    c->completed_before = NULL;
     fp_trace_encoder *e = c->encoders;
     c->encoders = NULL;
     while (e) {
@@ -1062,7 +1125,7 @@ static void trace_cb_finish(fp_trace_cb *c)
         else trace_discard_encoder(e);
         e = next;
     }
-    if (c->last_encoder) g_trace_completed[c->queue] = c->last_encoder;
+    g_trace_completed[c->queue] = c->span.tid ? c : NULL;
     if (!c->selected) free(c);
 }
 
@@ -1752,8 +1815,6 @@ static void phase1(fp_cb *c)
         PUSH(g_pend, g_npend, g_cpend, n->uid);
     }
     if (trace) {
-        free(trace->completed_before);
-        trace->completed_before = NULL;
         trace->phased = 1;
         trace_cb_finish(trace);
     }
