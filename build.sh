@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds libfencepost.dylib and the test programs, all universal (arm64 + x86_64: the
+# Builds libfencepost.dylib, the test programs and the trigger helpers, all universal (arm64 + x86_64: the
 # x86_64 slice is the one Wine under Rosetta loads), signed ad hoc.
 #   ./build.sh                 build into out/
 #   ./build.sh release 0.1.0   also out/fencepost-0.1.0-macos.tar.gz: the dylib without debug
@@ -15,9 +15,11 @@ clang $FLAGS -dynamiclib -install_name @rpath/libfencepost.dylib -o out/.libfenc
 clang $FLAGS -o out/fptest tests/fptest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/tracetest tests/tracetest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/ringtest tests/ringtest.m -framework Metal -framework Foundation
+clang $FLAGS -o out/fencepost-trigger tools/trigger/fencepost-trigger.c
 codesign -f -s - out/.libfencepost.dylib.new out/fptest out/tracetest out/ringtest 2>/dev/null
+codesign -f -s - out/fencepost-trigger 2>/dev/null
 mv -f out/.libfencepost.dylib.new out/libfencepost.dylib
-echo "built out/libfencepost.dylib, out/fptest, out/tracetest and out/ringtest"
+echo "built out/libfencepost.dylib, out/fptest, out/tracetest, out/ringtest and out/fencepost-trigger"
 
 if [[ $1 == release ]]; then
     v=${2:?usage: ./build.sh release VERSION}
