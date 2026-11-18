@@ -18,8 +18,11 @@ clang $FLAGS -o out/ringtest tests/ringtest.m -framework Metal -framework Founda
 clang $FLAGS -o out/fencepost-trigger tools/trigger/fencepost-trigger.c
 app='out/Fencepost Trigger.app'
 mkdir -p "$app/Contents/MacOS"
-clang $FLAGS -fobjc-arc -o "$app/Contents/MacOS/Fencepost Trigger" tools/trigger/FencepostTrigger.m \
+# Built outside the bundle so its debug symbols (out/fencepost-trigger-app.dSYM) stay out of the app.
+clang $FLAGS -fobjc-arc -o out/fencepost-trigger-app tools/trigger/FencepostTrigger.m \
     -framework Cocoa -framework Carbon
+rm -rf "$app/Contents/MacOS/Fencepost Trigger.dSYM"
+mv -f out/fencepost-trigger-app "$app/Contents/MacOS/Fencepost Trigger"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
