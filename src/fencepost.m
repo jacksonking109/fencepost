@@ -397,7 +397,7 @@ static const char *const trace_categories[] = { "fence", "event", "completed", "
 
 typedef struct fp_trace_link fp_trace_link;
 typedef struct {
-    uint64_t start, end;
+    uint64_t start, end, frame;
     int tid, ready, encoder, gpu;
     fp_trace_link *waiting;
 } fp_trace_span;
@@ -457,7 +457,7 @@ typedef struct fp_trace_cb {
     uint64_t uid;
     struct fp_trace_cb **completed_before;
     uint64_t gpu_start, gpu_end;
-    int queue, phased, completed, selected;
+    int queue, phased, completed, selected, has_encoder;
     char label[48];
 } fp_trace_cb;
 
@@ -528,24 +528,88 @@ static void trace_us(FILE *f, int64_t ns)
     fprintf(f, "%s%llu.%03llu", ns < 0 ? "-" : "", TRACE_U64(v / 1000), TRACE_U64(v % 1000));
 }
 
-/* A flow pair is staged and budgeted together. Put the comma before each event so
- * the last complete record is readable even when the process misses atexit. */
-static int trace_write(FILE *f, char **record, size_t *length, unsigned events, int final)
+/* A record can contain multiple inseparable events (e.g. a flow pair).
+ * Frames are assigned in submission order, but analysis and GPU completion
+ * can append to an earlier frame. All chunk operations run under g_lock. */
+#define TRACE_METADATA UINT64_MAX
+typedef struct fp_trace_record {
+    struct fp_trace_record *next;
+    char *json;
+    size_t length;
+} fp_trace_record;
+
+typedef struct fp_trace_chunk {
+    struct fp_trace_chunk *next;
+    uint64_t frame;
+    fp_trace_record *first, *last;
+} fp_trace_chunk;
+
+static fp_trace_chunk g_trace_metadata, *g_trace_chunks;
+static int g_trace_has_output;
+
+static fp_trace_chunk *trace_chunk(uint64_t frame)
+{
+    if (frame == TRACE_METADATA) return &g_trace_metadata;
+    fp_trace_chunk **slot = &g_trace_chunks;
+    while (*slot && (*slot)->frame < frame) slot = &(*slot)->next;
+    if (!*slot || (*slot)->frame != frame) {
+        fp_trace_chunk *chunk = calloc(1, sizeof *chunk);
+        chunk->frame = frame;
+        chunk->next = *slot;
+        *slot = chunk;
+    }
+    return *slot;
+}
+
+static void trace_drain(fp_trace_chunk *chunk)
+{
+    while (chunk->first) {
+        fp_trace_record *r = chunk->first;
+        fputs(g_trace_has_output ? ",\n" : "\n", g_trace);
+        fwrite(r->json, 1, r->length, g_trace);
+        g_trace_has_output = 1;
+        chunk->first = r->next;
+        free(r->json);
+        free(r);
+    }
+    chunk->last = NULL;
+}
+
+static void trace_stream_flush(void)
+{
+    trace_drain(&g_trace_metadata);
+    while (g_trace_chunks) {
+        fp_trace_chunk *chunk = g_trace_chunks;
+        g_trace_chunks = chunk->next;
+        trace_drain(chunk);
+        free(chunk);
+    }
+}
+
+/* Budget whole records, including their separator, before publishing them. */
+static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events, int final)
 {
     int ok = !fclose(f);
     if (!final && !g_trace_stopped && g_trace_bytes + *length + 2 + FP_TRACE_RESERVE > g_trace_limit) {
         g_trace_stopped = 1;
         fp_log("fencepost: trace size limit reached (FENCEPOST_TRACE_MB); recording stopped\n");
+        trace_stream_flush();
         fflush(g_trace);
     }
     if (ok && (final || !g_trace_stopped)) {
-        const char *prefix = g_trace_bytes == 1 ? "\n" : ",\n";
-        ok = fputs(prefix, g_trace) != EOF && fwrite(*record, 1, *length, g_trace) == *length;
-        g_trace_bytes += strlen(prefix) + *length;
-    } else ok = 0;
-    if (!ok) g_trace_dropped += events;
+        fp_trace_chunk *chunk = trace_chunk(frame);
+        fp_trace_record *r = calloc(1, sizeof *r);
+        r->json = *record;
+        r->length = *length;
+        if (chunk->last) chunk->last->next = r;
+        else chunk->first = r;
+        chunk->last = r;
+        g_trace_bytes += *length + (g_trace_bytes == 1 ? 1 : 2);
+        return 1;
+    }
+    g_trace_dropped += events;
     free(*record);
-    return ok;
+    return 0;
 }
 
 static void trace_header(FILE *f, char phase, int tid, uint64_t ts, const char *cat, const char *name)
@@ -572,7 +636,7 @@ static void trace_start(void)
     fputs(",\"ts\":0.000,\"args\":{\"name\":", f);
     trace_string(f, [[NSProcessInfo processInfo] processName].UTF8String);
     fputs("}}", f);
-    trace_write(f, &record, &length, 1, 0);
+    trace_write(TRACE_METADATA, f, &record, &length, 1, 0);
 }
 
 static int trace_name_track(const char *name)
@@ -585,7 +649,7 @@ static int trace_name_track(const char *name)
     fputs(",\"args\":{\"name\":", f);
     trace_string(f, name);
     fputs("}}", f);
-    trace_write(f, &record, &length, 1, 0);
+    trace_write(TRACE_METADATA, f, &record, &length, 1, 0);
     return tid;
 }
 
@@ -687,7 +751,7 @@ static void trace_flow(const fp_trace_link *link, const fp_trace_span *from, con
     trace_flow_event(f, 's', from, start, cat, id, link);
     fputs(",\n", f);
     trace_flow_event(f, 'f', to, to->start, cat, id, link);
-    if (trace_write(f, &record, &length, 2, 0)) g_trace_flows++;
+    if (trace_write(to->frame, f, &record, &length, 2, 0)) g_trace_flows++;
 }
 
 static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_trace_span *to,
@@ -721,7 +785,7 @@ static void trace_marker(fp_trace_link *link, const fp_trace_span *to, const fp_
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
     trace_marker_record(f, link, to, from);
-    if (trace_write(f, &record, &length, 1, 0)) {
+    if (trace_write(to->frame, f, &record, &length, 1, 0)) {
         g_trace_markers++;
         g_trace_marker_counts[link->kind - TR_RACE]++;
     }
@@ -1000,7 +1064,7 @@ static void trace_place_encoder(fp_trace_encoder *e)
         trace_slice(f, &e->span, kind, name);
         fprintf(f, ",\"args\":{%s,\"gpu_time\":%s%s}}", e->args, gpu ? "true" : "false",
                 trace_estimated(&e->span) ? ",\"estimated\":true" : "");
-        if (trace_write(f, &record, &length, count + 1, 0)) {
+        if (trace_write(e->span.frame, f, &record, &length, count + 1, 0)) {
             g_trace_markers += count;
             for (int i = 0; i < 4; i++) g_trace_marker_counts[i] += markers[i];
             g_trace_encoders++;
@@ -1018,7 +1082,7 @@ static void trace_place_encoder(fp_trace_encoder *e)
             f = open_memstream(&record, &length);
             trace_slice(f, &cpu, "cpu encode", name);
             fprintf(f, ",\"args\":{\"uid\":%llu}}", TRACE_U64(e->uid));
-            trace_write(f, &record, &length, 1, 0);
+            trace_write(e->span.frame, f, &record, &length, 1, 0);
         } else e->span.tid = 0;
     } else g_trace_dropped++;
     free(e->args); e->args = NULL;
@@ -1071,6 +1135,10 @@ static void trace_analyse(const fp_node *n)
 
 static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *waits, int count)
 {
+    if (n->kind != FPK_SIGNAL && !c->has_encoder) {
+        c->has_encoder = 1;
+        c->span.frame = n->frame;
+    }
     if (!trace_frame_selected(n->frame) || g_trace_stopped) return;
     c->selected = 1;
     if (n->kind == FPK_SIGNAL) {
@@ -1079,6 +1147,7 @@ static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *
     }
     fp_trace_encoder *e = (fp_trace_encoder *)trace_node(n->uid);
     if (!e) return;
+    e->span.frame = n->frame;
     e->selected = 1;
     if (count) {
         e->waits = malloc((size_t)count * sizeof *waits);
@@ -1104,7 +1173,7 @@ static void trace_cb_finish(fp_trace_cb *c)
             FILE *f = open_memstream(&record, &length);
             trace_slice(f, &c->span, "command buffer", name);
             fprintf(f, ",\"args\":{\"uid\":%llu,\"queue\":%d}}", TRACE_U64(c->uid), c->queue);
-            if (!trace_write(f, &record, &length, 1, 0)) c->span.tid = 0;
+            if (!trace_write(c->span.frame, f, &record, &length, 1, 0)) c->span.tid = 0;
         }
         trace_ready(&c->span);
     }
@@ -1183,7 +1252,7 @@ static void trace_frame_done(uint64_t frame, const fp_frame *r)
     /* Ratio with six fractional digits, without a locale-dependent decimal point. */
     uint64_t ratio = r->depth ? (uint64_t)r->nenc * 1000000 / r->depth : 0;
     fprintf(f, "%llu.%06llu,\"gpu_idle_commits\":%ld}}", TRACE_U64(ratio / 1000000), TRACE_U64(ratio % 1000000), r->idle);
-    trace_write(f, &record, &length, 1, 0);
+    trace_write(frame, f, &record, &length, 1, 0);
 }
 
 static void trace_final_node(const void *key, const void *value, void *context)
@@ -1224,7 +1293,9 @@ static void trace_final(void)
         fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(g_trace_marker_hits[i]),
                 types[i], TRACE_U64(g_trace_marker_counts[i]));
     fputs("}}", f);
-    trace_write(f, &record, &length, 1, 1);
+    trace_stream_flush();
+    trace_write(TRACE_METADATA, f, &record, &length, 1, 1);
+    trace_stream_flush();
     fputs("\n]\n", g_trace);
     fclose(g_trace);
     g_trace = NULL;
@@ -1756,6 +1827,7 @@ static void phase1(fp_cb *c)
     fp_evwait active[32]; int nactive = 0;
     fp_queue *q = c->q;
     fp_trace_cb *trace = g_trace_enabled ? c->trace : NULL;
+    if (trace) trace->span.frame = g_frame_cur;  /* fallback for an encoderless CB */
     if (trace && trace_frame_selected(g_frame_cur) && !g_trace_stopped) trace->selected = 1;
     g_st[ST_CBS]++;
     for (int i = 0; i < c->nit; i++) {
@@ -1851,6 +1923,7 @@ static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
             if (n && !n->done_tick) n->done_tick = g_tick;
         }
     if (trace) trace_cb_completed(trace, b);
+    if (g_trace) trace_stream_flush();
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -2399,6 +2472,7 @@ static void h_cb_commit(id self, SEL _cmd)
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             queue_submit(c->q, c);
             process_pending(0);
+            if (g_trace) trace_stream_flush();
             sweep();
             g_st[ST_ANALYSIS_NS] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
         }
