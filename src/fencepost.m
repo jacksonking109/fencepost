@@ -398,12 +398,12 @@ static const char *const trace_categories[] = { "fence", "event", "completed", "
 typedef struct fp_trace_link fp_trace_link;
 typedef struct {
     uint64_t start, end, frame;
-    int tid, ready, encoder, gpu;
+    int tid, ready, encoder, gpu, sampled;
     fp_trace_link *waiting;
 } fp_trace_span;
 
 typedef struct {
-    uint64_t start, end;
+    uint64_t start, end, frame;
 } fp_trace_interval;
 
 typedef struct fp_trace_frame {
@@ -412,6 +412,7 @@ typedef struct fp_trace_frame {
 } fp_trace_frame;
 
 typedef struct {
+    uint64_t floor;
     int tid, n, cap;
     fp_trace_interval *intervals;
 } fp_trace_lane;
@@ -449,13 +450,17 @@ typedef struct fp_trace_encoder {
 }
 @end
 
+typedef struct { uint64_t uid; fp_trace_span span; } fp_trace_endpoint;
+
 typedef struct fp_trace_cb {
     fp_trace_span span;
     fp_trace_encoder *encoders, **encoder_tail;
     fp_trace_device *device;
     FPTraceOwner *owner;           /* owned by the Metal command buffer */
     uint64_t uid;
-    struct fp_trace_cb **completed_before;
+    fp_trace_endpoint *completed_before;
+    uint64_t *signals;
+    int nsignals, csignals, refs;
     uint64_t gpu_start, gpu_end;
     int queue, phased, completed, selected, has_encoder;
     char label[48];
@@ -476,7 +481,7 @@ static uint64_t g_trace_origin, g_trace_first = 1, g_trace_last = UINT64_MAX, g_
 static uint64_t g_trace_encoders, g_trace_sampled, g_trace_skipped, g_trace_flows, g_trace_dropped;
 static uint64_t g_trace_pool_exhausted;
 static uint64_t g_trace_markers, g_trace_marker_candidates, g_trace_marker_hits[4], g_trace_marker_counts[4];
-static fp_trace_cb *g_trace_completed[FP_MAXQ];
+static fp_trace_endpoint g_trace_completed[FP_MAXQ];
 static char g_trace_queue_labels[FP_MAXQ][64];
 static fp_trace_track g_trace_tracks[FP_MAXQ][TR_QUEUE_TRACKS];
 static fp_trace_frame *g_trace_frames, **g_trace_frame_tail = &g_trace_frames;
@@ -536,20 +541,45 @@ typedef struct fp_trace_record {
     struct fp_trace_record *next;
     char *json;
     size_t length;
+    uint64_t source;
+    unsigned type;
 } fp_trace_record;
+
+enum { REC_PLAIN, REC_ENCODER, REC_SAMPLED, REC_FLOW, REC_MARKER }; /* REC_MARKER + kind offset */
 
 typedef struct fp_trace_chunk {
     struct fp_trace_chunk *next;
     uint64_t frame;
     fp_trace_record *first, *last;
+    size_t bytes;
+    unsigned outstanding;
+    uint64_t marker_hits[4], end;
 } fp_trace_chunk;
 
 static fp_trace_chunk g_trace_metadata, *g_trace_chunks;
-static int g_trace_has_output;
+static int g_trace_has_output, g_frames_tid;
+static unsigned g_ring, g_ring_after = 2;
+static size_t g_ring_bytes, g_ring_limit = 64u * 1024u * 1024u;
+static uint64_t g_ring_floor, g_ring_latest, g_ring_evictions, g_ring_cap_evictions;
+static fp_trace_endpoint *g_ring_history;
+static char *g_ring_prefix;
+static int g_ring_encoded;
+
+typedef struct {
+    int active;
+    uint64_t frame, first, last, timestamp;
+    char reason[33];
+    const char *source;
+} fp_trigger;
+
+static fp_trigger g_trigger;
+static void ring_update(int final);
+
 
 static fp_trace_chunk *trace_chunk(uint64_t frame)
 {
     if (frame == TRACE_METADATA) return &g_trace_metadata;
+    if (g_ring && frame < g_ring_floor) return NULL;
     fp_trace_chunk **slot = &g_trace_chunks;
     while (*slot && (*slot)->frame < frame) slot = &(*slot)->next;
     if (!*slot || (*slot)->frame != frame) {
@@ -557,17 +587,23 @@ static fp_trace_chunk *trace_chunk(uint64_t frame)
         chunk->frame = frame;
         chunk->next = *slot;
         *slot = chunk;
+        if (g_ring) g_ring_bytes += sizeof *chunk;
     }
     return *slot;
 }
 
-static void trace_drain(fp_trace_chunk *chunk)
+static int trace_emit(FILE *out, int *started, const fp_trace_record *r)
+{
+    if (fputs(*started ? ",\n" : "\n", out) == EOF || fwrite(r->json, 1, r->length, out) != r->length) return 0;
+    *started = 1;
+    return 1;
+}
+
+static void trace_drain(fp_trace_chunk *chunk, FILE *out)
 {
     while (chunk->first) {
         fp_trace_record *r = chunk->first;
-        fputs(g_trace_has_output ? ",\n" : "\n", g_trace);
-        fwrite(r->json, 1, r->length, g_trace);
-        g_trace_has_output = 1;
+        if (out) trace_emit(out, &g_trace_has_output, r);
         chunk->first = r->next;
         free(r->json);
         free(r);
@@ -577,20 +613,33 @@ static void trace_drain(fp_trace_chunk *chunk)
 
 static void trace_stream_flush(void)
 {
-    trace_drain(&g_trace_metadata);
+    trace_drain(&g_trace_metadata, g_trace);
     while (g_trace_chunks) {
         fp_trace_chunk *chunk = g_trace_chunks;
         g_trace_chunks = chunk->next;
-        trace_drain(chunk);
+        trace_drain(chunk, g_trace);
         free(chunk);
     }
 }
 
+static void ring_evict(int cap)
+{
+    fp_trace_chunk *chunk = g_trace_chunks;
+    g_trace_chunks = chunk->next;
+    g_ring_bytes -= chunk->bytes + sizeof *chunk;
+    g_ring_floor = chunk->frame + 1;
+    g_ring_evictions++;
+    if (cap) g_ring_cap_evictions++;
+    trace_drain(chunk, NULL);
+    free(chunk);
+}
+
 /* Budget whole records, including their separator, before publishing them. */
-static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events, int final)
+static int trace_store(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events, int final,
+                       unsigned type, uint64_t source)
 {
     int ok = !fclose(f);
-    if (!final && !g_trace_stopped && g_trace_bytes + *length + 2 + FP_TRACE_RESERVE > g_trace_limit) {
+    if (!g_ring && !final && !g_trace_stopped && g_trace_bytes + *length + 2 + FP_TRACE_RESERVE > g_trace_limit) {
         g_trace_stopped = 1;
         fp_log("fencepost: trace size limit reached (FENCEPOST_TRACE_MB); recording stopped\n");
         trace_stream_flush();
@@ -598,7 +647,21 @@ static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, u
     }
     if (ok && (final || !g_trace_stopped)) {
         fp_trace_chunk *chunk = trace_chunk(frame);
+        size_t bytes = sizeof(fp_trace_record) + *length + 1;
+        if (g_ring) {
+            while (g_trace_chunks && g_ring_bytes + bytes > g_ring_limit) ring_evict(1);
+            if ((frame != TRACE_METADATA && frame < g_ring_floor) || g_ring_bytes + bytes > g_ring_limit) {
+                if (frame == TRACE_METADATA) g_trace_stopped = 1;
+                free(*record);
+                g_trace_dropped += events;
+                return 0;
+            }
+            g_ring_bytes += bytes;
+            chunk->bytes += bytes;
+        }
         fp_trace_record *r = calloc(1, sizeof *r);
+        r->source = source;
+        r->type = type;
         r->json = *record;
         r->length = *length;
         if (chunk->last) chunk->last->next = r;
@@ -610,6 +673,11 @@ static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, u
     g_trace_dropped += events;
     free(*record);
     return 0;
+}
+
+static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events, int final)
+{
+    return trace_store(frame, f, record, length, events, final, REC_PLAIN, 0);
 }
 
 static void trace_header(FILE *f, char phase, int tid, uint64_t ts, const char *cat, const char *name)
@@ -666,6 +734,13 @@ static int trace_lane(fp_trace_track *track, const char *name, const fp_trace_sp
             PUSH(track->lanes, track->n, track->cap, fresh);
         }
         fp_trace_lane *lane = &track->lanes[i];
+        if (g_ring && lane->floor != g_ring_floor) {
+            int kept = 0;
+            for (int j = 0; j < lane->n; j++)
+                if (lane->intervals[j].frame >= g_ring_floor) lane->intervals[kept++] = lane->intervals[j];
+            lane->n = kept;
+            lane->floor = g_ring_floor;
+        }
         int lo = lane->n, hi = lane->n;
         if (lo && lane->intervals[lo - 1].end > span->start) lo = 0;
         while (lo < hi) {
@@ -674,7 +749,7 @@ static int trace_lane(fp_trace_track *track, const char *name, const fp_trace_sp
             else hi = mid;
         }
         if (lo < lane->n && lane->intervals[lo].start < span->end) continue;
-        fp_trace_interval interval = { span->start, span->end };
+        fp_trace_interval interval = { span->start, span->end, span->frame };
         PUSH(lane->intervals, lane->n, lane->cap, interval);
         if (lo < lane->n - 1) {
             memmove(lane->intervals + lo + 1, lane->intervals + lo,
@@ -710,7 +785,10 @@ static void trace_slice(FILE *f, const fp_trace_span *span, const char *kind, co
 
 static fp_trace_span *trace_node(uint64_t uid)
 {
-    return (fp_trace_span *)CFDictionaryGetValue(g_trace_nodes, TRACE_KEY(uid));
+    fp_trace_span *live = (fp_trace_span *)CFDictionaryGetValue(g_trace_nodes, TRACE_KEY(uid));
+    if (live || !g_ring || !uid) return live;
+    fp_trace_endpoint *old = &g_ring_history[uid % FP_POOL];
+    return old->uid == uid ? &old->span : NULL;
 }
 
 static int trace_sampled(const fp_trace_encoder *e)
@@ -720,7 +798,7 @@ static int trace_sampled(const fp_trace_encoder *e)
 
 static int trace_estimated(const fp_trace_span *span)
 {
-    return span->encoder && span->gpu && !trace_sampled((const fp_trace_encoder *)span);
+    return span->encoder && span->gpu && !span->sampled;
 }
 
 static void trace_flow_event(FILE *f, char phase, const fp_trace_span *span, uint64_t ts, const char *cat,
@@ -751,7 +829,7 @@ static void trace_flow(const fp_trace_link *link, const fp_trace_span *from, con
     trace_flow_event(f, 's', from, start, cat, id, link);
     fputs(",\n", f);
     trace_flow_event(f, 'f', to, to->start, cat, id, link);
-    if (trace_write(to->frame, f, &record, &length, 2, 0)) g_trace_flows++;
+    if (trace_store(to->frame, f, &record, &length, 2, 0, REC_FLOW, from->frame)) g_trace_flows++;
 }
 
 static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_trace_span *to,
@@ -764,11 +842,9 @@ static void trace_marker_record(FILE *f, const fp_trace_link *link, const fp_tra
     trace_label(f, "first", link->first);
     trace_label(f, "second", link->second);
     trace_label(f, "why", link->why);
-    const fp_trace_encoder *a = from && from->encoder ? (const fp_trace_encoder *)from : NULL;
-    const fp_trace_encoder *b = (const fp_trace_encoder *)to;
     const char *overlap = "null";
-    if (a && a->span.gpu && trace_sampled(a) && trace_sampled(b))
-        overlap = a->gpu_start < b->gpu_end && b->gpu_start < a->gpu_end ? "true" : "false";
+    if (from && from->sampled && to->sampled)
+        overlap = from->start < to->end && to->start < from->end ? "true" : "false";
     fprintf(f, ",\"overlapped_on_gpu\":%s}}", overlap);
 }
 
@@ -785,7 +861,8 @@ static void trace_marker(fp_trace_link *link, const fp_trace_span *to, const fp_
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
     trace_marker_record(f, link, to, from);
-    if (trace_write(to->frame, f, &record, &length, 1, 0)) {
+    if (trace_store(to->frame, f, &record, &length, 1, 0, REC_MARKER + link->kind - TR_RACE,
+                    from ? from->frame : UINT64_MAX)) {
         g_trace_markers++;
         g_trace_marker_counts[link->kind - TR_RACE]++;
     }
@@ -831,7 +908,12 @@ static int trace_marker_hit(const fp_node *to, unsigned kind)
 {
     if (!trace_frame_selected(to->frame)) return 0;
     g_trace_marker_hits[kind - TR_RACE]++;
-    if (g_trace_marker_candidates++ >= FP_TRACE_MARKERS || g_trace_stopped || !trace_node(to->uid)) {
+    if (g_ring) {
+        fp_trace_chunk *chunk = trace_chunk(to->frame);
+        if (!chunk) return 0;
+        chunk->marker_hits[kind - TR_RACE]++;
+    }
+    if ((!g_ring && g_trace_marker_candidates++ >= FP_TRACE_MARKERS) || g_trace_stopped || !trace_node(to->uid)) {
         g_trace_dropped++;
         return 0;
     }
@@ -925,7 +1007,7 @@ static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue)
 {
     if (g_trace_stopped || g_frame_cur >= g_trace_last) return NULL;
     fp_trace_cb *c = calloc(1, sizeof *c);
-    c->uid = uid; c->queue = queue; c->encoder_tail = &c->encoders;
+    c->refs = 1; c->uid = uid; c->queue = queue; c->encoder_tail = &c->encoders;
     if (g_trace_gpu) c->device = trace_device([cb device]);
     if (!g_trace_origin) trace_start();
     FPTraceOwner *owner = [[FPTraceOwner alloc] init];
@@ -1013,6 +1095,7 @@ static void trace_layout_encoders(fp_trace_cb *c)
         if (!e->selected) continue;
         e->span.gpu = 1;
         if (trace_sampled(e)) {
+            e->span.sampled = 1;
             e->span.start = e->gpu_start;
             e->span.end = e->gpu_end;
             limit = 0;
@@ -1028,6 +1111,20 @@ static void trace_layout_encoders(fp_trace_cb *c)
         }
         prev_end = e->span.end;
     }
+}
+
+/* Keep resolved endpoints only as long as the detector can refer to their
+ * UIDs. An encoder waiting for analysis still owns a reference to its CB. */
+static void ring_archive(uint64_t uid, fp_trace_span *span)
+{
+    CFDictionaryRemoveValue(g_trace_nodes, TRACE_KEY(uid));
+    fp_trace_endpoint *slot = &g_ring_history[uid % FP_POOL];
+    if (slot->uid < uid) *slot = (fp_trace_endpoint){ uid, *span };
+}
+
+static void ring_release_cb(fp_trace_cb *c)
+{
+    if (!--c->refs) free(c);
 }
 
 static void trace_place_encoder(fp_trace_encoder *e)
@@ -1055,6 +1152,11 @@ static void trace_place_encoder(fp_trace_encoder *e)
             fp_trace_span *from = trace_node(link->from);
             /* A laid-out source has its timing even before its slice is written. */
             if (from && !from->ready && !from->start) continue;
+            if (g_ring) {
+                trace_marker(link, &e->span, from);
+                trace_marker_clear(link);
+                continue;
+            }
             trace_marker_record(f, link, &e->span, from);
             fputs(",\n", f);
             markers[link->kind - TR_RACE]++;
@@ -1064,7 +1166,7 @@ static void trace_place_encoder(fp_trace_encoder *e)
         trace_slice(f, &e->span, kind, name);
         fprintf(f, ",\"args\":{%s,\"gpu_time\":%s%s}}", e->args, gpu ? "true" : "false",
                 trace_estimated(&e->span) ? ",\"estimated\":true" : "");
-        if (trace_write(e->span.frame, f, &record, &length, count + 1, 0)) {
+        if (trace_store(e->span.frame, f, &record, &length, count + 1, 0, gpu ? REC_SAMPLED : REC_ENCODER, 0)) {
             g_trace_markers += count;
             for (int i = 0; i < 4; i++) g_trace_marker_counts[i] += markers[i];
             g_trace_encoders++;
@@ -1077,7 +1179,7 @@ static void trace_place_encoder(fp_trace_encoder *e)
             }
             char thread[64];
             snprintf(thread, sizeof thread, "CPU encode %llu", TRACE_U64(e->thread));
-            fp_trace_span cpu = { .start = e->start, .end = e->end > e->start ? e->end : e->start + 1 };
+            fp_trace_span cpu = { .frame = e->span.frame, .start = e->start, .end = e->end > e->start ? e->end : e->start + 1 };
             cpu.tid = trace_lane(track, thread, &cpu);
             f = open_memstream(&record, &length);
             trace_slice(f, &cpu, "cpu encode", name);
@@ -1087,6 +1189,13 @@ static void trace_place_encoder(fp_trace_encoder *e)
     } else g_trace_dropped++;
     free(e->args); e->args = NULL;
     trace_ready(&e->span);
+    if (g_ring) {
+        fp_trace_chunk *chunk = trace_chunk(e->span.frame);
+        if (chunk) chunk->outstanding--;
+        ring_archive(e->uid, &e->span);
+        ring_release_cb(e->cb);
+        free(e);
+    }
 }
 
 static const char *trace_stage(const fp_node *n, int stage, const char *nonrender)
@@ -1135,6 +1244,7 @@ static void trace_analyse(const fp_node *n)
 
 static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *waits, int count)
 {
+    if (g_ring) g_ring_latest = n->frame;
     if (n->kind != FPK_SIGNAL && !c->has_encoder) {
         c->has_encoder = 1;
         c->span.frame = n->frame;
@@ -1143,10 +1253,16 @@ static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *
     c->selected = 1;
     if (n->kind == FPK_SIGNAL) {
         CFDictionarySetValue(g_trace_nodes, TRACE_KEY(n->uid), &c->span);
+        if (g_ring) PUSH(c->signals, c->nsignals, c->csignals, n->uid);
         return;
     }
     fp_trace_encoder *e = (fp_trace_encoder *)trace_node(n->uid);
     if (!e) return;
+    if (g_ring) {
+        fp_trace_chunk *chunk = trace_chunk(n->frame);
+        if (chunk) chunk->outstanding++;
+        c->refs++;
+    }
     e->span.frame = n->frame;
     e->selected = 1;
     if (count) {
@@ -1179,8 +1295,8 @@ static void trace_cb_finish(fp_trace_cb *c)
     }
     if (c->span.tid)
         for (int i = 0; i < FP_MAXQ; i++) {
-            fp_trace_cb *from = c->completed_before[i];
-            if (!from) continue;
+            fp_trace_endpoint *from = &c->completed_before[i];
+            if (!from->uid) continue;
             fp_trace_link link = { .from = from->uid, .to = c->uid, .kind = TR_COMPLETED };
             trace_flow(&link, &from->span, &c->span);
         }
@@ -1194,8 +1310,14 @@ static void trace_cb_finish(fp_trace_cb *c)
         else trace_discard_encoder(e);
         e = next;
     }
-    g_trace_completed[c->queue] = c->span.tid ? c : NULL;
-    if (!c->selected) free(c);
+    g_trace_completed[c->queue] = (fp_trace_endpoint){ c->span.tid ? c->uid : 0, c->span };
+    if (g_ring) {
+        for (int i = 0; i < c->nsignals; i++) ring_archive(c->signals[i], &c->span);
+        free(c->signals);
+        fp_trace_chunk *chunk = c->selected ? trace_chunk(c->span.frame) : NULL;
+        if (chunk) chunk->outstanding--;
+        ring_release_cb(c);
+    } else if (!c->selected) free(c);
 }
 
 static void trace_cb_completed(fp_trace_cb *c, id<MTLCommandBuffer> cb)
@@ -1220,6 +1342,7 @@ static void trace_cb_completed(fp_trace_cb *c, id<MTLCommandBuffer> cb)
 
 static void trace_frame_boundary(uint64_t frame, uint64_t timestamp, fp_trace_cb *c)
 {
+    if (g_ring) g_ring_latest = frame;
     if (!g_trace_frame_start) g_trace_frame_start = timestamp;
     if (timestamp < g_trace_frame_start) timestamp = g_trace_frame_start;
     if (trace_frame_selected(frame) && !g_trace_stopped) {
@@ -1238,12 +1361,15 @@ static void trace_frame_done(uint64_t frame, const fp_frame *r)
     if (!item || item->frame != frame) return;
     g_trace_frames = item->next;
     if (!g_trace_frames) g_trace_frame_tail = &g_trace_frames;
-    static int tid;
-    if (!tid) tid = trace_name_track("Frames");
+    if (!g_frames_tid) g_frames_tid = trace_name_track("Frames");
+    if (g_ring) {
+        fp_trace_chunk *chunk = trace_chunk(frame);
+        if (chunk) chunk->end = item->end;
+    }
     char name[40], *record = NULL;
     size_t length = 0;
     snprintf(name, sizeof name, "Frame %llu", TRACE_U64(frame + 1));
-    fp_trace_span span = { .start = item->start, .end = item->end, .tid = tid };
+    fp_trace_span span = { .start = item->start, .end = item->end, .tid = g_frames_tid };
     free(item);
     FILE *f = open_memstream(&record, &length);
     trace_slice(f, &span, "frame", name);
@@ -1263,7 +1389,12 @@ static void trace_final_node(const void *key, const void *value, void *context)
     if (!span->ready) trace_ready(span);
 }
 
-static void trace_final(void)
+typedef struct {
+    uint64_t encoders, sampled, skipped, flows, markers, dropped, hits[4], counts[4];
+    uint64_t outside_flows, outside_markers;
+} fp_trace_counts;
+
+static char *trace_summary(fp_trace_counts totals, size_t *length)
 {
     static const char *const stats[] = {
         "race_unique", "possible_unique", "race_hits", "possible_hits", "nodes", "accesses", "cbs",
@@ -1272,30 +1403,152 @@ static void trace_final(void)
         "objs", "obj_drops", "analysis_ns", "frames", "frame_enc", "frame_chain", "gpu_idle"
     };
     _Static_assert(sizeof stats / sizeof *stats == ST_COUNT, "trace summary must include all detector counters");
-    while (g_trace_frames) {
-        uint64_t frame = g_trace_frames->frame;
-        trace_frame_done(frame, frame_get(frame));
-    }
-    CFDictionaryApplyFunction(g_trace_nodes, trace_final_node, NULL);
     char *record = NULL;
-    size_t length = 0;
-    FILE *f = open_memstream(&record, &length);
+    FILE *f = open_memstream(&record, length);
     trace_header(f, 'i', 0, trace_clock(), "fencepost", "fencepost summary");
     fprintf(f, ",\"s\":\"p\",\"args\":{\"encoders_traced\":%llu,\"sampled\":%llu,\"sampling_skipped\":%llu,\"pool_exhausted\":%llu,"
             "\"flows\":%llu,\"markers\":%llu,\"dropped\":%llu,\"sampling_supported\":%s,\"size_limit_reached\":%s",
-            TRACE_U64(g_trace_encoders), TRACE_U64(g_trace_sampled), TRACE_U64(g_trace_skipped),
-            TRACE_U64(g_trace_pool_exhausted), TRACE_U64(g_trace_flows),
-            TRACE_U64(g_trace_markers), TRACE_U64(g_trace_dropped), g_trace_sampling_supported ? "true" : "false",
+            TRACE_U64(totals.encoders), TRACE_U64(totals.sampled), TRACE_U64(totals.skipped),
+            TRACE_U64(g_trace_pool_exhausted), TRACE_U64(totals.flows),
+            TRACE_U64(totals.markers), TRACE_U64(totals.dropped), g_trace_sampling_supported ? "true" : "false",
             g_trace_stopped ? "true" : "false");
     for (int i = 0; i < ST_COUNT; i++) fprintf(f, ",\"%s\":%ld", stats[i], g_st[i]);
     static const char *const types[] = { "race", "possible", "order", "partial" };
     for (int i = 0; i < 4; i++)
-        fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(g_trace_marker_hits[i]),
-                types[i], TRACE_U64(g_trace_marker_counts[i]));
+        fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(totals.hits[i]),
+                types[i], TRACE_U64(totals.counts[i]));
+    if (g_ring)
+        fprintf(f, ",\"evicted_frames\":%llu,\"memory_evictions\":%llu,\"outside_flows\":%llu,\"outside_markers\":%llu",
+                TRACE_U64(g_ring_evictions), TRACE_U64(g_ring_cap_evictions),
+                TRACE_U64(totals.outside_flows), TRACE_U64(totals.outside_markers));
     fputs("}}", f);
+    fclose(f);
+    return record;
+}
+
+static void ring_trigger(const char *reason, const char *source, uint64_t frame, uint64_t timestamp)
+{
+    if (!g_ring_encoded || g_trace_stopped || g_trigger.active || !trace_frame_selected(frame)) return;
+    fp_trigger trigger = { .active = 1, .frame = frame, .timestamp = timestamp, .source = source };
+    trigger.first = frame >= g_ring ? frame - g_ring + 1 : 0;
+    trigger.last = frame + g_ring_after;
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)(reason ? reason : "");
+         *p && *p != '\n' && *p != '\r' && n < sizeof trigger.reason - 1; p++) {
+        unsigned c = *p;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        trigger.reason[n++] = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ? c : '-';
+    }
+    if (!n) strcpy(trigger.reason, "manual");
+    g_trigger = trigger;
+}
+
+__attribute__((visibility("default"))) void fencepost_trigger(const char *reason)
+{
+    if (!g_ring) return;
+    pthread_mutex_lock(&g_lock);
+    ring_trigger(reason, "api", g_frame_cur, trace_clock());
+    pthread_mutex_unlock(&g_lock);
+}
+
+static int ring_write_dump(FILE *out)
+{
+    int started = 0;
+    fp_trace_counts totals = {0};
+    uint64_t first = MAX(g_trigger.first, g_ring_floor), timestamp = g_trigger.timestamp;
+    if (!g_frames_tid) g_frames_tid = trace_name_track("Frames");
+    if (fputc('[', out) == EOF) return 0;
+    for (fp_trace_record *r = g_trace_metadata.first; r; r = r->next)
+        if (!trace_emit(out, &started, r)) return 0;
+    for (fp_trace_chunk *c = g_trace_chunks; c; c = c->next) {
+        if (c->frame < first || c->frame > g_trigger.last) continue;
+        if (c->frame == g_trigger.frame && c->end) timestamp = MIN(timestamp, c->end);
+        for (int i = 0; i < 4; i++) totals.hits[i] += c->marker_hits[i];
+        for (fp_trace_record *r = c->first; r; r = r->next) {
+            if (r->type >= REC_FLOW && (r->source < first || r->source > g_trigger.last)) {
+                if (r->type == REC_FLOW) totals.outside_flows++;
+                else totals.outside_markers++;
+                continue;
+            }
+            if (!trace_emit(out, &started, r)) return 0;
+            if (r->type == REC_FLOW) totals.flows++;
+            if (r->type >= REC_MARKER) {
+                totals.markers++;
+                totals.counts[r->type - REC_MARKER]++;
+            }
+            if (r->type == REC_SAMPLED) totals.sampled++;
+            if (r->type == REC_ENCODER || r->type == REC_SAMPLED) totals.encoders++;
+        }
+    }
+    totals.skipped = g_trace_gpu ? totals.encoders - totals.sampled : 0;
+    totals.dropped = totals.outside_flows * 2;
+    for (int i = 0; i < 4; i++) totals.dropped += totals.hits[i] - totals.counts[i];
+
+    char title[48];
+    snprintf(title, sizeof title, "TRIGGER %s", g_trigger.reason);
+    fputs(started ? ",\n" : "\n", out);
+    trace_header(out, 'i', g_frames_tid, timestamp, "frame", title);
+    fprintf(out, ",\"s\":\"t\",\"args\":{\"frame\":%llu", TRACE_U64(g_trigger.frame + 1));
+    trace_label(out, "reason", g_trigger.reason);
+    trace_label(out, "source", g_trigger.source);
+    fputs("}},\n", out);
+    size_t length = 0;
+    char *summary = trace_summary(totals, &length);
+    int ok = fwrite(summary, 1, length, out) == length;
+    free(summary);
+    return ok && fputs("\n]\n", out) != EOF && !ferror(out);
+}
+
+static void ring_dump(void)
+{
+    char *path = NULL;
+    if (asprintf(&path, "%s-%d-f%llu-%s.json", g_ring_prefix, g_trace_pid,
+                 TRACE_U64(g_trigger.frame + 1), g_trigger.reason) < 0) return;
+    FILE *out = fopen(path, "wx");
+    int ok = out && ring_write_dump(out);
+    if (out && fclose(out)) ok = 0;
+    if (ok) fp_log("fencepost: timeline dump %s\n", path);
+    else fp_log("fencepost: could not write timeline dump %s: %s\n", path, strerror(errno));
+    free(path);
+}
+
+/* Wait for both analysis and Metal completion in the captured window. A
+ * busy queue can complete several frames behind the CPU. Never block it. */
+static void ring_update(int final)
+{
+    if (g_trigger.active && (final || g_frame_next > g_trigger.last)) {
+        int ready = 1;
+        for (fp_trace_chunk *c = g_trace_chunks; !final && c; c = c->next)
+            if (c->frame >= g_trigger.first && c->frame <= g_trigger.last && c->outstanding) ready = 0;
+        if (ready) {
+            ring_dump();
+            g_trigger.active = 0;
+        }
+    }
+    uint64_t first = g_ring_latest >= g_ring ? g_ring_latest - g_ring + 1 : 0;
+    if (g_trigger.active) first = MIN(first, g_trigger.first);
+    while (g_trace_chunks && g_trace_chunks->frame < first) ring_evict(0);
+    g_ring_floor = MAX(first, g_ring_floor);
+}
+
+static void trace_final(void)
+{
+    while (g_trace_frames) {
+        uint64_t frame = g_trace_frames->frame;
+        trace_frame_done(frame, frame_get(frame));
+    }
+    if (g_ring) { ring_update(1); return; }
+    CFDictionaryApplyFunction(g_trace_nodes, trace_final_node, NULL);
+    fp_trace_counts totals = { g_trace_encoders, g_trace_sampled, g_trace_skipped, g_trace_flows,
+                               g_trace_markers, g_trace_dropped, {0}, {0}, 0, 0 };
+    memcpy(totals.hits, g_trace_marker_hits, sizeof totals.hits);
+    memcpy(totals.counts, g_trace_marker_counts, sizeof totals.counts);
+    size_t length = 0;
+    char *record = trace_summary(totals, &length);
     trace_stream_flush();
-    trace_write(TRACE_METADATA, f, &record, &length, 1, 1);
-    trace_stream_flush();
+    fp_trace_record summary = { .json = record, .length = length };
+    trace_emit(g_trace, &g_trace_has_output, &summary);
+    free(record);
     fputs("\n]\n", g_trace);
     fclose(g_trace);
     g_trace = NULL;
@@ -1887,6 +2140,10 @@ static void phase1(fp_cb *c)
         PUSH(g_pend, g_npend, g_cpend, n->uid);
     }
     if (trace) {
+        if (g_ring && trace->selected) {
+            fp_trace_chunk *chunk = trace_chunk(trace->span.frame);
+            if (chunk) chunk->outstanding++;
+        }
         trace->phased = 1;
         trace_cb_finish(trace);
     }
@@ -1923,6 +2180,7 @@ static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
             if (n && !n->done_tick) n->done_tick = g_tick;
         }
     if (trace) trace_cb_completed(trace, b);
+    if (g_ring) ring_update(0);
     if (g_trace) trace_stream_flush();
     pthread_mutex_unlock(&g_lock);
 }
@@ -2218,6 +2476,7 @@ static fp_node *on_encoder(id cb, id enc, int kind, fp_trace_encoder *trace)
     if (c) {
         n = node_new(kind);
         n->enc = (void *)enc; n->cb_uid = c->uid; n->idx = ++c->nenc;
+        if (g_ring) g_ring_encoded = 1;
         if (trace) trace_encoder_register(trace, n);
         fp_item it = { 0, n->uid, NULL, 0 };
         PUSH(c->it, c->nit, c->cit, it);
@@ -2472,6 +2731,7 @@ static void h_cb_commit(id self, SEL _cmd)
             uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             queue_submit(c->q, c);
             process_pending(0);
+            if (g_ring) ring_update(0);
             if (g_trace) trace_stream_flush();
             sweep();
             g_st[ST_ANALYSIS_NS] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
@@ -3027,10 +3287,26 @@ static FILE *fp_open_path(const char *p, const char *mode)
     return fopen(path, mode);
 }
 
+static unsigned trace_unsigned(const char *name, unsigned fallback)
+{
+    const char *s = getenv(name);
+    if (!s || *s < '0' || *s > '9') return fallback;
+    char *end;
+    unsigned long long n = strtoull(s, &end, 10);
+    return *end || n > UINT_MAX ? fallback : (unsigned)n;
+}
+
 static void trace_init(const char *path)
 {
-    g_trace = fp_open_path(path, "w");
-    if (!g_trace) {
+    g_ring = trace_unsigned("FENCEPOST_RING", 0);
+    if (g_ring) {
+        g_ring_after = trace_unsigned("FENCEPOST_RING_AFTER", 2);
+        unsigned mb = trace_unsigned("FENCEPOST_RING_MB", 64);
+        g_ring_limit = (size_t)(mb ? mb : 64) * 1024 * 1024;
+        g_ring_prefix = strdup(path);
+        g_ring_history = calloc(FP_POOL, sizeof *g_ring_history);
+    } else g_trace = fp_open_path(path, "w");
+    if (!g_ring && !g_trace) {
         fp_log("fencepost: could not open FENCEPOST_TRACE: %s\n", strerror(errno));
         return;
     }
@@ -3049,8 +3325,10 @@ static void trace_init(const char *path)
     g_trace_pid = getpid();
     g_trace_nodes = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     g_trace_threads = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-    setvbuf(g_trace, NULL, _IOFBF, 64 * 1024);
-    fputc('[', g_trace);
+    if (g_trace) {
+        setvbuf(g_trace, NULL, _IOFBF, 64 * 1024);
+        fputc('[', g_trace);
+    }
     g_trace_bytes = 1;
     g_trace_enabled = 1;
     atexit(final_summary);

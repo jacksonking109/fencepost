@@ -129,7 +129,7 @@ def check_trace(events, args):
             assert cpu_domain(event) == (not (estimated or data["gpu_time"]))
             if data["cb"] in command_buffers:
                 assert estimated or data["gpu_time"]
-            if estimated:
+            if estimated and (not args.dump or data["cb"] in command_buffers):
                 cb = command_buffers[data["cb"]]
                 assert cb["ts"] <= start <= slice_end(event) <= slice_end(cb)
                 assert event["dur"] <= 1
@@ -189,7 +189,8 @@ def check_trace(events, args):
 
     markers = [event for event in events if event["ph"] == "i" and marker_kind(event)]
     counts = Counter(marker_kind(event) for event in markers)
-    assert len(markers) == summary["markers"] <= 20000
+    assert len(markers) == summary["markers"]
+    assert args.dump or len(markers) <= 20000
     for marker in markers:
         data = marker["args"]
         assert marker["s"] == "t" and all(data[k] for k in ("resource", "first", "second", "why"))
@@ -205,7 +206,7 @@ def check_trace(events, args):
         assert counts[kind] == summary[f"{kind}_markers"]
         scoped = summary[f"{kind}_marker_hits"]
         assert counts[kind] <= scoped <= summary[f"{kind}_hits"]
-        if not args.frames:
+        if not args.frames and not args.dump:
             assert scoped == summary[f"{kind}_hits"]
         missing += scoped - counts[kind]
     assert missing <= summary["dropped"]
@@ -215,6 +216,20 @@ def check_trace(events, args):
     if args.frames:
         first, last = args.frames
         assert all(first <= event["args"]["frame"] <= last for event in (*encoders.values(), *frames))
+    if args.dump:
+        assert args.trace.read_text().rstrip().endswith("]")
+        triggers = [e for e in events if e["name"].startswith("TRIGGER ")]
+        assert len(triggers) == 1
+        trigger = triggers[0]
+        data = trigger["args"]
+        assert trigger["ph"] == "i" and trigger["s"] == "t" and track_names[trigger["tid"]] == "Frames"
+        assert trigger["name"] == "TRIGGER " + data["reason"] and data["source"]
+        assert args.trace.name.endswith(f"-{trigger['pid']}-f{data['frame']}-{data['reason']}.json")
+        if args.trigger:
+            assert (data["frame"], data["reason"]) == (int(args.trigger[0]), args.trigger[1])
+        if args.frames:
+            assert sorted(f["args"]["frame"] for f in frames) == list(range(first, last + 1))
+        assert all(m["args"]["from_uid"] in encoders for m in markers)
     if args.shape:
         first, last = args.frames or (1, 2)
         check_shape(encoders, slices, flows, markers, frames, set(range(first, last + 1)) & {1, 2}, summary)
@@ -229,6 +244,8 @@ def main():
     parser.add_argument("--shape", action="store_true", help="check tracetest's exact encoders, flows and marker")
     parser.add_argument("--frames", metavar="A:B", help="expect only this inclusive capture range")
     parser.add_argument("--cpu-only", action="store_true", help="expect no sampled GPU encoder times")
+    parser.add_argument("--dump", action="store_true", help="check a standalone triggered capture")
+    parser.add_argument("--trigger", nargs=2, metavar=("FRAME", "REASON"), help="expect this trigger in the dump")
     args = parser.parse_args()
     if args.frames:
         args.frames = tuple(map(int, args.frames.split(":")))

@@ -14,9 +14,10 @@ clang $FLAGS -dynamiclib -install_name @rpath/libfencepost.dylib -o out/.libfenc
     -framework Metal -framework Foundation
 clang $FLAGS -o out/fptest tests/fptest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/tracetest tests/tracetest.m -framework Metal -framework Foundation
-codesign -f -s - out/.libfencepost.dylib.new out/fptest out/tracetest 2>/dev/null
+clang $FLAGS -o out/ringtest tests/ringtest.m -framework Metal -framework Foundation
+codesign -f -s - out/.libfencepost.dylib.new out/fptest out/tracetest out/ringtest 2>/dev/null
 mv -f out/.libfencepost.dylib.new out/libfencepost.dylib
-echo "built out/libfencepost.dylib, out/fptest and out/tracetest"
+echo "built out/libfencepost.dylib, out/fptest, out/tracetest and out/ringtest"
 
 if [[ $1 == release ]]; then
     v=${2:?usage: ./build.sh release VERSION}
