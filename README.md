@@ -98,7 +98,7 @@ signalling command buffer. Each command buffer can receive one completed arrow f
 per queue at commit. Race and declared-barrier markers carry the same detail as the log, including hits that repeat
 or exceed its report limit. The `overlapped_on_gpu` argument is `true` if the two sampled GPU spans intersect,
 `false` if both were sampled and did not intersect, and `null` if either sampled span is unavailable.
-The trace keeps up to 20,000 of these markers. Perfetto can omit arrows whose destination ran earlier than the
+The streaming trace keeps up to 20,000 of these markers. Perfetto can omit arrows whose destination ran earlier than the
 source finished, or attach an arrow to a diagnostic marker at the destination's start. The JSON retains both
 endpoints. The **fencepost summary** gives the detector counters and trace counts.
 
@@ -112,6 +112,36 @@ Set `FENCEPOST_TRACE_GPU=0` to disable encoder counter sampling and keep command
 
 The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
 process stopped before writing the closing bracket.
+
+## Catching a bad frame (FENCEPOST_RING)
+
+```
+FENCEPOST_RING=10 FENCEPOST_TRACE=/tmp/fencepost DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib your-metal-program
+```
+
+Fencepost keeps the last 10 frames of timeline in memory. A trigger on frame 30 keeps frames 21 through 30,
+then records two more by default. Once their analysis and GPU timings are available, fencepost logs the path
+to `<prefix>-<pid>-f<frame>-<reason>.json`. Open that file in Perfetto and find **TRIGGER** on the **Frames**
+track. Each dump includes its own track names and summary. On normal exit a pending dump contains the work
+available so far.
+
+A new race or ORDER signature that gets a detailed report triggers `race`. A command buffer error triggers
+`gpu-error` and includes the error description. A long CPU frame triggers `spike` when its boundary-to-boundary
+duration exceeds both the previous 120 frames' median times the factor and that median plus the minimum increase.
+A program can also call `void fencepost_trigger(const char *reason)` through `dlsym`. Only processes that have
+encoded work accept triggers.
+
+To mark a glitch yourself, run `printf 'flicker\n' > /tmp/fencepost-trigger-$(id -u)`. Fencepost checks for a
+newer modification time at commit, at most once every 250 ms. An existing file establishes the starting time.
+The first line supplies the reason (up to 32 characters, sanitised to `[a-z0-9-]`), or `manual` for an empty
+line or file. Fencepost only reads the file, so several processes can observe the same update. A Wine user can
+point `FENCEPOST_TRIGGER_FILE` wherever they like. A hotkey helper is planned separately.
+
+The memory cap evicts the oldest frames first and can shorten either side of a capture. A command buffer belongs
+to its first encoder's frame. Arrows and diagnostic markers belong to their destination frame. The summary counts
+arrows and markers dropped because their source is outside the dump, frame evictions, and triggers suppressed
+while another dump was pending, during cooldown, or after the dump limit. Detector counters cover the process
+up to the dump.
 
 ## How it works
 
@@ -156,10 +186,19 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
 | `FENCEPOST_CHAIN` | 0 | list the longest ordered chain of this frame (counted from 1) |
 | `FENCEPOST_BIND_MAYWRITE` | 0 | 1: direct compute bindings of writable resources count as "may write", not reads |
-| `FENCEPOST_TRACE` | unset | write a Chrome trace JSON file here; `%p` becomes the process id |
+| `FENCEPOST_TRACE` | unset | stream to this JSON file (`%p` expands to the process id), or use this literal prefix for ring dumps |
 | `FENCEPOST_TRACE_FRAMES` | all | capture frames `a:b`, inclusive and counted from 1 |
-| `FENCEPOST_TRACE_MB` | 512 | stop recording when the file reaches this size in MiB |
+| `FENCEPOST_TRACE_MB` | 512 | stop streaming when the file reaches this size in MiB |
 | `FENCEPOST_TRACE_GPU` | 1 | 0 disables encoder counter sampling and leaves command buffer GPU timing on |
+| `FENCEPOST_RING` | 0 | frames to retain through the trigger frame (inclusive), requires `FENCEPOST_TRACE` |
+| `FENCEPOST_RING_AFTER` | 2 | additional frames to record after a trigger |
+| `FENCEPOST_RING_MB` | 64 | memory budget in MiB for retained timeline records and metadata |
+| `FENCEPOST_TRIGGER_RACE` | new | `new` fires on detailed reports, `all` on every race or ORDER hit, `0` disables |
+| `FENCEPOST_TRIGGER_GPUERR` | 1 | trigger on command buffer errors, `0` disables |
+| `FENCEPOST_TRIGGER_SPIKE` | 2:8 | median multiplier and minimum increase in ms (`factor:min_ms`), `0` disables |
+| `FENCEPOST_TRIGGER_FILE` | `/tmp/fencepost-trigger-<uid>` | watch this file for a newer modification time, empty disables |
+| `FENCEPOST_TRIGGER_COOLDOWN` | 5 | seconds between accepted triggers in one process |
+| `FENCEPOST_MAX_DUMPS` | 20 | maximum dumps per process |
 
 Each distinct race is printed once and counted after that.
 
@@ -196,6 +235,8 @@ FENCEPOST_TRACE=out/fptest.json DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dyli
 python3 -I tests/trace_check.py out/fptest.json
 FENCEPOST_TRACE=out/tracetest.json FENCEPOST_MAX_REPORTS=0 DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/tracetest
 python3 -I tests/trace_check.py --shape out/tracetest.json
+python3 -I tests/ring_check.py arm64
+python3 -I tests/ring_check.py x86_64
 ```
 
 `tests/fptest.m` holds 34 small Metal programs with and without the synchronisation they need, each with the number of
