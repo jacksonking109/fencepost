@@ -2,8 +2,11 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static void fill(id<MTLCommandBuffer> cb, id<MTLBuffer> buffer)
@@ -22,13 +25,19 @@ int main(int argc, char **argv)
         if (!device || !frame || !trigger) return 2;
         const char *mode = argc == 2 ? argv[1] : "api";
         int race = !strcmp(mode, "race"), spike = !strcmp(mode, "spike"), file = !strcmp(mode, "file");
-        if (!race && !spike && !file && strcmp(mode, "api")) return 2;
+        int external = !strcmp(mode, "external");
+        if (!race && !spike && !file && !external && strcmp(mode, "api")) return 2;
         const char *path = getenv("FENCEPOST_TRIGGER_FILE");
-        if (file && (!path || !*path)) return 2;
+        if ((file || external) && (!path || !*path)) return 2;
+        struct stat initial = {0};
+        if (external && stat(path, &initial) == -1 && errno != ENOENT) return 1;
         id<MTLCommandQueue> queue = [device newCommandQueue];
         id<MTLBuffer> buffer = [device newBufferWithLength:4096 options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked];
-        trigger("idle");
-        for (int i = 1; i <= (spike ? 140 : 40); i++) @autoreleasepool {
+        if (!external) trigger("idle");
+        uint64_t deadline = external ? clock_gettime_nsec_np(CLOCK_MONOTONIC) + 10000000000ULL : 0;
+        int changed = 0;
+        for (int i = 1; external ? clock_gettime_nsec_np(CLOCK_MONOTONIC) < deadline
+                                 : i <= (spike ? 140 : 40); i++) @autoreleasepool {
             id<MTLCommandBuffer> cb = [queue commandBuffer];
             fill(cb, buffer);
             if (race && (i == 30 || i == 35)) fill(cb, buffer);
@@ -50,6 +59,22 @@ int main(int argc, char **argv)
             [cb commit];
             [cb waitUntilCompleted];
             if (cb.status != MTLCommandBufferStatusCompleted) return 1;
+            if (external) {
+                if (i == 10) {
+                    puts("ready");
+                    fflush(stdout);
+                }
+                struct stat current;
+                if (!changed && stat(path, &current) == 0 &&
+                    (current.st_ino != initial.st_ino ||
+                     current.st_mtimespec.tv_sec != initial.st_mtimespec.tv_sec ||
+                     current.st_mtimespec.tv_nsec != initial.st_mtimespec.tv_nsec)) {
+                    changed = 1;
+                    /* Give fencepost's 250 ms poll and post-trigger frames time to finish. */
+                    deadline = MIN(deadline, clock_gettime_nsec_np(CLOCK_MONOTONIC) + 400000000ULL);
+                }
+                usleep(10000);
+            }
         }
         [buffer release];
         [queue release];
