@@ -137,14 +137,37 @@ encoded work accept triggers.
 To mark a glitch yourself, run `printf 'flicker\n' > /tmp/fencepost-trigger-$(id -u)`. Fencepost checks for a
 newer modification time at commit, at most once every 250 ms. An existing file establishes the starting time.
 The first line supplies the reason (up to 32 characters, sanitised to `[a-z0-9-]`), or `manual` for an empty
-line or file. Fencepost only reads the file, so several processes can observe the same update. A Wine user can
-point `FENCEPOST_TRIGGER_FILE` wherever they like. A hotkey helper is planned separately.
+line or file. Fencepost only reads the file, so several processes can observe the same update. Set
+`FENCEPOST_TRIGGER_FILE` to use a different path.
 
 The memory cap evicts the oldest frames first and can shorten either side of a capture. A command buffer belongs
 to its first encoder's frame. Arrows and diagnostic markers belong to their destination frame. The summary counts
 arrows and markers dropped because their source is outside the dump, frame evictions, and triggers suppressed
 while another dump was pending, during cooldown, or after the dump limit. Detector counters cover the process
 up to the dump.
+
+### Hotkey helper
+
+Run `./build.sh`, then `open "out/Fencepost Trigger.app"`. Choose **Save timeline now** in the **FP** menu
+or press **Control–Option–Command–F11**. The global hotkey takes that combination away from the game while
+the app runs. If macOS can't register it, the menu shows **Global hotkey unavailable**.
+
+To change the hotkey or the trigger path, run these commands and restart the app. Use `ctrl`, `opt`, `cmd`
+and `shift` with a key from `f1`–`f19`, `a`–`z` or `0`–`9`.
+
+```sh
+defaults write io.github.jacksonking109.fencepost-trigger hotkey 'ctrl+opt+cmd+f10'
+defaults write io.github.jacksonking109.fencepost-trigger triggerFile -string /tmp/my-fencepost-trigger
+```
+
+Set `FENCEPOST_TRIGGER_FILE` to the same path in the traced process. The default is `/tmp/fencepost-trigger-<uid>`.
+For scripts, use `out/fencepost-trigger flicker` or pass `--file /tmp/my-fencepost-trigger`. The CLI uses
+`FENCEPOST_TRIGGER_FILE` when `--file` is omitted and uses `manual` when no reason is given. Both helpers only
+write a file and work with any program traced by fencepost, whether it runs through Wine or natively.
+
+To check the hotkey by hand, run a traced program with `FENCEPOST_RING` enabled and press the combination while
+the program is rendering. Use the Fn key too if your keyboard uses F11 as a media key. The **FP** item should
+briefly show a checkmark, and fencepost should log a dump whose filename ends in `-hotkey.json`.
 
 ## How it works
 
@@ -240,6 +263,8 @@ FENCEPOST_TRACE=out/tracetest.json FENCEPOST_MAX_REPORTS=0 DYLD_INSERT_LIBRARIES
 python3 -I tests/trace_check.py --shape out/tracetest.json
 python3 -I tests/ring_check.py arm64
 python3 -I tests/ring_check.py x86_64
+python3 -I tests/trigger_check.py arm64
+python3 -I tests/trigger_check.py x86_64
 ```
 
 `tests/fptest.m` holds 34 small Metal programs with and without the synchronisation they need, each with the number of
@@ -254,6 +279,9 @@ races, barrier violations or frame chain lengths fencepost must report. Examples
 `tests/tracetest.m` encodes a fence pair, a planted race and a cross-queue event in two frames. The checker
 verifies their exact arrows and marker, track lanes, and the trace's summary. Use `out/tracetest --app-counters`
 to check that the app still gets its own timestamps when tracing is on.
+
+`tests/trigger_check.py` checks trigger file writes, one CLI-triggered ring dump and app startup in the logged-in
+macOS session. Check the global hotkey by hand as described above.
 
 ## Results so far
 
