@@ -78,6 +78,36 @@ fencepost: CHAIN frame 300: 4 encoders; the longest chain the synchronisation fo
 A program that does not present, or wants its own frame boundaries, calls `fencepost_frame(commandBuffer)` (found with
 `dlsym` like `fencepost_barrier`); from its first call, presents no longer end frames.
 
+## Timeline (FENCEPOST_TRACE)
+
+```
+FENCEPOST_TRACE=/tmp/fencepost-%p.json DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib your-metal-program
+```
+
+In [Perfetto](https://ui.perfetto.dev/), choose **Open trace file** and select the JSON for the process that encoded
+the work. Chrome's `chrome://tracing` also reads it. The **Frames** track spans present to present (or the
+program's explicit frame boundaries) and carries the chain length, parallelism and idle-commit count. The first frame
+starts when fencepost sees the first command buffer. Each queue has command buffer and encoder tracks, with extra
+lanes for overlapping slices. Encoders without GPU timestamps have CPU encode intervals on a separate queue track.
+The **CPU encode** tracks show the work of creating and ending encoders on each CPU thread.
+
+Arrows show fence waits, event waits and work that completed before the next commit. Event arrows start on the
+signalling command buffer. Completed arrows show the latest observed completion per queue at commit. Race and
+declared-barrier markers carry the same detail as the log, including hits that repeat or exceed its report limit.
+The trace keeps up to 20,000 of these markers. Perfetto can omit arrows whose destination ran earlier than the
+source finished, or attach an arrow to a diagnostic marker at the destination's start. The JSON retains both
+endpoints. The **fencepost summary** gives the detector counters and trace counts.
+
+GPU timestamps require stage-boundary sampling and measure whole encoders. Render spans run from vertex start
+to fragment end. Empty passes, parallel render encoders and systems without usable counter samples have no
+per-encoder GPU timing. For timestamped passes fencepost passes Metal a descriptor copy (or makes a descriptor
+for the descriptorless calls). It leaves the app's descriptor intact and skips its own samples if the app
+already samples a boundary fencepost needs or all slots are occupied. A capture can change the timing of the
+work it observes. Set `FENCEPOST_TRACE_GPU=0` to keep command buffer GPU timing and use CPU timing for every encoder.
+
+The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
+process stopped before writing the closing bracket.
+
 ## How it works
 
 - **Nodes:** every encoder is one. A render encoder has two stages, vertex and fragment.
@@ -121,6 +151,10 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
 | `FENCEPOST_CHAIN` | 0 | list the longest ordered chain of this frame (counted from 1) |
 | `FENCEPOST_BIND_MAYWRITE` | 0 | 1: direct compute bindings of writable resources count as "may write", not reads |
+| `FENCEPOST_TRACE` | unset | write a Chrome trace JSON file here; `%p` becomes the process id |
+| `FENCEPOST_TRACE_FRAMES` | all | capture frames `a:b`, inclusive and counted from 1 |
+| `FENCEPOST_TRACE_MB` | 512 | stop recording when the file reaches this size in MiB |
+| `FENCEPOST_TRACE_GPU` | 1 | 0 uses CPU encode timing for encoder slices and leaves command buffer GPU timing on |
 
 Each distinct race is printed once and counted after that.
 
@@ -153,6 +187,10 @@ git clone https://github.com/jacksonking109/fencepost && cd fencepost
 ./build.sh release 0.1.0                                     # also a release archive, without debug information
 DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
 arch -x86_64 -e DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest   # the Rosetta slice
+FENCEPOST_TRACE=out/fptest.json DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
+python3 -I tests/trace_check.py out/fptest.json
+FENCEPOST_TRACE=out/tracetest.json FENCEPOST_MAX_REPORTS=0 DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/tracetest
+python3 -I tests/trace_check.py --shape out/tracetest.json
 ```
 
 `tests/fptest.m` holds 34 small Metal programs with and without the synchronisation they need, each with the number of
@@ -163,6 +201,10 @@ races, barrier violations or frame chain lengths fencepost must report. Examples
 - a fence that must be resolved in enqueue order, not commit order;
 - mip levels written and read through views;
 - a fence wait that crosses a frame boundary, which must not lengthen the new frame's chain.
+
+`tests/tracetest.m` encodes a fence pair, a planted race and a cross-queue event in two frames. The checker
+verifies their exact arrows and marker, track lanes, and the trace's summary. Use `out/tracetest --app-counters`
+to check that the app still gets its own timestamps when tracing is on.
 
 ## Results so far
 
