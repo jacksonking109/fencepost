@@ -2855,6 +2855,8 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
     }
 }
 
+/* Keep command-buffer allocation gated until Metal has stopped recording.
+ * A buffer allocated during this transition can enter the preceding capture. */
 static void capture_stop(int time_limit)
 {
     if (!g_capture_path) return;
