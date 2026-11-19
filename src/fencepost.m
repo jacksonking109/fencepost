@@ -2863,6 +2863,21 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
     }
 }
 
+static NSString *capture_resource_name(NSString *entry)
+{
+    NSString *name = entry.lastPathComponent;
+    size_t prefix;
+    if ([name hasPrefix:@"MTLBuffer-"]) prefix = sizeof "MTLBuffer-" - 1;
+    else if ([name hasPrefix:@"MTLTexture-"]) prefix = sizeof "MTLTexture-" - 1;
+    else return nil;
+
+    /* Metal uses names like MTLBuffer-4-0, with the snapshot index last. */
+    const char *id_start = name.UTF8String + prefix;
+    size_t digits = strspn(id_start, "0123456789");
+    if (!digits || (id_start[digits] && id_start[digits] != '-')) return nil;
+    return [name substringToIndex:prefix + digits];
+}
+
 /* Keep command-buffer allocation gated until Metal has stopped recording.
  * A buffer allocated during this transition can enter the preceding capture. */
 static void capture_stop(int time_limit)
@@ -2877,13 +2892,35 @@ static void capture_stop(int time_limit)
         uint64_t size = 0;
         NSFileManager *files = NSFileManager.defaultManager;
         NSDirectoryEnumerator *entries = [files enumeratorAtPath:g_capture_path];
-        while ([entries nextObject]) {
+        NSMutableDictionary<NSString *, NSNumber *> *sizes = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
+        NSString *entry;
+        while ((entry = [entries nextObject])) {
             NSDictionary *attrs = entries.fileAttributes;
-            if ([attrs.fileType isEqualToString:NSFileTypeRegular]) size += attrs.fileSize;
+            if (![attrs.fileType isEqualToString:NSFileTypeRegular]) continue;
+            uint64_t bytes = attrs.fileSize;
+            size += bytes;
+            NSString *name = capture_resource_name(entry);
+            if (name) {
+                sizes[name] = @(sizes[name].unsignedLongLongValue + bytes);
+                counts[name] = @(counts[name].unsignedLongLongValue + 1);
+            }
         }
         fp_log("fencepost: capture written %s, %.2f MB, %.1f s%s\n", g_capture_path.fileSystemRepresentation,
                size / 1048576.0, (g_capture_stopped - g_capture_started) / 1e9,
                time_limit ? " (time limit)" : "");
+        NSArray<NSString *> *largest = [[sizes allKeys] sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            NSComparisonResult order = [sizes[b] compare:sizes[a]];
+            return order == NSOrderedSame ? [a compare:b] : order;
+        }];
+        for (NSUInteger i = 0; i < MIN(largest.count, 3); i++) {
+            NSString *name = largest[i];
+            fp_log("fencepost: largest: %s %.0f MB in %llu snapshots\n", name.UTF8String,
+                   sizes[name].unsignedLongLongValue / 1048576.0, counts[name].unsignedLongLongValue);
+        }
+        if (size > 2 * 1073741824ULL)
+            fp_log("fencepost: big captures come from large buffers the frame touches. "
+                   "A timeline dump (⌃⌥⌘F) is the cheap alternative.\n");
         [g_capture_path release];
         g_capture_path = nil;
         char ignored[sizeof g_capture_reason];

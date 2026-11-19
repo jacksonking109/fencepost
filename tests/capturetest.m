@@ -35,7 +35,9 @@ int main(int argc, char **argv)
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device || !frame || !capture) return 2;
         id<MTLCommandQueue> queue = [device newCommandQueue];
-        id<MTLBuffer> buffer = [device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+        // The capture stores the larger buffer in a named snapshot file.
+        NSUInteger length = api ? 8 * 1024 * 1024 : 4096;
+        id<MTLBuffer> buffer = [device newBufferWithLength:length options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> first = [queue commandBuffer];
         if (!first || !buffer) return 2;
 

@@ -101,6 +101,11 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_s
     suffix = r" \(time limit\)" if mode == "idle" else ""
     assert len(stops) == 1 and re.fullmatch(
         rf"fencepost: capture written {re.escape(str(expected))}, \d+\.\d{{2}} MB, \d+\.\d s{suffix}", stops[0]), log
+    if mode == "api":
+        snapshots = [path for path in expected.rglob("MTLBuffer-*") if path.is_file()]
+        assert len(snapshots) == 1, (snapshots, log)
+        name = re.fullmatch(r"(MTLBuffer-\d+)-\d+", snapshots[0].name)
+        assert name and f"fencepost: largest: {name[1]} 8 MB in 1 snapshots" in log.splitlines(), log
 
 
 def check_cli(directory, arch):
