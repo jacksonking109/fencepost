@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -498,6 +499,43 @@ static const char g_trace_owner_key;
 #define TRACE_U64(n) ((unsigned long long)(n))
 
 static uint64_t trace_clock(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+enum { CAP_RACE = 1, CAP_GPU_ERROR = 2, CAP_SPIKE = 4 };
+static const char *g_capture_prefix, *g_capture_file;
+static struct timespec g_capture_mtime;
+static unsigned g_capture_on, g_capture_frames, g_capture_max, g_capture_free, g_capture_count;
+static double g_capture_cooldown;
+static uint64_t g_capture_opened, g_capture_until, g_capture_started, g_capture_stopped;
+static uint64_t g_capture_boundary, g_capture_durations[120], g_capture_duration_count;
+static char g_capture_reason[33];
+static int g_capture_active;
+static NSString *g_capture_path;
+/* Serialize first-CB creation and frame-ending commits while capture is enabled.
+ * Never call the capture manager with the detector lock held. */
+static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Called with g_lock held. Keep the first request for the next unopened frame. */
+static void capture_request(const char *reason)
+{
+    if (!g_capture_prefix || g_capture_active || g_capture_reason[0]) return;
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)(reason ?: "");
+         *p && *p != '\n' && *p != '\r' && n < sizeof g_capture_reason - 1; p++) {
+        unsigned c = *p;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        g_capture_reason[n++] = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ? c : '-';
+    }
+    g_capture_reason[n] = 0;
+    if (!n) strcpy(g_capture_reason, "manual");
+}
+
+__attribute__((visibility("default"))) void fencepost_capture(const char *reason)
+{
+    if (!g_capture_prefix) return;
+    pthread_mutex_lock(&g_lock);
+    capture_request(reason);
+    pthread_mutex_unlock(&g_lock);
+}
 
 static int trace_frame_selected(uint64_t frame)
 {
@@ -1378,6 +1416,24 @@ static int compare_duration(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+static void capture_frame_boundary(void)
+{
+    if (!(g_capture_on & CAP_SPIKE)) return;
+    uint64_t now = trace_clock();
+    if (g_capture_boundary) {
+        uint64_t duration = now - g_capture_boundary;
+        if (g_capture_duration_count >= 120) {
+            uint64_t sorted[120];
+            memcpy(sorted, g_capture_durations, sizeof sorted);
+            qsort(sorted, 120, sizeof *sorted, compare_duration);
+            double median = 0.5 * sorted[59] + 0.5 * sorted[60];
+            if (duration > MAX(2 * median, median + 8e6)) capture_request("spike");
+        }
+        g_capture_durations[g_capture_duration_count++ % 120] = duration;
+    }
+    g_capture_boundary = now;
+}
+
 static void ring_frame_duration(uint64_t frame, uint64_t timestamp)
 {
     if (!frame || !g_spike_factor) return; /* frame 1 starts at first CB, not at a boundary */
@@ -1677,6 +1733,7 @@ static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
             print = 0;
         }
     }
+    if (g_capture_on & CAP_RACE) capture_request("race");
     if (g_ring && g_ring_race && (print || g_ring_race == 2))
         ring_trigger("race", "race", s->frame, trace_clock(), NULL);
     if (!print && !marker) return;
@@ -2009,6 +2066,7 @@ static void check_barrier(fp_node *y)
         print = g_printed < g_max_reports;
         if (print) g_printed++;
     }
+    if (g_capture_on & CAP_RACE) capture_request("race");
     if (g_ring && g_ring_race && (print || g_ring_race == 2))
         ring_trigger("race", "race", y->frame, trace_clock(), NULL);
     if (!print && !marker) return;
@@ -2183,6 +2241,7 @@ static void phase1(fp_cb *c)
         }
         if (it->type == 4) {
             if (g_trace_enabled) trace_frame_boundary(g_frame_cur, it->val, trace);
+            capture_frame_boundary();
             g_frame_cur++;
             continue;
         }
@@ -2270,6 +2329,8 @@ static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
             fp_node *n = c->it[i].type != 2 ? node_get(c->it[i].uid) : NULL;
             if (n && !n->done_tick) n->done_tick = g_tick;
         }
+    if ((g_capture_on & CAP_GPU_ERROR) && b.status == MTLCommandBufferStatusError)
+        capture_request("gpu-error");
     if (trace) trace_cb_completed(trace, b);
     if (g_ring) ring_update(0);
     if (g_trace) trace_stream_flush();
@@ -2536,21 +2597,155 @@ static void on_cb(id q, id cb)
     pthread_mutex_unlock(&g_lock);
     hook_cb(object_getClass(cb));
 }
+static void capture_poll_file(void)
+{
+    if (!g_capture_file) return;
+    struct stat st;
+    if (stat(g_capture_file, &st) || !S_ISREG(st.st_mode)) return;
+    int fd = open(g_capture_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return;
+    if (!fstat(fd, &st) && S_ISREG(st.st_mode) &&
+        (st.st_mtimespec.tv_sec > g_capture_mtime.tv_sec ||
+         (st.st_mtimespec.tv_sec == g_capture_mtime.tv_sec &&
+          st.st_mtimespec.tv_nsec > g_capture_mtime.tv_nsec))) {
+        char reason[33];
+        ssize_t n = read(fd, reason, sizeof reason - 1);
+        if (n >= 0) {
+            reason[n] = 0;
+            g_capture_mtime = st.st_mtimespec;
+            capture_request(reason);
+        }
+    }
+    close(fd);
+}
+
+static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char *reason)
+{
+    @autoreleasepool {
+        NSString *path = [NSString stringWithFormat:@"%s-%d-f%llu-%s.gputrace",
+                          g_capture_prefix, getpid(), frame, reason];
+        if (!path.isAbsolutePath)
+            path = [NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:path];
+        const char *refusal = NULL;
+        uint64_t now = trace_clock();
+        struct statfs volume;
+        id<MTLDevice> device = queue.device;
+        MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
+        if (g_capture_count >= g_capture_max) refusal = "capture limit reached";
+        else if (g_capture_stopped && (now - g_capture_stopped) / 1e9 < g_capture_cooldown)
+            refusal = "cooldown in effect";
+        else if (!device) refusal = "command queue has no Metal device";
+        else if (manager.isCapturing) refusal = "Metal capture already running";
+        else if (statfs(path.stringByDeletingLastPathComponent.fileSystemRepresentation, &volume))
+            refusal = "cannot check free space on output volume";
+        else if ((double)volume.f_bavail * volume.f_bsize < g_capture_free * 1073741824.0)
+            refusal = "insufficient free space on output volume";
+        if (refusal) {
+            fp_log("fencepost: capture refused: %s\n", refusal);
+            return;
+        }
+
+        MTLCaptureDescriptor *desc = [[[MTLCaptureDescriptor alloc] init] autorelease];
+        desc.captureObject = device;
+        desc.destination = MTLCaptureDestinationGPUTraceDocument;
+        desc.outputURL = [NSURL fileURLWithPath:path];
+        NSError *error = nil;
+        if (![manager startCaptureWithDescriptor:desc error:&error]) {
+            fp_log("fencepost: capture failed: %s\n", error.localizedDescription.UTF8String ?: "unknown error");
+            return;
+        }
+
+        g_capture_path = [path copy];
+        g_capture_started = now;
+        g_capture_until = frame + g_capture_frames;
+        g_capture_count++;
+        pthread_mutex_lock(&g_lock);
+        g_capture_active = 1;
+        g_capture_reason[0] = 0;
+        pthread_mutex_unlock(&g_lock);
+        fp_log("fencepost: capturing frame %llu (%s) -> %s\n", frame, reason, path.fileSystemRepresentation);
+    }
+}
+
+static void capture_stop(void)
+{
+    if (!g_capture_path) return;
+    @autoreleasepool {
+        MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
+        if (manager.isCapturing) [manager stopCapture];
+        g_capture_stopped = trace_clock();
+        // Measure files visible when stopCapture returns. Metal may still be writing the document.
+        uint64_t size = 0;
+        NSFileManager *files = NSFileManager.defaultManager;
+        NSDirectoryEnumerator *entries = [files enumeratorAtPath:g_capture_path];
+        for (NSString *entry in entries) {
+            NSDictionary *attrs = entries.fileAttributes;
+            if ([attrs.fileType isEqualToString:NSFileTypeRegular]) size += attrs.fileSize;
+        }
+        fp_log("fencepost: capture written %s, %.2f MB, %.1f s\n", g_capture_path.fileSystemRepresentation,
+               size / 1048576.0, (g_capture_stopped - g_capture_started) / 1e9);
+        [g_capture_path release];
+        g_capture_path = nil;
+        pthread_mutex_lock(&g_lock);
+        g_capture_active = 0;
+        pthread_mutex_unlock(&g_lock);
+    }
+}
+
+static void capture_before_cb(id queue)
+{
+    pthread_mutex_lock(&g_lock);
+    uint64_t frame = g_frame_cur;
+    char reason[sizeof g_capture_reason] = {0};
+    if (frame > g_capture_opened) {
+        g_capture_opened = frame;
+        capture_poll_file();
+        memcpy(reason, g_capture_reason, sizeof reason);
+        g_capture_reason[0] = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (reason[0]) capture_start(queue, frame, reason);
+}
+
 static id h_q_cb(id self, SEL _cmd)
 {
-    ENTER; id cb = ORIG(H_Q_CB, id (*)(id, SEL))(self, _cmd); LEAVE;
+    ENTER;
+    int capture = OUTER && g_capture_prefix;
+    if (capture) {
+        pthread_mutex_lock(&g_capture_lock);
+        capture_before_cb(self);
+    }
+    id cb = ORIG(H_Q_CB, id (*)(id, SEL))(self, _cmd);
+    if (capture) pthread_mutex_unlock(&g_capture_lock);
+    LEAVE;
     if (OUTER) on_cb(self, cb);
     return cb;
 }
 static id h_q_cbu(id self, SEL _cmd)
 {
-    ENTER; id cb = ORIG(H_Q_CBU, id (*)(id, SEL))(self, _cmd); LEAVE;
+    ENTER;
+    int capture = OUTER && g_capture_prefix;
+    if (capture) {
+        pthread_mutex_lock(&g_capture_lock);
+        capture_before_cb(self);
+    }
+    id cb = ORIG(H_Q_CBU, id (*)(id, SEL))(self, _cmd);
+    if (capture) pthread_mutex_unlock(&g_capture_lock);
+    LEAVE;
     if (OUTER) on_cb(self, cb);
     return cb;
 }
 static id h_q_cbd(id self, SEL _cmd, id d)
 {
-    ENTER; id cb = ORIG(H_Q_CBD, id (*)(id, SEL, id))(self, _cmd, d); LEAVE;
+    ENTER;
+    int capture = OUTER && g_capture_prefix;
+    if (capture) {
+        pthread_mutex_lock(&g_capture_lock);
+        capture_before_cb(self);
+    }
+    id cb = ORIG(H_Q_CBD, id (*)(id, SEL, id))(self, _cmd, d);
+    if (capture) pthread_mutex_unlock(&g_capture_lock);
+    LEAVE;
     if (OUTER) on_cb(self, cb);
     return cb;
 }
@@ -2824,6 +3019,8 @@ static void ring_poll_file(void)
 static void h_cb_commit(id self, SEL _cmd)
 {
     ENTER;
+    int capture = OUTER && g_capture_prefix;
+    if (capture) pthread_mutex_lock(&g_capture_lock);
     if (OUTER) {
         uint64_t uid = 0;
         fp_trace_cb *trace = NULL;
@@ -2864,6 +3061,13 @@ static void h_cb_commit(id self, SEL _cmd)
         }
     }
     ORIG(H_CB_COMMIT, void (*)(id, SEL))(self, _cmd);
+    if (capture) {
+        pthread_mutex_lock(&g_lock);
+        int stop = g_capture_path && g_frame_cur >= g_capture_until;
+        pthread_mutex_unlock(&g_lock);
+        if (stop) capture_stop();
+        pthread_mutex_unlock(&g_capture_lock);
+    }
     LEAVE;
 }
 
@@ -3350,6 +3554,12 @@ static void final_summary(void)
 {
     static atomic_int once;
     if (atomic_exchange(&once, 1)) return;
+    if (g_capture_prefix && !pthread_mutex_trylock(&g_capture_lock)) {
+        tl_depth++;
+        capture_stop();
+        tl_depth--;
+        pthread_mutex_unlock(&g_capture_lock);
+    }
     if (g_st[ST_NODES]) summary(1);   /* helper processes that never encoded: quiet */
     if (g_trace_enabled) {
         pthread_mutex_lock(&g_lock);
@@ -3415,6 +3625,46 @@ static unsigned trace_unsigned(const char *name, unsigned fallback)
     char *end;
     unsigned long long n = strtoull(s, &end, 10);
     return *end || n > UINT_MAX ? fallback : (unsigned)n;
+}
+
+static void capture_init(const char *prefix)
+{
+    @autoreleasepool {
+        if (strcmp(getenv("MTL_CAPTURE_ENABLED") ?: "", "1") ||
+            ![MTLCaptureManager.sharedCaptureManager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+            fp_log("fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch and GPU trace document support; capture disabled\n");
+            return;
+        }
+        g_capture_prefix = prefix;
+        const char *file = getenv("FENCEPOST_CAPTURE_FILE");
+        static char default_path[64];
+        if (!file) {
+            snprintf(default_path, sizeof default_path, "/tmp/fencepost-capture-%u", getuid());
+            file = default_path;
+        }
+        struct stat st;
+        if (*file) {
+            g_capture_file = file;
+            if (!stat(file, &st)) g_capture_mtime = st.st_mtimespec;
+        }
+        g_capture_frames = MAX(1u, trace_unsigned("FENCEPOST_CAPTURE_FRAMES", 1));
+        g_capture_max = trace_unsigned("FENCEPOST_CAPTURE_MAX", 3);
+        g_capture_free = trace_unsigned("FENCEPOST_CAPTURE_MIN_FREE_GB", 10);
+        g_capture_cooldown = 10;
+        const char *value = getenv("FENCEPOST_CAPTURE_COOLDOWN");
+        double seconds;
+        char extra;
+        if (value && sscanf(value, "%lf%c", &seconds, &extra) == 1 && isfinite(seconds) && seconds >= 0)
+            g_capture_cooldown = seconds;
+        const char *on = getenv("FENCEPOST_CAPTURE_ON");
+        if (on) {
+            for (NSString *source in [[NSString stringWithUTF8String:on] componentsSeparatedByString:@","]) {
+                if ([source isEqualToString:@"race"]) g_capture_on |= CAP_RACE;
+                if ([source isEqualToString:@"gpu-error"]) g_capture_on |= CAP_GPU_ERROR;
+                if ([source isEqualToString:@"spike"]) g_capture_on |= CAP_SPIKE;
+            }
+        }
+    }
 }
 
 static void ring_init_triggers(void)
@@ -3486,6 +3736,7 @@ __attribute__((constructor)) static void fp_init(void)
 {
     const char *p = getenv("FENCEPOST_LOG");
     if (p && *p) g_out = fp_open_path(p, "a");
+    if ((p = getenv("FENCEPOST_CAPTURE")) && *p) capture_init(p);
     if ((p = getenv("FENCEPOST_TRACE")) && *p) trace_init(p);
     if ((p = getenv("FENCEPOST_MAX_REPORTS"))) g_max_reports = atol(p);
     if ((p = getenv("FENCEPOST_POSSIBLE"))) g_show_possible = atoi(p);
