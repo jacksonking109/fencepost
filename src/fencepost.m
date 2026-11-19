@@ -404,7 +404,7 @@ static const char *const trace_categories[] = { "fence", "event", "completed", "
 typedef struct fp_trace_link fp_trace_link;
 typedef struct {
     uint64_t start, end, frame;
-    int tid, ready, encoder, gpu, sampled;
+    int tid, ready, encoder, gpu, sampled, counted;
     fp_trace_link *waiting;
 } fp_trace_span;
 
@@ -443,7 +443,7 @@ typedef struct fp_trace_encoder {
     struct fp_trace_encoder *next;
     struct fp_trace_cb *cb;
     uint64_t uid, start, end, thread, gpu_start, gpu_end;
-    int sample, selected, kind;
+    int sample, selected, kind, args_dropped;
     char label[64];
     char *args;
     fp_evwait *waits;
@@ -488,6 +488,7 @@ static size_t g_trace_bytes, g_trace_limit = 512u * 1024u * 1024u;
 static uint64_t g_trace_origin, g_trace_first = 1, g_trace_last = UINT64_MAX, g_trace_frame_start;
 static uint64_t g_trace_encoders, g_trace_sampled, g_trace_skipped, g_trace_flows, g_trace_dropped;
 static uint64_t g_trace_pool_exhausted;
+static uint64_t g_trace_alloc_dropped;
 static uint64_t g_trace_markers, g_trace_marker_candidates, g_trace_marker_hits[4], g_trace_marker_counts[4];
 static fp_trace_endpoint g_trace_completed[FP_MAXQ];
 static char g_trace_queue_labels[FP_MAXQ][64];
@@ -648,6 +649,10 @@ static fp_trace_chunk *trace_chunk(uint64_t frame)
     while (*slot && (*slot)->frame < frame) slot = &(*slot)->next;
     if (!*slot || (*slot)->frame != frame) {
         fp_trace_chunk *chunk = calloc(1, sizeof *chunk);
+        if (!chunk) {
+            g_trace_alloc_dropped++;
+            return NULL;
+        }
         atomic_init(&chunk->refs, 1);
         chunk->frame = frame;
         chunk->next = *slot;
@@ -706,18 +711,35 @@ static void ring_evict(int cap)
     trace_release_chunk(chunk);
 }
 
+static void trace_drop_record(unsigned events)
+{
+    g_trace_alloc_dropped++;
+    g_trace_dropped += events;
+}
+
+static int trace_close_record(FILE *f)
+{
+    if (!f) return 0;
+    int failed = ferror(f);
+    return !fclose(f) && !failed;
+}
+
 /* Budget whole records, including their separator, before publishing them. */
 static int trace_store(uint64_t frame, FILE *f, char **record, size_t *length, unsigned events,
                        unsigned type, uint64_t source)
 {
-    int ok = !fclose(f);
+    if (!trace_close_record(f)) {
+        trace_drop_record(events);
+        free(*record);
+        return 0;
+    }
     if (!g_ring && !g_trace_stopped && g_trace_bytes + *length + 2 + FP_TRACE_RESERVE > g_trace_limit) {
         g_trace_stopped = 1;
         fp_log("fencepost: trace size limit reached (FENCEPOST_TRACE_MB); recording stopped\n");
         trace_stream_flush();
         fflush(g_trace);
     }
-    if (ok && !g_trace_stopped) {
+    if (!g_trace_stopped) {
         fp_trace_chunk *chunk = trace_chunk(frame);
         if (!chunk) {
             free(*record);
@@ -733,10 +755,17 @@ static int trace_store(uint64_t frame, FILE *f, char **record, size_t *length, u
                 g_trace_dropped += events;
                 return 0;
             }
+        }
+        fp_trace_record *r = calloc(1, sizeof *r);
+        if (!r) {
+            trace_drop_record(events);
+            free(*record);
+            return 0;
+        }
+        if (g_ring) {
             g_ring_bytes += bytes;
             chunk->bytes += bytes;
         }
-        fp_trace_record *r = calloc(1, sizeof *r);
         r->source = source;
         r->type = type;
         r->json = *record;
@@ -783,6 +812,7 @@ static void trace_start(void)
     char *record = NULL;
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
+    if (!f) { trace_drop_record(1); return; }
     trace_header(f, 'M', 0, 0, NULL, "process_name");
     fputs(",\"ts\":0.000,\"args\":{\"name\":", f);
     trace_string(f, [[NSProcessInfo processInfo] processName].UTF8String);
@@ -796,6 +826,7 @@ static int trace_name_track(const char *name)
     char *record = NULL;
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
+    if (!f) { trace_drop_record(1); return tid; }
     trace_header(f, 'M', tid, 0, NULL, "thread_name");
     fputs(",\"args\":{\"name\":", f);
     trace_string(f, name);
@@ -909,6 +940,7 @@ static void trace_flow(const fp_trace_link *link, const fp_trace_span *from, con
     char *record = NULL;
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
+    if (!f) { trace_drop_record(2); return; }
     trace_flow_event(f, 's', from, start, cat, id, link);
     fputs(",\n", f);
     trace_flow_event(f, 'f', to, to->start, cat, id, link);
@@ -947,6 +979,7 @@ static void trace_marker(fp_trace_link *link, const fp_trace_span *to, const fp_
     char *record = NULL;
     size_t length = 0;
     FILE *f = open_memstream(&record, &length);
+    if (!f) { trace_drop_record(1); return; }
     trace_marker_record(f, link, to, from);
     if (trace_store(to->frame, f, &record, &length, 1, REC_MARKER + link->kind - TR_RACE,
                     from ? from->frame : UINT64_MAX)) {
@@ -1216,7 +1249,8 @@ static void ring_release_cb(fp_trace_cb *c)
 
 static void trace_place_encoder(fp_trace_encoder *e)
 {
-    if (!e->args || e->span.ready) return;
+    if ((!e->args && !e->args_dropped) || e->span.ready) return;
+    if (e->args_dropped) goto done;
     int gpu = e->span.gpu && trace_sampled(e);
     if (!e->span.gpu) {
         e->span.start = e->start;
@@ -1231,6 +1265,11 @@ static void trace_place_encoder(fp_trace_encoder *e)
         char *record = NULL;
         size_t length = 0;
         FILE *f = open_memstream(&record, &length);
+        if (!f) {
+            trace_drop_record(1);
+            e->span.tid = 0;
+            goto done;
+        }
         /* At an equal timestamp Perfetto binds to the most recent slice. Put
          * known markers before their encoder so arrows bind to the encoder. */
         unsigned markers[4] = {0}, count = 0;
@@ -1268,16 +1307,21 @@ static void trace_place_encoder(fp_trace_encoder *e)
             snprintf(thread, sizeof thread, "CPU encode %llu", TRACE_U64(e->thread));
             fp_trace_span cpu = { .frame = e->span.frame, .start = e->start, .end = e->end > e->start ? e->end : e->start + 1 };
             cpu.tid = trace_lane(track, thread, &cpu);
-            f = open_memstream(&record, &length);
-            trace_slice(f, &cpu, "cpu encode", name);
-            fprintf(f, ",\"args\":{\"uid\":%llu}}", TRACE_U64(e->uid));
-            trace_write(e->span.frame, f, &record, &length, 1);
+            char *cpu_record = NULL;
+            size_t cpu_length = 0;
+            f = open_memstream(&cpu_record, &cpu_length);
+            if (f) {
+                trace_slice(f, &cpu, "cpu encode", name);
+                fprintf(f, ",\"args\":{\"uid\":%llu}}", TRACE_U64(e->uid));
+            }
+            trace_write(e->span.frame, f, &cpu_record, &cpu_length, 1);
         } else if (!g_ring || e->span.frame >= g_ring_floor) e->span.tid = 0;
     } else g_trace_dropped++;
+done:
     free(e->args); e->args = NULL;
     trace_ready(&e->span);
     if (g_ring) {
-        fp_trace_chunk *chunk = trace_chunk(e->span.frame);
+        fp_trace_chunk *chunk = e->span.counted ? trace_chunk(e->span.frame) : NULL;
         if (chunk) chunk->outstanding--;
         ring_archive(e->uid, &e->span);
         ring_release_cb(e->cb);
@@ -1302,6 +1346,7 @@ static void trace_analyse(const fp_node *n)
     size_t length = 0;
     memcpy(e->label, n->label, sizeof e->label);
     FILE *f = open_memstream(&e->args, &length);
+    if (!f) goto drop;
     fprintf(f, "\"uid\":%llu,\"cb\":%llu,\"queue\":%d,\"frame\":%llu,\"chain_depth\":%u,\"accesses\":%d,"
             "\"after_declared_barrier\":%s", TRACE_U64(n->uid), TRACE_U64(n->cb_uid), e->cb->queue,
             TRACE_U64(n->frame + 1), n->depth, n->nacc, n->req_mark ? "true" : "false");
@@ -1320,12 +1365,19 @@ static void trace_analyse(const fp_node *n)
     for (int i = 0; i < e->nwaits; i++)
         fprintf(f, "%s{\"event\":\"%p\",\"value\":%llu}", i ? "," : "", e->waits[i].ev, TRACE_U64(e->waits[i].val));
     fputc(']', f);
-    fclose(f);
+    if (!trace_close_record(f)) goto drop;
     free(e->waits); e->waits = NULL;
     int fence_edges = 0;
     for (int i = 0; i < n->nfw; i++) if (n->fw[i].src) fence_edges++;
     for (int i = 0; i < n->ned; i++)
         trace_ordering(n->ed[i].src, n->uid, i < fence_edges ? TR_FENCE : TR_EVENT);
+    if (e->cb->completed) trace_place_encoder(e);
+    return;
+
+drop:
+    trace_drop_record(1);
+    e->args_dropped = 1;
+    free(e->waits); e->waits = NULL;
     if (e->cb->completed) trace_place_encoder(e);
 }
 
@@ -1347,7 +1399,10 @@ static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *
     if (!e) return;
     if (g_ring) {
         fp_trace_chunk *chunk = trace_chunk(n->frame);
-        if (chunk) chunk->outstanding++;
+        if (chunk) {
+            chunk->outstanding++;
+            e->span.counted = 1;
+        }
         c->refs++;
     }
     e->span.frame = n->frame;
@@ -1379,8 +1434,10 @@ static void trace_cb_finish(fp_trace_cb *c)
             char *record = NULL;
             size_t length = 0;
             FILE *f = open_memstream(&record, &length);
-            trace_slice(f, &c->span, "command buffer", name);
-            fprintf(f, ",\"args\":{\"uid\":%llu,\"queue\":%d}}", TRACE_U64(c->uid), c->queue);
+            if (f) {
+                trace_slice(f, &c->span, "command buffer", name);
+                fprintf(f, ",\"args\":{\"uid\":%llu,\"queue\":%d}}", TRACE_U64(c->uid), c->queue);
+            }
             if (!trace_write(c->span.frame, f, &record, &length, 1) &&
                 (!g_ring || c->span.frame >= g_ring_floor)) c->span.tid = 0;
         }
@@ -1407,7 +1464,7 @@ static void trace_cb_finish(fp_trace_cb *c)
     if (g_ring) {
         for (int i = 0; i < c->nsignals; i++) ring_archive(c->signals[i], &c->span);
         free(c->signals);
-        fp_trace_chunk *chunk = c->selected ? trace_chunk(c->span.frame) : NULL;
+        fp_trace_chunk *chunk = c->span.counted ? trace_chunk(c->span.frame) : NULL;
         if (chunk) chunk->outstanding--;
         ring_release_cb(c);
     } else if (!c->selected) free(c);
@@ -1512,6 +1569,7 @@ static void trace_frame_done(uint64_t frame, const fp_frame *r)
     fp_trace_span span = { .start = item->start, .end = item->end, .tid = g_frames_tid };
     free(item);
     FILE *f = open_memstream(&record, &length);
+    if (!f) { trace_drop_record(1); return; }
     trace_slice(f, &span, "frame", name);
     fprintf(f, ",\"args\":{\"frame\":%llu,\"encoders\":%ld,\"longest_chain\":%u,\"parallelism\":",
             TRACE_U64(frame + 1), r->nenc, r->depth);
@@ -1536,7 +1594,7 @@ typedef struct {
 
 typedef struct {
     long stats[ST_COUNT];
-    uint64_t pool_exhausted, suppressed, evictions, cap_evictions;
+    uint64_t pool_exhausted, suppressed, evictions, cap_evictions, alloc_dropped;
     uint64_t origin;
     int stopped, sampling_supported;
 } fp_trace_summary;
@@ -1546,13 +1604,14 @@ static fp_trace_summary trace_summary_state(void)
     fp_trace_summary state = {
         .pool_exhausted = g_trace_pool_exhausted, .stopped = g_trace_stopped,
         .origin = g_trace_origin, .sampling_supported = g_trace_sampling_supported,
-        .suppressed = g_suppressed, .evictions = g_ring_evictions, .cap_evictions = g_ring_cap_evictions
+        .suppressed = g_suppressed, .evictions = g_ring_evictions, .cap_evictions = g_ring_cap_evictions,
+        .alloc_dropped = g_trace_alloc_dropped
     };
     memcpy(state.stats, g_st, sizeof state.stats);
     return state;
 }
 
-static char *trace_summary(fp_trace_counts totals, const fp_trace_summary *state, size_t *length)
+static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summary *state, uint64_t timestamp)
 {
     static const char *const stats[] = {
         "race_unique", "possible_unique", "race_hits", "possible_hits", "nodes", "accesses", "cbs",
@@ -1561,9 +1620,6 @@ static char *trace_summary(fp_trace_counts totals, const fp_trace_summary *state
         "objs", "obj_drops", "analysis_ns", "frames", "frame_enc", "frame_chain", "gpu_idle"
     };
     _Static_assert(sizeof stats / sizeof *stats == ST_COUNT, "trace summary must include all detector counters");
-    char *record = NULL;
-    FILE *f = open_memstream(&record, length);
-    uint64_t timestamp = trace_clock();
     trace_header_at(f, 'i', 0, timestamp, "fencepost", "fencepost summary", state->origin ?: timestamp);
     fprintf(f, ",\"s\":\"p\",\"args\":{\"encoders_traced\":%llu,\"sampled\":%llu,\"sampling_skipped\":%llu,\"pool_exhausted\":%llu,"
             "\"flows\":%llu,\"markers\":%llu,\"dropped\":%llu,\"sampling_supported\":%s,\"size_limit_reached\":%s",
@@ -1582,9 +1638,9 @@ static char *trace_summary(fp_trace_counts totals, const fp_trace_summary *state
                 TRACE_U64(state->evictions), TRACE_U64(state->cap_evictions),
                 TRACE_U64(totals.outside_flows), TRACE_U64(totals.outside_markers));
     }
+    if (state->alloc_dropped)
+        fprintf(f, ",\"allocation_drops\":%llu", TRACE_U64(state->alloc_dropped));
     fputs("}}", f);
-    fclose(f);
-    return record;
 }
 
 static void ring_trigger(const char *reason, const char *source, uint64_t frame, uint64_t timestamp, const char *error)
@@ -1706,11 +1762,8 @@ static int ring_write_dump(FILE *out, const fp_ring_dump *dump)
     trace_label(out, "source", trigger->source);
     if (trigger->error) trace_label(out, "error", trigger->error);
     fputs("}},\n", out);
-    size_t length = 0;
-    char *summary = trace_summary(totals, &dump->summary, &length);
-    int ok = fwrite(summary, 1, length, out) == length;
-    free(summary);
-    return ok && fputs("\n]\n", out) != EOF && !ferror(out);
+    trace_summary(out, totals, &dump->summary, trace_clock());
+    return fputs("\n]\n", out) != EOF && !ferror(out);
 }
 
 static int ring_dump(const fp_ring_dump *dump)
@@ -1791,13 +1844,11 @@ static void trace_final(void)
                                g_trace_markers, g_trace_dropped, {0}, {0}, 0, 0 };
     memcpy(totals.hits, g_trace_marker_hits, sizeof totals.hits);
     memcpy(totals.counts, g_trace_marker_counts, sizeof totals.counts);
-    size_t length = 0;
     fp_trace_summary state = trace_summary_state();
-    char *record = trace_summary(totals, &state, &length);
+    uint64_t timestamp = trace_clock();
     trace_stream_flush();
-    fp_trace_record summary = { .json = record, .length = length };
-    trace_emit(g_trace, &g_trace_has_output, &summary);
-    free(record);
+    fputs(g_trace_has_output ? ",\n" : "\n", g_trace);
+    trace_summary(g_trace, totals, &state, timestamp);
     fputs("\n]\n", g_trace);
     fclose(g_trace);
     g_trace = NULL;
@@ -2211,10 +2262,11 @@ static void check_barrier(fp_node *y)
         if (print) fp_log("  waits  : nothing\n");
         if (details) fputs("\nwaits: nothing", details);
     }
-    if (details) {
-        fclose(details);
-        trace_diagnostic(kind, x->uid, y->uid, bad ? "ORDER barrier not honoured" : "ORDER fragment-only",
-                         barrier, d1, second, why);
+    if (marker) {
+        if (trace_close_record(details))
+            trace_diagnostic(kind, x->uid, y->uid, bad ? "ORDER barrier not honoured" : "ORDER fragment-only",
+                             barrier, d1, second, why);
+        else trace_drop_record(1);
         free(why);
     }
 }
@@ -2399,7 +2451,10 @@ static void phase1(fp_cb *c)
     if (trace) {
         if (g_ring && trace->selected) {
             fp_trace_chunk *chunk = trace_chunk(trace->span.frame);
-            if (chunk) chunk->outstanding++;
+            if (chunk) {
+                chunk->outstanding++;
+                trace->span.counted = 1;
+            }
         }
         trace->phased = 1;
         trace_cb_finish(trace);
@@ -3722,6 +3777,9 @@ static void final_summary(void)
         pthread_mutex_lock(&g_lock);
         trace_final();
         g_trace_stopped = 1;
+        if (g_trace_alloc_dropped)
+            fp_log("fencepost: final: %llu trace records dropped while allocating or formatting\n",
+                   TRACE_U64(g_trace_alloc_dropped));
         pthread_mutex_unlock(&g_lock);
         if (g_ring_writer) dispatch_sync(g_ring_writer, ^{});
     }
