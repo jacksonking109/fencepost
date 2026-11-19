@@ -135,7 +135,8 @@ A program can also call `void fencepost_trigger(const char *reason)` through `dl
 encoded work accept triggers.
 
 To mark a glitch yourself, run `printf 'flicker\n' > /tmp/fencepost-trigger-$(id -u)`. Fencepost checks for a
-newer modification time at commit, at most once every 250 ms. An existing file establishes the starting time.
+newer modification time at commit, at most once every 250 ms. The request file must belong to the effective
+user of the traced process. An existing file owned by that user establishes the starting time.
 The first line supplies the reason (up to 32 characters, sanitised to `[a-z0-9-]`), or `manual` for an empty
 line or file. Fencepost only reads the file, so several processes can observe the same update. Set
 `FENCEPOST_TRIGGER_FILE` to use a different path.

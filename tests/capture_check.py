@@ -13,10 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 DISABLED = "fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; capture disabled"
 
 
-def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_secs=10, reason=None, message=None):
+def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_secs=10,
+             reason=None, message=None, foreign=None):
     prefix = directory / "capture"
     request = directory / "request"
-    request.write_text("stale\n")
+    if foreign is None:
+        request.write_text("stale\n")
+    else:
+        request.symlink_to(foreign)
+        message = f"fencepost: ignoring request file owned by another user: {request}"
     knobs = {
         "DYLD_INSERT_LIBRARIES": ROOT / "out/libfencepost.dylib",
         "FENCEPOST_CAPTURE": prefix,
@@ -46,9 +51,10 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_s
                     _, log = test.communicate(timeout=5)
                     raise AssertionError((test.returncode, log))
                 assert ready == "ready\n", ready
-                stamp = request.stat().st_mtime_ns
-                request.write_text("File Request\nignored second line\n")
-                assert request.stat().st_mtime_ns > stamp
+                if foreign is None:
+                    stamp = request.stat().st_mtime_ns
+                    request.write_text("File Request\nignored second line\n")
+                    assert request.stat().st_mtime_ns > stamp
             idle_log = b""
             if mode == "idle":
                 deadline = time.monotonic() + 15
@@ -113,6 +119,11 @@ def main():
             ("app-capture", "app-owned capture left running", {
                 "message": "fencepost: capture refused: Metal capture already running"}),
         ]
+        foreign = Path("/etc/hosts")
+        if foreign.is_file() and foreign.stat().st_uid != os.geteuid() and os.access(foreign, os.R_OK):
+            cases.append(("file", "foreign-owned request ignored and logged once", {"foreign": foreign}))
+        else:
+            print(f"{args.arch}: skipped foreign-owned request case (no readable foreign fixture)", flush=True)
         for index, (mode, label, options) in enumerate(cases):
             directory = Path(scratch).resolve() / str(index)
             directory.mkdir()

@@ -505,6 +505,7 @@ static uint64_t trace_clock(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RA
 enum { CAP_RACE = 1, CAP_GPU_ERROR = 2, CAP_SPIKE = 4 };
 static const char *g_capture_prefix, *g_capture_file;
 static struct timespec g_capture_mtime;
+static int g_capture_owner_warned;
 static unsigned g_capture_on, g_capture_frames, g_capture_max, g_capture_free, g_capture_count;
 static unsigned g_capture_max_secs;
 static _Atomic uint64_t g_capture_deadline;
@@ -624,6 +625,7 @@ static unsigned g_max_dumps = 20, g_dumps, g_pending_dumps;
 static dispatch_queue_t g_ring_writer;
 static char *g_trigger_file;
 static struct timespec g_file_mtime;
+static int g_trigger_owner_warned;
 
 typedef struct {
     int active;
@@ -2709,6 +2711,16 @@ static void on_cb(id q, id cb)
     pthread_mutex_unlock(&g_lock);
     hook_cb(object_getClass(cb));
 }
+static int trigger_file_owned(const struct stat *st, const char *path, int *warned)
+{
+    if (st->st_uid == geteuid()) return 1;
+    if (!*warned) {
+        *warned = 1;
+        fp_log("fencepost: ignoring request file owned by another user: %s\n", path);
+    }
+    return 0;
+}
+
 /* Called under the capture lock. Acknowledge the timestamp of the inode read,
  * including file requests received while a capture is running. */
 static int capture_poll_file(char reason[static sizeof g_capture_reason])
@@ -2721,6 +2733,7 @@ static int capture_poll_file(char reason[static sizeof g_capture_reason])
     if (fd < 0) return 0;
     int changed = 0;
     if (!fstat(fd, &st) && S_ISREG(st.st_mode) &&
+        trigger_file_owned(&st, g_capture_file, &g_capture_owner_warned) &&
         trigger_time_newer(st.st_mtimespec, g_capture_mtime)) {
         ssize_t n = read(fd, reason, sizeof g_capture_reason - 1);
         if (n >= 0) {
@@ -3150,7 +3163,8 @@ static void ring_poll_file(void)
     if (stat(g_trigger_file, &st) || !S_ISREG(st.st_mode) || !ring_new_mtime(st.st_mtimespec)) return;
     int fd = open(g_trigger_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return;
-    if (!fstat(fd, &st) && S_ISREG(st.st_mode) && ring_new_mtime(st.st_mtimespec)) {
+    if (!fstat(fd, &st) && S_ISREG(st.st_mode) &&
+        trigger_file_owned(&st, g_trigger_file, &g_trigger_owner_warned) && ring_new_mtime(st.st_mtimespec)) {
         char reason[33];
         ssize_t n = read(fd, reason, sizeof reason - 1);
         if (n >= 0) {
@@ -3798,7 +3812,7 @@ static void capture_init(const char *prefix)
         struct stat st;
         if (*file) {
             g_capture_file = strdup(file);
-            if (!stat(file, &st)) g_capture_mtime = st.st_mtimespec;
+            if (!stat(file, &st) && st.st_uid == geteuid()) g_capture_mtime = st.st_mtimespec;
         }
         g_capture_frames = MAX(1u, trace_unsigned("FENCEPOST_CAPTURE_FRAMES", 1));
         g_capture_max_secs = MAX(1u, trace_unsigned("FENCEPOST_CAPTURE_MAX_SECS", 10));
@@ -3844,7 +3858,7 @@ static void ring_init_triggers(void)
     if (!p) asprintf(&g_trigger_file, "/tmp/fencepost-trigger-%u", getuid());
     else if (*p) g_trigger_file = strdup(p);
     struct stat st;
-    if (g_trigger_file && !stat(g_trigger_file, &st)) g_file_mtime = st.st_mtimespec;
+    if (g_trigger_file && !stat(g_trigger_file, &st) && st.st_uid == geteuid()) g_file_mtime = st.st_mtimespec;
 }
 
 static void trace_init(const char *path)
