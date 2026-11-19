@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import platform
 from pathlib import Path
 import plistlib
 import select
@@ -146,8 +147,13 @@ def main():
         print(f"{args.arch}: CLI content, mtime, overrides and write failure passed", flush=True)
         check_ring(directory, args.arch, cli, env)
         print(f"{args.arch}: exactly one external-cli ring dump passed", flush=True)
-        check_app(directory, args.arch)
-        print(f"{args.arch}: app launch and cleanup passed (global hotkey is manual-only)")
+        # The menu-bar app is only launched as the machine's native slice: an Intel launch on Apple silicon
+        # goes through Rosetta and makes macOS show its "Support Ending for Intel-based Apps" notice.
+        if args.arch == platform.machine():
+            check_app(directory, args.arch)
+            print(f"{args.arch}: app launch and cleanup passed (global hotkey is manual-only)")
+        else:
+            print(f"{args.arch}: app launch skipped (not the native slice)")
 
 
 if __name__ == "__main__":
