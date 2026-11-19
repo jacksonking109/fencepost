@@ -149,7 +149,7 @@ up to the dump.
 ### Hotkey helper
 
 Run `./build.sh`, then `open "out/Fencepost Trigger.app"`. Choose **Save timeline now** in the **FP** menu
-or press **Control–Option–Command–F11**. The global hotkey takes that combination away from the game while
+or press **Control–Option–Command–F**. The global hotkey takes that combination away from the game while
 the app runs. If macOS can't register it, the menu shows **Global hotkey unavailable**.
 
 To change the hotkey or the trigger path, run these commands and restart the app. Use `ctrl`, `opt`, `cmd`
@@ -166,7 +166,8 @@ For scripts, use `out/fencepost-trigger flicker` or pass `--file /tmp/my-fencepo
 write a file and work with any program traced by fencepost, whether it runs through Wine or natively.
 
 To check the hotkey by hand, run a traced program with `FENCEPOST_RING` enabled and press the combination while
-the program is rendering. Use the Fn key too if your keyboard uses F11 as a media key. The **FP** item should
+the program is rendering. A function-key hotkey also needs Fn on keyboards whose
+top row sends media keys. The **FP** item should
 briefly show a checkmark, and fencepost should log a dump whose filename ends in `-hotkey.json`.
 
 ## How it works

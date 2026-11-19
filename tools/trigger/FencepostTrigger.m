@@ -2,7 +2,7 @@
 #import <Carbon/Carbon.h>
 #include "trigger_write.h"
 
-static NSString *const DefaultHotkey = @"ctrl+opt+cmd+f11";
+static NSString *const DefaultHotkey = @"ctrl+opt+cmd+f";
 
 static BOOL parse_key(NSString *key, UInt32 *code)
 {
