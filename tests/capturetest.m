@@ -26,7 +26,8 @@ int main(int argc, char **argv)
         int file = !strcmp(mode, "file"), noFrame = !strcmp(mode, "no-frame");
         int api = !strcmp(mode, "api"), exitActive = !strcmp(mode, "exit-active");
         int appCapture = !strcmp(mode, "app-capture"), multi = !strcmp(mode, "multi-frame");
-        if (!file && !noFrame && !api && !exitActive && !appCapture && !multi) return 2;
+        int idle = !strcmp(mode, "idle");
+        if (!file && !noFrame && !api && !exitActive && !appCapture && !multi && !idle) return 2;
 
         void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
         void (*capture)(const char *) = dlsym(RTLD_DEFAULT, "fencepost_capture");
@@ -63,11 +64,15 @@ int main(int argc, char **argv)
 
         MTLCommandBufferDescriptor *descriptor = [[[MTLCommandBufferDescriptor alloc] init] autorelease];
         id<MTLCommandBuffer> second = [queue commandBufferWithDescriptor:descriptor];
-        if (api || exitActive || multi) {
+        if (api || exitActive || multi || idle) {
             if (!manager.isCapturing) return 3;
             capture("Ignore While Active");
         }
         if (!submit(second, buffer, noFrame ? NULL : frame)) return 1;
+        if (idle) {
+            if (getchar() == EOF) return 2;
+            return manager.isCapturing ? 3 : 0;
+        }
         if (exitActive) return manager.isCapturing ? 0 : 3;
         if (appCapture) {
             if (!manager.isCapturing) return 3;

@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -505,6 +506,8 @@ enum { CAP_RACE = 1, CAP_GPU_ERROR = 2, CAP_SPIKE = 4 };
 static const char *g_capture_prefix, *g_capture_file;
 static struct timespec g_capture_mtime;
 static unsigned g_capture_on, g_capture_frames, g_capture_max, g_capture_free, g_capture_count;
+static unsigned g_capture_max_secs;
+static _Atomic uint64_t g_capture_deadline;
 static double g_capture_cooldown;
 static uint64_t g_capture_frame, g_capture_opened, g_capture_until, g_capture_started, g_capture_stopped;
 static uint64_t g_capture_boundary, g_capture_durations[120], g_capture_duration_count;
@@ -518,6 +521,7 @@ static NSString *g_capture_path;
  * commit: a full command queue can make allocation wait for another commit.
  * Lock order is capture lock then detector lock. */
 static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static void capture_check_time(uint64_t deadline);
 
 /* Called with g_lock held. Keep the first request for the next unopened frame. */
 static void capture_request(const char *reason)
@@ -2340,6 +2344,13 @@ static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
     if (g_ring) ring_update(0);
     if (g_trace) trace_stream_flush();
     pthread_mutex_unlock(&g_lock);
+    uint64_t deadline = atomic_load(&g_capture_deadline);
+    if (deadline && trace_clock() >= deadline) {
+        /* Metal may wait for completion handlers while stopping a capture. */
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            capture_check_time(deadline);
+        });
+    }
 }
 
 /* ---------------------------------------------------------------- recording */
@@ -2669,13 +2680,21 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
         g_capture_started = trace_clock();
         g_capture_until = frame + g_capture_frames;
         g_capture_count++;
+        uint64_t interval = (uint64_t)g_capture_max_secs * NSEC_PER_SEC;
+        uint64_t deadline = g_capture_started + interval;
+        atomic_store(&g_capture_deadline, deadline);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, interval),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            capture_check_time(deadline);
+        });
         fp_log("fencepost: capturing frame %llu (%s) -> %s\n", frame + 1, reason, path.fileSystemRepresentation);
     }
 }
 
-static void capture_stop(void)
+static void capture_stop(int time_limit)
 {
     if (!g_capture_path) return;
+    atomic_store(&g_capture_deadline, 0);
     @autoreleasepool {
         MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
         if (manager.isCapturing) [manager stopCapture];
@@ -2688,8 +2707,9 @@ static void capture_stop(void)
             NSDictionary *attrs = entries.fileAttributes;
             if ([attrs.fileType isEqualToString:NSFileTypeRegular]) size += attrs.fileSize;
         }
-        fp_log("fencepost: capture written %s, %.2f MB, %.1f s\n", g_capture_path.fileSystemRepresentation,
-               size / 1048576.0, (g_capture_stopped - g_capture_started) / 1e9);
+        fp_log("fencepost: capture written %s, %.2f MB, %.1f s%s\n", g_capture_path.fileSystemRepresentation,
+               size / 1048576.0, (g_capture_stopped - g_capture_started) / 1e9,
+               time_limit ? " (time limit)" : "");
         [g_capture_path release];
         g_capture_path = nil;
         char ignored[sizeof g_capture_reason];
@@ -2698,6 +2718,17 @@ static void capture_stop(void)
         g_capture_busy = 0;
         pthread_mutex_unlock(&g_lock);
     }
+}
+
+static void capture_check_time(uint64_t deadline)
+{
+    pthread_mutex_lock(&g_capture_lock);
+    if (atomic_load(&g_capture_deadline) == deadline && trace_clock() >= deadline) {
+        tl_depth++;
+        capture_stop(1);
+        tl_depth--;
+    }
+    pthread_mutex_unlock(&g_capture_lock);
 }
 
 static void capture_before_cb(id queue)
@@ -2735,7 +2766,9 @@ static void capture_after_commit(void)
      * is inside the capture and the next allocation sees the transition. */
     if (--g_capture_commits == 0) g_capture_frame = g_frame_cur;
     pthread_mutex_unlock(&g_lock);
-    if (g_capture_path && g_capture_frame >= g_capture_until) capture_stop();
+    uint64_t deadline = atomic_load(&g_capture_deadline);
+    int time_limit = deadline && trace_clock() >= deadline;
+    if (g_capture_path && (time_limit || g_capture_frame >= g_capture_until)) capture_stop(time_limit);
     pthread_mutex_unlock(&g_capture_lock);
 }
 
@@ -3570,7 +3603,7 @@ static void final_summary(void)
     if (atomic_exchange(&once, 1)) return;
     if (g_capture_available && !pthread_mutex_trylock(&g_capture_lock)) {
         tl_depth++;
-        capture_stop();
+        capture_stop(0);
         tl_depth--;
         pthread_mutex_unlock(&g_capture_lock);
     }
@@ -3671,6 +3704,7 @@ static void capture_init(const char *prefix)
             if (!stat(file, &st)) g_capture_mtime = st.st_mtimespec;
         }
         g_capture_frames = MAX(1u, trace_unsigned("FENCEPOST_CAPTURE_FRAMES", 1));
+        g_capture_max_secs = MAX(1u, trace_unsigned("FENCEPOST_CAPTURE_MAX_SECS", 10));
         g_capture_max = trace_unsigned("FENCEPOST_CAPTURE_MAX", 3);
         g_capture_free = trace_unsigned("FENCEPOST_CAPTURE_MIN_FREE_GB", 10);
         g_capture_cooldown = 10;

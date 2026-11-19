@@ -197,6 +197,7 @@ first command buffer. It ignores requests while a capture is active. Open the lo
 | `FENCEPOST_CAPTURE_FILE` | `/tmp/fencepost-capture-<uid>` | request file, empty disables polling |
 | `FENCEPOST_CAPTURE_ON` | empty | comma-separated `race`, `gpu-error`, `spike` auto triggers |
 | `FENCEPOST_CAPTURE_FRAMES` | 1 | frame ends to record |
+| `FENCEPOST_CAPTURE_MAX_SECS` | 10 | maximum seconds to record, minimum 1 |
 | `FENCEPOST_CAPTURE_MAX` | 3 | captures allowed per process |
 | `FENCEPOST_CAPTURE_MIN_FREE_GB` | 10 | minimum free GiB on the output volume |
 | `FENCEPOST_CAPTURE_COOLDOWN` | 10 | seconds after a capture before another can start |

@@ -7,12 +7,13 @@ import re
 import select
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 DISABLED = "fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; capture disabled"
 
 
-def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, reason=None, message=None):
+def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_secs=10, reason=None, message=None):
     prefix = directory / "capture"
     request = directory / "request"
     request.write_text("stale\n")
@@ -22,6 +23,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, reaso
         "FENCEPOST_CAPTURE_FILE": request,
         "FENCEPOST_CAPTURE_MIN_FREE_GB": min_free,
         "FENCEPOST_CAPTURE_FRAMES": frames,
+        "FENCEPOST_CAPTURE_MAX_SECS": max_secs,
         "FENCEPOST_CAPTURE_COOLDOWN": 0,
     }
     if enabled:
@@ -47,7 +49,17 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, reaso
                 stamp = request.stat().st_mtime_ns
                 request.write_text("File Request\nignored second line\n")
                 assert request.stat().st_mtime_ns > stamp
+            idle_log = b""
+            if mode == "idle":
+                deadline = time.monotonic() + 15
+                while b" (time limit)\n" not in idle_log:
+                    timeout = max(0, deadline - time.monotonic())
+                    assert select.select([test.stderr], [], [], timeout)[0], idle_log
+                    chunk = os.read(test.stderr.fileno(), 4096)
+                    assert chunk, idle_log
+                    idle_log += chunk
             _, log = test.communicate(input="\n", timeout=30)
+            log = idle_log.decode() + log
             assert test.returncode == 0, (test.returncode, log)
         finally:
             if test.poll() is None:
@@ -69,8 +81,9 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, reaso
     size = sum(path.stat().st_size for path in expected.rglob("*") if path.is_file())
     assert size >= 4096, (size, log)
     assert starts == [f"fencepost: capturing frame 2 ({reason}) -> {expected}"], log
+    suffix = r" \(time limit\)" if mode == "idle" else ""
     assert len(stops) == 1 and re.fullmatch(
-        rf"fencepost: capture written {re.escape(str(expected))}, \d+\.\d{{2}} MB, \d+\.\d s", stops[0]), log
+        rf"fencepost: capture written {re.escape(str(expected))}, \d+\.\d{{2}} MB, \d+\.\d s{suffix}", stops[0]), log
 
 
 def check_cli(directory, arch):
@@ -94,6 +107,8 @@ def main():
             ("no-frame", "no capture without a frame boundary", {}),
             ("api", "capture API and active-request suppression", {"reason": "api-request"}),
             ("multi-frame", "capture spans two frame ends", {"reason": "api-request", "frames": 2}),
+            ("idle", "capture time limit while submissions are idle",
+             {"reason": "api-request", "frames": 2, "max_secs": 1}),
             ("exit-active", "exit during a multi-frame capture", {"reason": "api-request", "frames": 3}),
             ("app-capture", "app-owned capture left running", {
                 "message": "fencepost: capture refused: Metal capture already running"}),
