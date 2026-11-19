@@ -55,7 +55,7 @@ static inline int trigger_advance_mtime(int fd, const char *path)
     return -1;
 }
 
-static inline int trigger_write(const char *path, const char *reason)
+static inline int trigger_write(const char *path, const char *reason, pid_t pid)
 {
     if (!*path) {
         errno = EINVAL;
@@ -71,7 +71,9 @@ static inline int trigger_write(const char *path, const char *reason)
     fd = mkstemp(temp);
     if (fd == -1) goto done;
     created = 1;
-    if (dprintf(fd, "%s\n", reason) < 0) goto done;
+    int length = (int)strcspn(reason, "\n");
+    if (dprintf(fd, "%.*s\n", length, reason) < 0) goto done;
+    if (pid > 0 && dprintf(fd, "pid=%d\n", pid) < 0) goto done;
 
     /* Serialize the timestamp check and rename among helper processes without a lockfile. */
     lock = open(directory, O_RDONLY | O_CLOEXEC);

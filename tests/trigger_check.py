@@ -34,8 +34,10 @@ def check_cli(directory, cli, env):
     stamp = path.stat().st_mtime_ns
     assert future < stamp < future + second, stamp
 
-    subprocess.run([*cli, "explicit", "--file", explicit], env=cli_env, check=True)
+    subprocess.run([*cli, "explicit\npid=1", "--file", explicit], env=cli_env, check=True)
     assert explicit.read_bytes() == b"explicit\n"
+    subprocess.run([*cli, "targeted", "--file", explicit, "--pid", "123"], env=cli_env, check=True)
+    assert explicit.read_bytes() == b"targeted\npid=123\n"
     assert path.read_bytes() == b"same-second\n"
 
     capture = directory / "cli.capture"
@@ -57,9 +59,10 @@ def check_cli(directory, cli, env):
         unwritable.chmod(0o755)
 
 
-def check_ring(directory, arch, cli, env):
+def check_ring(directory, arch, cli, env, *, targeted=False):
     path = directory / "ring.trigger"
     prefix = directory / "external"
+    reason = "external-cli" * 30 if targeted else "external-cli"
     knobs = {
         "DYLD_INSERT_LIBRARIES": ROOT / "out/libfencepost.dylib",
         "FENCEPOST_RING": 10,
@@ -75,7 +78,9 @@ def check_ring(directory, arch, cli, env):
             assert select.select([ring.stdout], [], [], 10)[0], "ringtest did not become ready"
             assert ring.stdout.readline() == "ready\n"
             assert not path.exists()
-            subprocess.run([*cli, "external-cli", "--file", path], env=env, check=True)
+            target = ["--pid", str(ring.pid)] if targeted else []
+            subprocess.run([*cli, reason, "--file", path, *target], env=env, check=True)
+            assert path.read_text() == f"{reason}\n" + (f"pid={ring.pid}\n" if targeted else "")
             assert ring.wait(timeout=12) == 0
         finally:
             if ring.poll() is None:
@@ -86,8 +91,7 @@ def check_ring(directory, arch, cli, env):
     dump = dumps[0]
     subprocess.run([sys.executable, "-I", ROOT / "tests/trace_check.py", "--dump", dump], check=True)
     trigger, = (event for event in json.loads(dump.read_text()) if event["name"].startswith("TRIGGER "))
-    assert (trigger["args"]["reason"], trigger["args"]["source"]) == ("external-cli", "file")
-    assert path.read_bytes() == b"external-cli\n"
+    assert (trigger["args"]["reason"], trigger["args"]["source"]) == (reason[:32], "file")
 
 
 def smoke_pid(executable, token):
@@ -138,9 +142,13 @@ def main():
     with tempfile.TemporaryDirectory() as scratch:
         directory = Path(scratch)
         check_cli(directory, cli, env)
-        print(f"{args.arch}: CLI content, mtime, overrides and write failure passed", flush=True)
+        print(f"{args.arch}: CLI content, PID, mtime, overrides and write failure passed", flush=True)
         check_ring(directory, args.arch, cli, env)
         print(f"{args.arch}: exactly one external-cli ring dump passed", flush=True)
+        targeted = directory / "targeted"
+        targeted.mkdir()
+        check_ring(targeted, args.arch, cli, env, targeted=True)
+        print(f"{args.arch}: matching PID ring dump with a long reason passed", flush=True)
         # The menu-bar app is only launched as the machine's native slice: an Intel launch on Apple silicon
         # goes through Rosetta and makes macOS show its "Support Ending for Intel-based Apps" notice.
         if args.arch == platform.machine():

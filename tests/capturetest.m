@@ -25,12 +25,12 @@ int main(int argc, char **argv)
     @autoreleasepool {
         const char *mode = argc == 2 ? argv[1] : "";
         int file = !strcmp(mode, "file"), noFrame = !strcmp(mode, "no-frame");
-        int emptyFile = !strcmp(mode, "empty-file");
+        int emptyFile = !strcmp(mode, "empty-file"), wrongPid = !strcmp(mode, "wrong-pid");
         int api = !strcmp(mode, "api"), exitActive = !strcmp(mode, "exit-active");
         int appCapture = !strcmp(mode, "app-capture"), multi = !strcmp(mode, "multi-frame");
         int idle = !strcmp(mode, "idle"), slow = !strcmp(mode, "slow-frame");
         int hardLimit = !strcmp(mode, "hard-limit");
-        if (!file && !emptyFile && !noFrame && !api && !exitActive && !appCapture && !multi &&
+        if (!file && !emptyFile && !wrongPid && !noFrame && !api && !exitActive && !appCapture && !multi &&
             !idle && !slow && !hardLimit) return 2;
 
         void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
@@ -44,12 +44,12 @@ int main(int argc, char **argv)
         id<MTLCommandBuffer> first = [queue commandBuffer];
         if (!first || !buffer) return 2;
 
-        if (file || emptyFile || noFrame) {
+        if (file || emptyFile || wrongPid || noFrame) {
             puts("ready");
             fflush(stdout);
             if (getchar() == EOF) return 2;
         }
-        if (!file && !emptyFile) capture("API Request");
+        if (!file && !emptyFile && !wrongPid) capture("API Request");
         MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
         if (manager.isCapturing) return 3;
         if (!submit(first, buffer, noFrame ? NULL : frame)) return 1;
@@ -70,7 +70,7 @@ int main(int argc, char **argv)
 
         MTLCommandBufferDescriptor *descriptor = [[[MTLCommandBufferDescriptor alloc] init] autorelease];
         id<MTLCommandBuffer> second = [queue commandBufferWithDescriptor:descriptor];
-        if (emptyFile && manager.isCapturing) return 3;
+        if ((emptyFile || wrongPid) && manager.isCapturing) return 3;
         if (api || exitActive || multi || idle || slow || hardLimit) {
             if (!manager.isCapturing) return 3;
             capture("Ignore While Active");
@@ -93,8 +93,16 @@ int main(int argc, char **argv)
             }
             return manager.isCapturing ? 3 : 0;
         }
-        if (emptyFile) {
-            puts("empty polled");
+        if (emptyFile || wrongPid) {
+            puts("request polled");
+            fflush(stdout);
+            if (getchar() == EOF) return 2;
+        }
+        if (wrongPid) {
+            id<MTLCommandBuffer> sameStamp = [queue commandBuffer];
+            if (manager.isCapturing) return 3;
+            if (!submit(sameStamp, buffer, frame)) return 1;
+            puts("same mtime polled");
             fflush(stdout);
             if (getchar() == EOF) return 2;
         }

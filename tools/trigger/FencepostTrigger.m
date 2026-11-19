@@ -163,9 +163,11 @@ static OSStatus handle_hotkey(EventHandlerCallRef next, EventRef event, void *co
 
 - (void)saveWithReason:(const char *)reason capture:(BOOL)capture
 {
+    pid_t pid = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    if (pid == getpid()) pid = 0;
     NSString *destination = capture ? _capturePath : _path;
     const char *path = destination.fileSystemRepresentation;
-    BOOL saved = path && trigger_write(path, reason) == 0;
+    BOOL saved = path && trigger_write(path, reason, pid) == 0;
     if (!saved) NSLog(@"Could not write fencepost request %@: %s", destination, strerror(path ? errno : EINVAL));
     _status.button.title = saved ? @"FP ✓" : @"FP !";
     [_feedback invalidate];

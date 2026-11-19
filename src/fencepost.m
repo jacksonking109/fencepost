@@ -2803,6 +2803,34 @@ static int trigger_file_owned(const struct stat *st, const char *path, int *warn
     return 0;
 }
 
+/* Keep the existing reason limit, but find line two even after a long reason. */
+static int trigger_read_request(int fd, char *reason, size_t capacity,
+                                struct timespec stamp, struct timespec *mtime)
+{
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n <= 0) return 0;
+    *mtime = stamp;
+    size_t length = MIN((size_t)n, capacity - 1);
+    memcpy(reason, buf, length);
+    reason[length] = 0;
+
+    for (off_t offset = 0; n > 0; offset += n, n = read(fd, buf, sizeof buf)) {
+        const char *newline = memchr(buf, '\n', (size_t)n);
+        if (!newline) continue;
+        char target[32];
+        n = pread(fd, target, sizeof target - 1, offset + (newline - buf) + 1);
+        if (n < 0) return 0;
+        if (n < 4 || memcmp(target, "pid=", 4)) return 1;
+        target[n] = 0;
+        char *end;
+        long pid = strtol(target + 4, &end, 10);
+        if (*end == '\r') end++;
+        return pid == getpid() && (*end == '\n' || (end == target + n && (size_t)n < sizeof target - 1));
+    }
+    return n == 0;
+}
+
 /* Called under the capture lock. Acknowledge the timestamp of the inode read,
  * including file requests received while a capture is running. */
 static int capture_poll_file(char reason[static sizeof g_capture_reason])
@@ -2817,12 +2845,7 @@ static int capture_poll_file(char reason[static sizeof g_capture_reason])
     if (!fstat(fd, &st) && S_ISREG(st.st_mode) &&
         trigger_file_owned(&st, g_capture_file, &g_capture_owner_warned) &&
         trigger_time_newer(st.st_mtimespec, g_capture_mtime)) {
-        ssize_t n = read(fd, reason, sizeof g_capture_reason - 1);
-        if (n > 0) {
-            reason[n] = 0;
-            g_capture_mtime = st.st_mtimespec;
-            changed = 1;
-        }
+        changed = trigger_read_request(fd, reason, sizeof g_capture_reason, st.st_mtimespec, &g_capture_mtime);
     }
     close(fd);
     return changed;
@@ -3293,8 +3316,8 @@ static int ring_new_mtime(struct timespec stamp)
            (stamp.tv_sec == g_file_mtime.tv_sec && stamp.tv_nsec > g_file_mtime.tv_nsec);
 }
 
-/* The file is shared by every interested process. Read a bounded first
- * line from the same inode whose timestamp we acknowledge, even on rename. */
+/* The file is shared by every interested process. Read the request from
+ * the same inode whose timestamp we acknowledge, even on rename. */
 static void ring_poll_file(void)
 {
     if (!g_trigger_file || !g_ring_encoded) return;
@@ -3308,10 +3331,7 @@ static void ring_poll_file(void)
     if (!fstat(fd, &st) && S_ISREG(st.st_mode) &&
         trigger_file_owned(&st, g_trigger_file, &g_trigger_owner_warned) && ring_new_mtime(st.st_mtimespec)) {
         char reason[33];
-        ssize_t n = read(fd, reason, sizeof reason - 1);
-        if (n > 0) {
-            reason[n] = 0;
-            g_file_mtime = st.st_mtimespec;
+        if (trigger_read_request(fd, reason, sizeof reason, st.st_mtimespec, &g_file_mtime)) {
             ring_trigger(DUMP_MANUAL, reason, "file", g_frame_cur, now, NULL);
         }
     }

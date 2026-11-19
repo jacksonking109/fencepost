@@ -14,7 +14,7 @@ DISABLED = "fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; 
 
 
 def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_secs=10, max_secs=120,
-             reason=None, message=None, foreign=None):
+             reason=None, message=None, foreign=None, targeted=False):
     prefix = directory / "capture"
     request = directory / "request"
     if foreign is None:
@@ -45,7 +45,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     with subprocess.Popen([*command, ROOT / "out/capturetest", mode], env=env,
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as test:
         try:
-            if mode in {"file", "no-frame", "empty-file"}:
+            if mode in {"file", "no-frame", "empty-file", "wrong-pid"}:
                 assert select.select([test.stdout], [], [], 15)[0], "capturetest did not become ready"
                 ready = test.stdout.readline()
                 if not ready:
@@ -59,9 +59,27 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
                     test.stdin.write("\n")
                     test.stdin.flush()
                     assert select.select([test.stdout], [], [], 15)[0], "empty request was not polled"
-                    assert test.stdout.readline() == "empty polled\n"
+                    assert test.stdout.readline() == "request polled\n"
                     request.write_text("File Request\n")
                     os.utime(request, ns=(stamp, stamp))
+                elif targeted or mode == "wrong-pid":
+                    cli = ["arch", "-" + arch, ROOT / "out/fencepost-trigger", "--capture", "--file", request]
+                    pid = test.pid if targeted else 1
+                    subprocess.run([*cli, "File Request", "--pid", str(pid)], env=env, check=True)
+                    if mode == "wrong-pid":
+                        stamp = request.stat().st_mtime_ns
+                        test.stdin.write("\n")
+                        test.stdin.flush()
+                        assert select.select([test.stdout], [], [], 15)[0], "targeted request was not polled"
+                        assert test.stdout.readline() == "request polled\n"
+                        # A broadcast at the ignored PID request's mtime must also be ignored.
+                        subprocess.run([*cli, "Same Stamp"], env=env, check=True)
+                        os.utime(request, ns=(stamp, stamp))
+                        test.stdin.write("\n")
+                        test.stdin.flush()
+                        assert select.select([test.stdout], [], [], 15)[0], "same-mtime request was not polled"
+                        assert test.stdout.readline() == "same mtime polled\n"
+                        subprocess.run([*cli, "Later Broadcast"], env=env, check=True)
                 elif foreign is None:
                     stamp = request.stat().st_mtime_ns
                     request.write_text("File Request\nignored second line\n")
@@ -93,7 +111,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     if reason is None:
         assert not captures and not starts and not stops, (captures, log)
         return
-    frame = 3 if mode == "empty-file" else 2
+    frame = {"empty-file": 3, "wrong-pid": 4}.get(mode, 2)
     expected = directory / f"capture-{test.pid}-f{frame}-{reason}.gputrace"
     assert captures == [expected] and expected.is_dir(), (captures, log)
     size = sum(path.stat().st_size for path in expected.rglob("*") if path.is_file())
@@ -127,6 +145,8 @@ def main():
         cases = [
             ("file", "file request and frame 2 trace", {"reason": "file-request"}),
             ("empty-file", "empty request ignored without acknowledging mtime", {"reason": "file-request"}),
+            ("file", "matching PID request captured", {"reason": "file-request", "targeted": True}),
+            ("wrong-pid", "wrong PID acknowledged and later broadcast captured", {"reason": "later-broadcast"}),
             ("file", "disabled without MTL_CAPTURE_ENABLED", {"enabled": False, "message": DISABLED}),
             ("file", "disk space refusal", {"min_free": 999999,
              "message": "fencepost: capture refused: insufficient free space on output volume"}),

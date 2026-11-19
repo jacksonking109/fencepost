@@ -158,8 +158,10 @@ logs a line for every manual request it queues or refuses, with the reason.
 ### Hotkey helper
 
 Run `./build.sh`, then `open "out/Fencepost Trigger.app"`. Choose **Save timeline now** in the **FP** menu
-or press **Control–Option–Command–F**. The global hotkey takes that combination away from the game while
-the app runs. If macOS can't register it, the menu shows **Global hotkey unavailable**.
+or press **Control–Option–Command–F**. Both target the frontmost app's process. If the helper itself is
+frontmost or there is no frontmost app, the request goes to all traced processes. The global hotkey takes
+that combination away from the game while the app runs. If macOS can't register it, the menu shows
+**Global hotkey unavailable**.
 
 To change the hotkey or the trigger path, run these commands and restart the app. Use `ctrl`, `opt`, `cmd`
 and `shift` with a key from `f1`–`f19`, `a`–`z` or `0`–`9`.
@@ -171,8 +173,9 @@ defaults write io.github.jacksonking109.fencepost-trigger triggerFile -string /t
 
 Set `FENCEPOST_TRIGGER_FILE` to the same path in the traced process. The default is `/tmp/fencepost-trigger-<uid>`.
 For scripts, use `out/fencepost-trigger flicker` or pass `--file /tmp/my-fencepost-trigger`. The CLI uses
-`FENCEPOST_TRIGGER_FILE` when `--file` is omitted and uses `manual` when no reason is given. Both helpers only
-write a file and work with any program traced by fencepost, whether it runs through Wine or natively.
+`FENCEPOST_TRIGGER_FILE` when `--file` is omitted and uses `manual` when no reason is given. It targets
+all traced processes unless you pass `--pid N`. The request file's first line is the reason. An optional
+second line `pid=N` targets only that process. Both helpers work with traced Wine and native programs.
 
 To check the hotkey by hand, run a traced program with `FENCEPOST_RING` enabled and press the combination while
 the program is rendering. A function-key hotkey also needs Fn on keyboards whose
@@ -191,11 +194,13 @@ MTL_CAPTURE_ENABLED=1 FENCEPOST_CAPTURE=/tmp/fencepost \
 out/fencepost-trigger --capture flicker
 ```
 
-You can also choose **Capture next frame** in the **FP** menu, press **Control–Option–Command–C**, or call
-`void fencepost_capture(const char *reason)` through `dlsym`. To customise the app, set `captureHotkey` and
+Choose **Capture next frame** in the **FP** menu or press **Control–Option–Command–C** to target the
+frontmost app's process, with the same fallback as the timeline hotkey. The CLI sends to all traced
+processes unless you pass `--pid N`. You can also call `void fencepost_capture(const char *reason)` through
+`dlsym`. To customise the app, set `captureHotkey` and
 `captureFile` in the same defaults domain as the timeline helper and restart it. Set the matching
-`FENCEPOST_CAPTURE_FILE` in the Metal program. The request file uses its modification time and first line,
-just like the timeline trigger file.
+`FENCEPOST_CAPTURE_FILE` in the Metal program. Like the timeline trigger file, it uses its modification
+time, a reason on line one, and an optional `pid=N` on line two.
 
 After the program has ended at least one frame, fencepost starts capture before allocating the next frame's
 first command buffer. It ignores requests while a capture is active. Open the logged
