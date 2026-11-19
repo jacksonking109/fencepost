@@ -30,6 +30,7 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include "../tools/trigger/trigger_write.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -505,19 +506,22 @@ static const char *g_capture_prefix, *g_capture_file;
 static struct timespec g_capture_mtime;
 static unsigned g_capture_on, g_capture_frames, g_capture_max, g_capture_free, g_capture_count;
 static double g_capture_cooldown;
-static uint64_t g_capture_opened, g_capture_until, g_capture_started, g_capture_stopped;
+static uint64_t g_capture_frame, g_capture_opened, g_capture_until, g_capture_started, g_capture_stopped;
 static uint64_t g_capture_boundary, g_capture_durations[120], g_capture_duration_count;
 static char g_capture_reason[33];
-static int g_capture_active;
+static int g_capture_busy;                   /* starting, active or stopping (g_lock) */
+static unsigned g_capture_commits;           /* tracked commits still in Metal (g_lock) */
 static NSString *g_capture_path;
-/* Serialize first-CB creation and frame-ending commits while capture is enabled.
- * Never call the capture manager with the detector lock held. */
+/* Gate command-buffer entry during capture transitions, with tl_depth set so
+ * Metal's nested hooks pass through. Never hold this across allocation or
+ * commit: a full command queue can make allocation wait for another commit.
+ * Lock order is capture lock then detector lock. */
 static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Called with g_lock held. Keep the first request for the next unopened frame. */
 static void capture_request(const char *reason)
 {
-    if (!g_capture_prefix || g_capture_active || g_capture_reason[0]) return;
+    if (!g_capture_prefix || g_capture_busy || g_capture_reason[0]) return;
     size_t n = 0;
     for (const unsigned char *p = (const unsigned char *)(reason ?: "");
          *p && *p != '\n' && *p != '\r' && n < sizeof g_capture_reason - 1; p++) {
@@ -1416,19 +1420,25 @@ static int compare_duration(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+static int frame_duration_spiked(uint64_t duration, const uint64_t history[120],
+                                 uint64_t count, double factor, double min_ns)
+{
+    if (count < 120) return 0;
+    uint64_t sorted[120];
+    memcpy(sorted, history, sizeof sorted);
+    qsort(sorted, 120, sizeof *sorted, compare_duration);
+    double median = 0.5 * sorted[59] + 0.5 * sorted[60];
+    return duration > MAX(factor * median, median + min_ns);
+}
+
 static void capture_frame_boundary(void)
 {
     if (!(g_capture_on & CAP_SPIKE)) return;
     uint64_t now = trace_clock();
     if (g_capture_boundary) {
         uint64_t duration = now - g_capture_boundary;
-        if (g_capture_duration_count >= 120) {
-            uint64_t sorted[120];
-            memcpy(sorted, g_capture_durations, sizeof sorted);
-            qsort(sorted, 120, sizeof *sorted, compare_duration);
-            double median = 0.5 * sorted[59] + 0.5 * sorted[60];
-            if (duration > MAX(2 * median, median + 8e6)) capture_request("spike");
-        }
+        if (frame_duration_spiked(duration, g_capture_durations, g_capture_duration_count, 2, 8e6))
+            capture_request("spike");
         g_capture_durations[g_capture_duration_count++ % 120] = duration;
     }
     g_capture_boundary = now;
@@ -1438,14 +1448,8 @@ static void ring_frame_duration(uint64_t frame, uint64_t timestamp)
 {
     if (!frame || !g_spike_factor) return; /* frame 1 starts at first CB, not at a boundary */
     uint64_t duration = timestamp - g_trace_frame_start;
-    if (g_duration_count >= 120) {
-        uint64_t sorted[120];
-        memcpy(sorted, g_durations, sizeof sorted);
-        qsort(sorted, 120, sizeof *sorted, compare_duration);
-        double median = 0.5 * sorted[59] + 0.5 * sorted[60];
-        if (duration > MAX(g_spike_factor * median, median + g_spike_min_ns))
-            ring_trigger("spike", "spike", frame, timestamp, NULL);
-    }
+    if (frame_duration_spiked(duration, g_durations, g_duration_count, g_spike_factor, g_spike_min_ns))
+        ring_trigger("spike", "spike", frame, timestamp, NULL);
     g_durations[g_duration_count++ % 120] = duration;
 }
 
@@ -2597,34 +2601,38 @@ static void on_cb(id q, id cb)
     pthread_mutex_unlock(&g_lock);
     hook_cb(object_getClass(cb));
 }
-static void capture_poll_file(void)
+/* Called under the capture lock. Acknowledge the timestamp of the inode read,
+ * including file requests received while a capture is running. */
+static int capture_poll_file(char reason[static sizeof g_capture_reason])
 {
-    if (!g_capture_file) return;
+    if (!g_capture_file) return 0;
     struct stat st;
-    if (stat(g_capture_file, &st) || !S_ISREG(st.st_mode)) return;
+    if (stat(g_capture_file, &st) || !S_ISREG(st.st_mode) ||
+        !trigger_time_newer(st.st_mtimespec, g_capture_mtime)) return 0;
     int fd = open(g_capture_file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) return;
+    if (fd < 0) return 0;
+    int changed = 0;
     if (!fstat(fd, &st) && S_ISREG(st.st_mode) &&
-        (st.st_mtimespec.tv_sec > g_capture_mtime.tv_sec ||
-         (st.st_mtimespec.tv_sec == g_capture_mtime.tv_sec &&
-          st.st_mtimespec.tv_nsec > g_capture_mtime.tv_nsec))) {
-        char reason[33];
-        ssize_t n = read(fd, reason, sizeof reason - 1);
+        trigger_time_newer(st.st_mtimespec, g_capture_mtime)) {
+        ssize_t n = read(fd, reason, sizeof g_capture_reason - 1);
         if (n >= 0) {
             reason[n] = 0;
             g_capture_mtime = st.st_mtimespec;
-            capture_request(reason);
+            changed = 1;
         }
     }
     close(fd);
+    return changed;
 }
 
 static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char *reason)
 {
     @autoreleasepool {
-        NSString *path = [NSString stringWithFormat:@"%s-%d-f%llu-%s.gputrace",
-                          g_capture_prefix, getpid(), frame, reason];
-        if (!path.isAbsolutePath)
+        NSString *prefix = [NSFileManager.defaultManager stringWithFileSystemRepresentation:g_capture_prefix
+                                                                                      length:strlen(g_capture_prefix)];
+        NSString *path = prefix ? [prefix stringByAppendingFormat:@"-%d-f%llu-%s.gputrace",
+                                   getpid(), frame + 1, reason] : nil;
+        if (path && !path.isAbsolutePath)
             path = [NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:path];
         const char *refusal = NULL;
         uint64_t now = trace_clock();
@@ -2635,6 +2643,7 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
         else if (g_capture_stopped && (now - g_capture_stopped) / 1e9 < g_capture_cooldown)
             refusal = "cooldown in effect";
         else if (!device) refusal = "command queue has no Metal device";
+        else if (!path.fileSystemRepresentation) refusal = "invalid output path";
         else if (manager.isCapturing) refusal = "Metal capture already running";
         else if (statfs(path.stringByDeletingLastPathComponent.fileSystemRepresentation, &volume))
             refusal = "cannot check free space on output volume";
@@ -2656,14 +2665,10 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
         }
 
         g_capture_path = [path copy];
-        g_capture_started = now;
+        g_capture_started = trace_clock();
         g_capture_until = frame + g_capture_frames;
         g_capture_count++;
-        pthread_mutex_lock(&g_lock);
-        g_capture_active = 1;
-        g_capture_reason[0] = 0;
-        pthread_mutex_unlock(&g_lock);
-        fp_log("fencepost: capturing frame %llu (%s) -> %s\n", frame, reason, path.fileSystemRepresentation);
+        fp_log("fencepost: capturing frame %llu (%s) -> %s\n", frame + 1, reason, path.fileSystemRepresentation);
     }
 }
 
@@ -2678,7 +2683,7 @@ static void capture_stop(void)
         uint64_t size = 0;
         NSFileManager *files = NSFileManager.defaultManager;
         NSDirectoryEnumerator *entries = [files enumeratorAtPath:g_capture_path];
-        for (NSString *entry in entries) {
+        while ([entries nextObject]) {
             NSDictionary *attrs = entries.fileAttributes;
             if ([attrs.fileType isEqualToString:NSFileTypeRegular]) size += attrs.fileSize;
         }
@@ -2686,37 +2691,58 @@ static void capture_stop(void)
                size / 1048576.0, (g_capture_stopped - g_capture_started) / 1e9);
         [g_capture_path release];
         g_capture_path = nil;
+        char ignored[sizeof g_capture_reason];
+        capture_poll_file(ignored);
         pthread_mutex_lock(&g_lock);
-        g_capture_active = 0;
+        g_capture_busy = 0;
         pthread_mutex_unlock(&g_lock);
     }
 }
 
 static void capture_before_cb(id queue)
 {
-    pthread_mutex_lock(&g_lock);
-    uint64_t frame = g_frame_cur;
-    char reason[sizeof g_capture_reason] = {0};
+    pthread_mutex_lock(&g_capture_lock);
+    uint64_t frame = g_capture_frame;
     if (frame > g_capture_opened) {
         g_capture_opened = frame;
-        capture_poll_file();
+        char reason[sizeof g_capture_reason];
+        int changed = capture_poll_file(reason);
+        pthread_mutex_lock(&g_lock);
+        if (changed) capture_request(reason);
         memcpy(reason, g_capture_reason, sizeof reason);
         g_capture_reason[0] = 0;
+        if (reason[0]) g_capture_busy = 1;
+        pthread_mutex_unlock(&g_lock);
+        if (reason[0]) {
+            capture_start(queue, frame, reason);
+            if (!g_capture_path) {
+                pthread_mutex_lock(&g_lock);
+                g_capture_busy = 0;
+                pthread_mutex_unlock(&g_lock);
+            }
+        }
     }
+    pthread_mutex_unlock(&g_capture_lock);
+}
+
+static void capture_after_commit(void)
+{
+    pthread_mutex_lock(&g_capture_lock);
+    pthread_mutex_lock(&g_lock);
+    /* Phase 1 can advance across enqueue-held buffers. Publish the new frame
+     * only after those Metal commits have returned, so the ending submission
+     * is inside the capture and the next allocation sees the transition. */
+    if (--g_capture_commits == 0) g_capture_frame = g_frame_cur;
     pthread_mutex_unlock(&g_lock);
-    if (reason[0]) capture_start(queue, frame, reason);
+    if (g_capture_path && g_capture_frame >= g_capture_until) capture_stop();
+    pthread_mutex_unlock(&g_capture_lock);
 }
 
 static id h_q_cb(id self, SEL _cmd)
 {
     ENTER;
-    int capture = OUTER && g_capture_prefix;
-    if (capture) {
-        pthread_mutex_lock(&g_capture_lock);
-        capture_before_cb(self);
-    }
+    if (OUTER && g_capture_prefix) capture_before_cb(self);
     id cb = ORIG(H_Q_CB, id (*)(id, SEL))(self, _cmd);
-    if (capture) pthread_mutex_unlock(&g_capture_lock);
     LEAVE;
     if (OUTER) on_cb(self, cb);
     return cb;
@@ -2724,13 +2750,8 @@ static id h_q_cb(id self, SEL _cmd)
 static id h_q_cbu(id self, SEL _cmd)
 {
     ENTER;
-    int capture = OUTER && g_capture_prefix;
-    if (capture) {
-        pthread_mutex_lock(&g_capture_lock);
-        capture_before_cb(self);
-    }
+    if (OUTER && g_capture_prefix) capture_before_cb(self);
     id cb = ORIG(H_Q_CBU, id (*)(id, SEL))(self, _cmd);
-    if (capture) pthread_mutex_unlock(&g_capture_lock);
     LEAVE;
     if (OUTER) on_cb(self, cb);
     return cb;
@@ -2738,13 +2759,8 @@ static id h_q_cbu(id self, SEL _cmd)
 static id h_q_cbd(id self, SEL _cmd, id d)
 {
     ENTER;
-    int capture = OUTER && g_capture_prefix;
-    if (capture) {
-        pthread_mutex_lock(&g_capture_lock);
-        capture_before_cb(self);
-    }
+    if (OUTER && g_capture_prefix) capture_before_cb(self);
     id cb = ORIG(H_Q_CBD, id (*)(id, SEL, id))(self, _cmd, d);
-    if (capture) pthread_mutex_unlock(&g_capture_lock);
     LEAVE;
     if (OUTER) on_cb(self, cb);
     return cb;
@@ -3019,8 +3035,7 @@ static void ring_poll_file(void)
 static void h_cb_commit(id self, SEL _cmd)
 {
     ENTER;
-    int capture = OUTER && g_capture_prefix;
-    if (capture) pthread_mutex_lock(&g_capture_lock);
+    int capture_commit = 0;
     if (OUTER) {
         uint64_t uid = 0;
         fp_trace_cb *trace = NULL;
@@ -3029,6 +3044,10 @@ static void h_cb_commit(id self, SEL _cmd)
         fp_cb *c = cb_find_open((void *)self);
         if (c && c->state == 1) {
             uid = c->uid;
+            if (g_capture_prefix) {
+                g_capture_commits++;
+                capture_commit = 1;
+            }
             if (l) snprintf(c->label, sizeof c->label, "%s", l.UTF8String);
             if (g_trace_enabled && (trace = c->trace)) {
                 trace->owner->record = NULL;
@@ -3061,13 +3080,7 @@ static void h_cb_commit(id self, SEL _cmd)
         }
     }
     ORIG(H_CB_COMMIT, void (*)(id, SEL))(self, _cmd);
-    if (capture) {
-        pthread_mutex_lock(&g_lock);
-        int stop = g_capture_path && g_frame_cur >= g_capture_until;
-        pthread_mutex_unlock(&g_lock);
-        if (stop) capture_stop();
-        pthread_mutex_unlock(&g_capture_lock);
-    }
+    if (capture_commit) capture_after_commit();
     LEAVE;
 }
 
@@ -3630,12 +3643,15 @@ static unsigned trace_unsigned(const char *name, unsigned fallback)
 static void capture_init(const char *prefix)
 {
     @autoreleasepool {
-        if (strcmp(getenv("MTL_CAPTURE_ENABLED") ?: "", "1") ||
-            ![MTLCaptureManager.sharedCaptureManager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
-            fp_log("fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch and GPU trace document support; capture disabled\n");
+        if (strcmp(getenv("MTL_CAPTURE_ENABLED") ?: "", "1")) {
+            fp_log("fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; capture disabled\n");
             return;
         }
-        g_capture_prefix = prefix;
+        if (![MTLCaptureManager.sharedCaptureManager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+            fp_log("fencepost: Metal does not support GPU trace documents; capture disabled\n");
+            return;
+        }
+        g_capture_prefix = strdup(prefix);
         const char *file = getenv("FENCEPOST_CAPTURE_FILE");
         static char default_path[64];
         if (!file) {
@@ -3644,7 +3660,7 @@ static void capture_init(const char *prefix)
         }
         struct stat st;
         if (*file) {
-            g_capture_file = file;
+            g_capture_file = strdup(file);
             if (!stat(file, &st)) g_capture_mtime = st.st_mtimespec;
         }
         g_capture_frames = MAX(1u, trace_unsigned("FENCEPOST_CAPTURE_FRAMES", 1));
