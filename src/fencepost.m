@@ -605,6 +605,7 @@ typedef struct fp_trace_chunk {
     fp_trace_record *first, *last;
     size_t bytes;
     unsigned outstanding;
+    atomic_uint refs;
     uint64_t marker_hits[4], start, end;
 } fp_trace_chunk;
 
@@ -619,7 +620,8 @@ static int g_ring_encoded, g_ring_race = 1, g_ring_gpuerr = 1;
 static double g_spike_factor = 2, g_spike_min_ns = 8e6, g_cooldown_ns = 5e9;
 static uint64_t g_durations[120], g_duration_count;
 static uint64_t g_last_fire, g_last_poll, g_suppressed;
-static unsigned g_max_dumps = 20, g_dumps;
+static unsigned g_max_dumps = 20, g_dumps, g_pending_dumps;
+static dispatch_queue_t g_ring_writer;
 static char *g_trigger_file;
 static struct timespec g_file_mtime;
 
@@ -644,6 +646,7 @@ static fp_trace_chunk *trace_chunk(uint64_t frame)
     while (*slot && (*slot)->frame < frame) slot = &(*slot)->next;
     if (!*slot || (*slot)->frame != frame) {
         fp_trace_chunk *chunk = calloc(1, sizeof *chunk);
+        atomic_init(&chunk->refs, 1);
         chunk->frame = frame;
         chunk->next = *slot;
         *slot = chunk;
@@ -671,6 +674,14 @@ static void trace_drain(fp_trace_chunk *chunk, FILE *out)
     chunk->last = NULL;
 }
 
+static void trace_release_chunk(fp_trace_chunk *chunk)
+{
+    if (atomic_fetch_sub(&chunk->refs, 1) == 1) {
+        trace_drain(chunk, NULL);
+        free(chunk);
+    }
+}
+
 static void trace_stream_flush(void)
 {
     trace_drain(&g_trace_metadata, g_trace);
@@ -690,8 +701,7 @@ static void ring_evict(int cap)
     g_ring_floor = chunk->frame + 1;
     g_ring_evictions++;
     if (cap) g_ring_cap_evictions++;
-    trace_drain(chunk, NULL);
-    free(chunk);
+    trace_release_chunk(chunk);
 }
 
 /* Budget whole records, including their separator, before publishing them. */
@@ -745,16 +755,22 @@ static int trace_write(uint64_t frame, FILE *f, char **record, size_t *length, u
     return trace_store(frame, f, record, length, events, REC_PLAIN, 0);
 }
 
-static void trace_header(FILE *f, char phase, int tid, uint64_t ts, const char *cat, const char *name)
+static void trace_header_at(FILE *f, char phase, int tid, uint64_t ts, const char *cat, const char *name,
+                            uint64_t origin)
 {
     fprintf(f, "{\"ph\":\"%c\",\"pid\":%d,\"tid\":%d,\"name\":", phase, g_trace_pid, tid);
     trace_string(f, name);
     if (cat) { fputs(",\"cat\":", f); trace_string(f, cat); }
     if (phase != 'M') {
-        if (!g_trace_origin) g_trace_origin = ts;
         fputs(",\"ts\":", f);
-        trace_us(f, (int64_t)ts - (int64_t)g_trace_origin);
+        trace_us(f, (int64_t)ts - (int64_t)origin);
     }
+}
+
+static void trace_header(FILE *f, char phase, int tid, uint64_t ts, const char *cat, const char *name)
+{
+    if (phase != 'M' && !g_trace_origin) g_trace_origin = ts;
+    trace_header_at(f, phase, tid, ts, cat, name, g_trace_origin);
 }
 
 static void trace_start(void)
@@ -1516,7 +1532,25 @@ typedef struct {
     uint64_t outside_flows, outside_markers;
 } fp_trace_counts;
 
-static char *trace_summary(fp_trace_counts totals, size_t *length)
+typedef struct {
+    long stats[ST_COUNT];
+    uint64_t pool_exhausted, suppressed, evictions, cap_evictions;
+    uint64_t origin;
+    int stopped, sampling_supported;
+} fp_trace_summary;
+
+static fp_trace_summary trace_summary_state(void)
+{
+    fp_trace_summary state = {
+        .pool_exhausted = g_trace_pool_exhausted, .stopped = g_trace_stopped,
+        .origin = g_trace_origin, .sampling_supported = g_trace_sampling_supported,
+        .suppressed = g_suppressed, .evictions = g_ring_evictions, .cap_evictions = g_ring_cap_evictions
+    };
+    memcpy(state.stats, g_st, sizeof state.stats);
+    return state;
+}
+
+static char *trace_summary(fp_trace_counts totals, const fp_trace_summary *state, size_t *length)
 {
     static const char *const stats[] = {
         "race_unique", "possible_unique", "race_hits", "possible_hits", "nodes", "accesses", "cbs",
@@ -1527,22 +1561,23 @@ static char *trace_summary(fp_trace_counts totals, size_t *length)
     _Static_assert(sizeof stats / sizeof *stats == ST_COUNT, "trace summary must include all detector counters");
     char *record = NULL;
     FILE *f = open_memstream(&record, length);
-    trace_header(f, 'i', 0, trace_clock(), "fencepost", "fencepost summary");
+    uint64_t timestamp = trace_clock();
+    trace_header_at(f, 'i', 0, timestamp, "fencepost", "fencepost summary", state->origin ?: timestamp);
     fprintf(f, ",\"s\":\"p\",\"args\":{\"encoders_traced\":%llu,\"sampled\":%llu,\"sampling_skipped\":%llu,\"pool_exhausted\":%llu,"
             "\"flows\":%llu,\"markers\":%llu,\"dropped\":%llu,\"sampling_supported\":%s,\"size_limit_reached\":%s",
             TRACE_U64(totals.encoders), TRACE_U64(totals.sampled), TRACE_U64(totals.skipped),
-            TRACE_U64(g_trace_pool_exhausted), TRACE_U64(totals.flows),
-            TRACE_U64(totals.markers), TRACE_U64(totals.dropped), g_trace_sampling_supported ? "true" : "false",
-            g_trace_stopped ? "true" : "false");
-    for (int i = 0; i < ST_COUNT; i++) fprintf(f, ",\"%s\":%ld", stats[i], g_st[i]);
+            TRACE_U64(state->pool_exhausted), TRACE_U64(totals.flows),
+            TRACE_U64(totals.markers), TRACE_U64(totals.dropped), state->sampling_supported ? "true" : "false",
+            state->stopped ? "true" : "false");
+    for (int i = 0; i < ST_COUNT; i++) fprintf(f, ",\"%s\":%ld", stats[i], state->stats[i]);
     static const char *const types[] = { "race", "possible", "order", "partial" };
     for (int i = 0; i < 4; i++)
         fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(totals.hits[i]),
                 types[i], TRACE_U64(totals.counts[i]));
     if (g_ring) {
-        fprintf(f, ",\"suppressed_triggers\":%llu", TRACE_U64(g_suppressed));
+        fprintf(f, ",\"suppressed_triggers\":%llu", TRACE_U64(state->suppressed));
         fprintf(f, ",\"evicted_frames\":%llu,\"memory_evictions\":%llu,\"outside_flows\":%llu,\"outside_markers\":%llu",
-                TRACE_U64(g_ring_evictions), TRACE_U64(g_ring_cap_evictions),
+                TRACE_U64(state->evictions), TRACE_U64(state->cap_evictions),
                 TRACE_U64(totals.outside_flows), TRACE_U64(totals.outside_markers));
     }
     fputs("}}", f);
@@ -1554,7 +1589,8 @@ static void ring_trigger(const char *reason, const char *source, uint64_t frame,
 {
     if (!g_ring_encoded || g_trace_stopped || !trace_frame_selected(frame)) return;
     uint64_t now = trace_clock();
-    if (g_trigger.active || g_dumps >= g_max_dumps || (g_last_fire && now - g_last_fire < g_cooldown_ns)) {
+    if (g_trigger.active || g_dumps + g_pending_dumps >= g_max_dumps ||
+        (g_last_fire && now - g_last_fire < g_cooldown_ns)) {
         g_suppressed++;
         return;
     }
@@ -1582,21 +1618,65 @@ __attribute__((visibility("default"))) void fencepost_trigger(const char *reason
     pthread_mutex_unlock(&g_lock);
 }
 
-static int ring_write_dump(FILE *out)
+typedef struct {
+    fp_trace_chunk *owner;
+    const fp_trace_record *first, *last;
+    uint64_t marker_hits[4];
+} fp_dump_chunk;
+
+typedef struct {
+    fp_trigger trigger;
+    fp_trace_summary summary;
+    int frames_tid;
+    uint64_t first, timestamp;
+    size_t count;
+    fp_dump_chunk chunks[];
+} fp_ring_dump;
+
+/* Snapshot the record boundaries. The live ring can append to a chunk or
+ * evict it while the writer reads the pinned records through the saved tail. */
+static fp_ring_dump *ring_snapshot(void)
+{
+    if (!g_frames_tid) g_frames_tid = trace_name_track("Frames");
+    uint64_t first = MAX(g_trigger.first, g_ring_floor);
+    fp_trace_chunk *start = g_trace_chunks;
+    while (start && start->frame < first) start = start->next;
+    size_t count = 1;
+    for (fp_trace_chunk *c = start; c && c->frame <= g_trigger.last; c = c->next) count++;
+    fp_ring_dump *dump = malloc(sizeof *dump + count * sizeof *dump->chunks);
+    if (!dump) return NULL;
+    dump->trigger = g_trigger;
+    g_trigger.error = NULL;
+    dump->frames_tid = g_frames_tid;
+    dump->first = first;
+    dump->timestamp = g_trigger.timestamp;
+    dump->count = count;
+    dump->chunks[0] = (fp_dump_chunk){ .first = g_trace_metadata.first, .last = g_trace_metadata.last };
+    size_t i = 1;
+    for (fp_trace_chunk *c = start; c && c->frame <= g_trigger.last; c = c->next) {
+        if (c->frame == g_trigger.frame && c->end)
+            dump->timestamp = MAX(c->start, MIN(dump->timestamp, c->end));
+        atomic_fetch_add(&c->refs, 1);
+        fp_dump_chunk *chunk = &dump->chunks[i++];
+        *chunk = (fp_dump_chunk){ .owner = c, .first = c->first, .last = c->last };
+        memcpy(chunk->marker_hits, c->marker_hits, sizeof chunk->marker_hits);
+    }
+    if (!g_trace_origin) g_trace_origin = dump->timestamp;
+    dump->summary = trace_summary_state();
+    return dump;
+}
+
+static int ring_write_dump(FILE *out, const fp_ring_dump *dump)
 {
     int started = 0;
     fp_trace_counts totals = {0};
-    if (!g_frames_tid) g_frames_tid = trace_name_track("Frames");
-    uint64_t first = MAX(g_trigger.first, g_ring_floor), timestamp = g_trigger.timestamp;
+    const fp_trigger *trigger = &dump->trigger;
     if (fputc('[', out) == EOF) return 0;
-    for (fp_trace_record *r = g_trace_metadata.first; r; r = r->next)
-        if (!trace_emit(out, &started, r)) return 0;
-    for (fp_trace_chunk *c = g_trace_chunks; c; c = c->next) {
-        if (c->frame < first || c->frame > g_trigger.last) continue;
-        if (c->frame == g_trigger.frame && c->end) timestamp = MAX(c->start, MIN(timestamp, c->end));
+    for (size_t index = 0; index < dump->count; index++) {
+        const fp_dump_chunk *c = &dump->chunks[index];
         for (int i = 0; i < 4; i++) totals.hits[i] += c->marker_hits[i];
-        for (fp_trace_record *r = c->first; r; r = r->next) {
-            if (r->type >= REC_FLOW && (r->source < first || r->source > g_trigger.last)) {
+        for (const fp_trace_record *r = c->first; r; r = r == c->last ? NULL : r->next) {
+            if (r->type >= REC_FLOW && (r->source < dump->first || r->source > trigger->last)) {
                 if (r->type == REC_FLOW) totals.outside_flows++;
                 else totals.outside_markers++;
                 continue;
@@ -1616,26 +1696,26 @@ static int ring_write_dump(FILE *out)
     for (int i = 0; i < 4; i++) totals.dropped += totals.hits[i] - totals.counts[i];
 
     char title[48];
-    snprintf(title, sizeof title, "TRIGGER %s", g_trigger.reason);
+    snprintf(title, sizeof title, "TRIGGER %s", trigger->reason);
     fputs(started ? ",\n" : "\n", out);
-    trace_header(out, 'i', g_frames_tid, timestamp, "frame", title);
-    fprintf(out, ",\"s\":\"t\",\"args\":{\"frame\":%llu", TRACE_U64(g_trigger.frame + 1));
-    trace_label(out, "reason", g_trigger.reason);
-    trace_label(out, "source", g_trigger.source);
-    if (g_trigger.error) trace_label(out, "error", g_trigger.error);
+    trace_header_at(out, 'i', dump->frames_tid, dump->timestamp, "frame", title, dump->summary.origin);
+    fprintf(out, ",\"s\":\"t\",\"args\":{\"frame\":%llu", TRACE_U64(trigger->frame + 1));
+    trace_label(out, "reason", trigger->reason);
+    trace_label(out, "source", trigger->source);
+    if (trigger->error) trace_label(out, "error", trigger->error);
     fputs("}},\n", out);
     size_t length = 0;
-    char *summary = trace_summary(totals, &length);
+    char *summary = trace_summary(totals, &dump->summary, &length);
     int ok = fwrite(summary, 1, length, out) == length;
     free(summary);
     return ok && fputs("\n]\n", out) != EOF && !ferror(out);
 }
 
-static void ring_dump(void)
+static int ring_dump(const fp_ring_dump *dump)
 {
     char *path = NULL;
     if (asprintf(&path, "%s-%d-f%llu-%s.json", g_ring_prefix, g_trace_pid,
-                 TRACE_U64(g_trigger.frame + 1), g_trigger.reason) < 0) return;
+                 TRACE_U64(dump->trigger.frame + 1), dump->trigger.reason) < 0) return 0;
     char *temp = NULL;
     int ok = 0;
     if (asprintf(&temp, "%s.tmp.XXXXXX", path) >= 0) {
@@ -1643,7 +1723,7 @@ static void ring_dump(void)
         if (fd >= 0) {
             FILE *out = fdopen(fd, "w");
             if (out) {
-                ok = ring_write_dump(out);
+                ok = ring_write_dump(out, dump);
                 if (fclose(out)) ok = 0;
             } else close(fd);
             /* Publish only a complete file, without replacing an earlier dump. */
@@ -1654,11 +1734,10 @@ static void ring_dump(void)
         }
         free(temp);
     }
-    if (ok) {
-        g_dumps++;
-        fp_log("fencepost: timeline dump %s\n", path);
-    } else fp_log("fencepost: could not write timeline dump %s: %s\n", path, strerror(errno));
+    if (ok) fp_log("fencepost: timeline dump %s\n", path);
+    else fp_log("fencepost: could not write timeline dump %s: %s\n", path, strerror(errno));
     free(path);
+    return ok;
 }
 
 /* Wait for both analysis and Metal completion in the captured window. A
@@ -1670,9 +1749,25 @@ static void ring_update(int final)
         for (fp_trace_chunk *c = g_trace_chunks; !final && c; c = c->next)
             if (c->frame >= g_trigger.first && c->frame <= g_trigger.last && c->outstanding) ready = 0;
         if (ready) {
-            ring_dump();
+            fp_ring_dump *dump = ring_snapshot();
             free(g_trigger.error);
             g_trigger = (fp_trigger){0};
+            if (dump) {
+                g_pending_dumps++;
+                dispatch_async(g_ring_writer, ^{
+                    /* The producer has released the detector lock before we start writing. */
+                    pthread_mutex_lock(&g_lock);
+                    pthread_mutex_unlock(&g_lock);
+                    int ok = ring_dump(dump);
+                    for (size_t i = 1; i < dump->count; i++) trace_release_chunk(dump->chunks[i].owner);
+                    free(dump->trigger.error);
+                    free(dump);
+                    pthread_mutex_lock(&g_lock);
+                    g_pending_dumps--;
+                    if (ok) g_dumps++;
+                    pthread_mutex_unlock(&g_lock);
+                });
+            }
         }
     }
     while (g_trace_chunks && g_ring_bytes > g_ring_limit) ring_evict(1);
@@ -1695,7 +1790,8 @@ static void trace_final(void)
     memcpy(totals.hits, g_trace_marker_hits, sizeof totals.hits);
     memcpy(totals.counts, g_trace_marker_counts, sizeof totals.counts);
     size_t length = 0;
-    char *record = trace_summary(totals, &length);
+    fp_trace_summary state = trace_summary_state();
+    char *record = trace_summary(totals, &state, &length);
     trace_stream_flush();
     fp_trace_record summary = { .json = record, .length = length };
     trace_emit(g_trace, &g_trace_has_output, &summary);
@@ -3613,6 +3709,7 @@ static void final_summary(void)
         trace_final();
         g_trace_stopped = 1;
         pthread_mutex_unlock(&g_lock);
+        if (g_ring_writer) dispatch_sync(g_ring_writer, ^{});
     }
 }
 
@@ -3758,6 +3855,7 @@ static void trace_init(const char *path)
         unsigned mb = trace_unsigned("FENCEPOST_RING_MB", 64);
         g_ring_limit = (size_t)(mb ? mb : 64) * 1024 * 1024;
         ring_init_triggers();
+        g_ring_writer = dispatch_queue_create("fencepost.ring-writer", DISPATCH_QUEUE_SERIAL);
         g_ring_prefix = strdup(path);
         g_ring_history = calloc(FP_POOL, sizeof *g_ring_history);
     } else g_trace = fp_open_path(path, "w");
