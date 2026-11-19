@@ -138,7 +138,8 @@ To mark a glitch yourself, run `printf 'flicker\n' > /tmp/fencepost-trigger-$(id
 newer modification time at commit, at most once every 250 ms. The request file must belong to the effective
 user of the traced process. An existing file owned by that user establishes the starting time.
 The first line supplies the reason (up to 32 characters, sanitised to `[a-z0-9-]`), or `manual` for an empty
-line or file. Fencepost only reads the file, so several processes can observe the same update. Set
+line. An empty file is ignored until it contains a line. Fencepost only reads the file, so several processes
+can observe the same update. Set
 `FENCEPOST_TRIGGER_FILE` to use a different path.
 
 The memory cap evicts the oldest frames first and can shorten either side of a capture. A command buffer belongs

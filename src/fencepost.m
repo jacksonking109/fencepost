@@ -2736,7 +2736,7 @@ static int capture_poll_file(char reason[static sizeof g_capture_reason])
         trigger_file_owned(&st, g_capture_file, &g_capture_owner_warned) &&
         trigger_time_newer(st.st_mtimespec, g_capture_mtime)) {
         ssize_t n = read(fd, reason, sizeof g_capture_reason - 1);
-        if (n >= 0) {
+        if (n > 0) {
             reason[n] = 0;
             g_capture_mtime = st.st_mtimespec;
             changed = 1;
@@ -3167,7 +3167,7 @@ static void ring_poll_file(void)
         trigger_file_owned(&st, g_trigger_file, &g_trigger_owner_warned) && ring_new_mtime(st.st_mtimespec)) {
         char reason[33];
         ssize_t n = read(fd, reason, sizeof reason - 1);
-        if (n >= 0) {
+        if (n > 0) {
             reason[n] = 0;
             g_file_mtime = st.st_mtimespec;
             ring_trigger(reason, "file", g_frame_cur, now, NULL);

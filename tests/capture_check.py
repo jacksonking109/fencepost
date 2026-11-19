@@ -44,14 +44,24 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_s
     with subprocess.Popen([*command, ROOT / "out/capturetest", mode], env=env,
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as test:
         try:
-            if mode in {"file", "no-frame"}:
+            if mode in {"file", "no-frame", "empty-file"}:
                 assert select.select([test.stdout], [], [], 15)[0], "capturetest did not become ready"
                 ready = test.stdout.readline()
                 if not ready:
                     _, log = test.communicate(timeout=5)
                     raise AssertionError((test.returncode, log))
                 assert ready == "ready\n", ready
-                if foreign is None:
+                if mode == "empty-file":
+                    stamp = request.stat().st_mtime_ns + 1_000_000_000
+                    request.write_text("")
+                    os.utime(request, ns=(stamp, stamp))
+                    test.stdin.write("\n")
+                    test.stdin.flush()
+                    assert select.select([test.stdout], [], [], 15)[0], "empty request was not polled"
+                    assert test.stdout.readline() == "empty polled\n"
+                    request.write_text("File Request\n")
+                    os.utime(request, ns=(stamp, stamp))
+                elif foreign is None:
                     stamp = request.stat().st_mtime_ns
                     request.write_text("File Request\nignored second line\n")
                     assert request.stat().st_mtime_ns > stamp
@@ -82,11 +92,12 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_s
     if reason is None:
         assert not captures and not starts and not stops, (captures, log)
         return
-    expected = directory / f"capture-{test.pid}-f2-{reason}.gputrace"
+    frame = 3 if mode == "empty-file" else 2
+    expected = directory / f"capture-{test.pid}-f{frame}-{reason}.gputrace"
     assert captures == [expected] and expected.is_dir(), (captures, log)
     size = sum(path.stat().st_size for path in expected.rglob("*") if path.is_file())
     assert size >= 4096, (size, log)
-    assert starts == [f"fencepost: capturing frame 2 ({reason}) -> {expected}"], log
+    assert starts == [f"fencepost: capturing frame {frame} ({reason}) -> {expected}"], log
     suffix = r" \(time limit\)" if mode == "idle" else ""
     assert len(stops) == 1 and re.fullmatch(
         rf"fencepost: capture written {re.escape(str(expected))}, \d+\.\d{{2}} MB, \d+\.\d s{suffix}", stops[0]), log
@@ -107,6 +118,7 @@ def main():
     with tempfile.TemporaryDirectory() as scratch:
         cases = [
             ("file", "file request and frame 2 trace", {"reason": "file-request"}),
+            ("empty-file", "empty request ignored without acknowledging mtime", {"reason": "file-request"}),
             ("file", "disabled without MTL_CAPTURE_ENABLED", {"enabled": False, "message": DISABLED}),
             ("file", "disk space refusal", {"min_free": 999999,
              "message": "fencepost: capture refused: insufficient free space on output volume"}),

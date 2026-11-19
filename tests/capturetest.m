@@ -24,10 +24,11 @@ int main(int argc, char **argv)
     @autoreleasepool {
         const char *mode = argc == 2 ? argv[1] : "";
         int file = !strcmp(mode, "file"), noFrame = !strcmp(mode, "no-frame");
+        int emptyFile = !strcmp(mode, "empty-file");
         int api = !strcmp(mode, "api"), exitActive = !strcmp(mode, "exit-active");
         int appCapture = !strcmp(mode, "app-capture"), multi = !strcmp(mode, "multi-frame");
         int idle = !strcmp(mode, "idle");
-        if (!file && !noFrame && !api && !exitActive && !appCapture && !multi && !idle) return 2;
+        if (!file && !emptyFile && !noFrame && !api && !exitActive && !appCapture && !multi && !idle) return 2;
 
         void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
         void (*capture)(const char *) = dlsym(RTLD_DEFAULT, "fencepost_capture");
@@ -38,12 +39,12 @@ int main(int argc, char **argv)
         id<MTLCommandBuffer> first = [queue commandBuffer];
         if (!first || !buffer) return 2;
 
-        if (file || noFrame) {
+        if (file || emptyFile || noFrame) {
             puts("ready");
             fflush(stdout);
             if (getchar() == EOF) return 2;
         }
-        if (!file) capture("API Request");
+        if (!file && !emptyFile) capture("API Request");
         MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
         if (manager.isCapturing) return 3;
         if (!submit(first, buffer, noFrame ? NULL : frame)) return 1;
@@ -64,11 +65,17 @@ int main(int argc, char **argv)
 
         MTLCommandBufferDescriptor *descriptor = [[[MTLCommandBufferDescriptor alloc] init] autorelease];
         id<MTLCommandBuffer> second = [queue commandBufferWithDescriptor:descriptor];
+        if (emptyFile && manager.isCapturing) return 3;
         if (api || exitActive || multi || idle) {
             if (!manager.isCapturing) return 3;
             capture("Ignore While Active");
         }
         if (!submit(second, buffer, noFrame ? NULL : frame)) return 1;
+        if (emptyFile) {
+            puts("empty polled");
+            fflush(stdout);
+            if (getchar() == EOF) return 2;
+        }
         if (idle) {
             if (getchar() == EOF) return 2;
             return manager.isCapturing ? 3 : 0;
