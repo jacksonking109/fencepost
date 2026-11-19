@@ -131,6 +131,8 @@ available so far.
 A new race or ORDER signature that gets a detailed report triggers `race`. A command buffer error triggers
 `gpu-error` and includes the error description. A long CPU frame triggers `spike` when its boundary-to-boundary
 duration exceeds both the previous 120 frames' median times the factor and that median plus the minimum increase.
+With `MTL_CAPTURE_ENABLED=1`, timeline spikes default to off because capture instrumentation changes frame timing.
+Set `FENCEPOST_TRIGGER_SPIKE=4:50` or `FENCEPOST_SPIKE=1` to enable the usual threshold.
 A program can also call `void fencepost_trigger(const char *reason)` through `dlsym`. Only processes that have
 encoded work accept triggers.
 
@@ -258,7 +260,7 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_TRIGGER_RACE` | new | `new` fires on detailed reports, `all` on every race or ORDER hit, `0` disables |
 | `FENCEPOST_TRIGGER_GPUERR` | 1 | trigger on command buffer errors, `0` disables |
 | `FENCEPOST_SPIKE` | 1 | `0` disables spike triggers for both timeline dumps and GPU captures |
-| `FENCEPOST_TRIGGER_SPIKE` | 4:50 | timeline spike median multiplier and minimum increase in ms (`factor:min_ms`), `0` disables timeline spikes |
+| `FENCEPOST_TRIGGER_SPIKE` | 4:50 (off with `MTL_CAPTURE_ENABLED=1` unless explicitly enabled) | timeline spike median multiplier and minimum increase in ms (`factor:min_ms`), `0` disables timeline spikes |
 | `FENCEPOST_TRIGGER_FILE` | `/tmp/fencepost-trigger-<uid>` | watch this file for a newer modification time, empty disables |
 | `FENCEPOST_TRIGGER_COOLDOWN` | 5 | seconds between accepted triggers in one process |
 | `FENCEPOST_MAX_AUTO_DUMPS` | 20 | timeline dumps per process from race, GPU-error and spike triggers |

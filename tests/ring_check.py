@@ -10,13 +10,14 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+CAPTURE_SPIKES_OFF = "fencepost: timeline spike triggers disabled by default with MTL_CAPTURE_ENABLED=1"
 
 
-def run_case(directory, arch, mode, ring):
+def run_case(directory, arch, mode, ring, *, capture=False, spike_override=None):
     prefix = directory / f"{mode}-{ring}"
     trigger_file = prefix.with_suffix(".trigger")
     trigger_file.write_text("stale\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("FENCEPOST_")}
+    env = {k: v for k, v in os.environ.items() if k != "MTL_CAPTURE_ENABLED" and not k.startswith("FENCEPOST_")}
     knobs = {
         "DYLD_INSERT_LIBRARIES": ROOT / "out/libfencepost.dylib",
         "FENCEPOST_TRIGGER_FILE": trigger_file,
@@ -27,10 +28,19 @@ def run_case(directory, arch, mode, ring):
         knobs["FENCEPOST_RING"] = 10
     if mode == "race":
         knobs.update(FENCEPOST_TRIGGER_RACE="all", FENCEPOST_MAX_AUTO_DUMPS=1, FENCEPOST_MAX_MANUAL_DUMPS=1)
+    if capture:
+        knobs["MTL_CAPTURE_ENABLED"] = 1
+    if spike_override:
+        knob, value = spike_override
+        knobs[knob] = value
     cmd = ["arch", "-" + arch]
     for k, v in knobs.items():
         cmd.extend(["-e", f"{k}={v}"])
-    subprocess.run([*cmd, ROOT / "out/ringtest", mode], env=env, check=True)
+    test = subprocess.run([*cmd, ROOT / "out/ringtest", mode], env=env, check=not capture,
+                          stderr=subprocess.PIPE if capture else None, text=True)
+    if capture:
+        assert test.returncode == 0, (test.returncode, test.stderr)
+        assert test.stderr.splitlines().count(CAPTURE_SPIKES_OFF) == int(spike_override is None), test.stderr
     dumps = sorted(directory.glob(prefix.name + "-*.json"))
     checker = [sys.executable, ROOT / "tests/trace_check.py"]
     if not ring:
@@ -38,6 +48,9 @@ def run_case(directory, arch, mode, ring):
         subprocess.run([*checker, prefix], check=True)
         return
     assert not prefix.exists()
+    if capture and spike_override is None:
+        assert not dumps, dumps
+        return
     expected = {
         "api": [(30, "bad-frame", "api")],
         "race": [(30, "race", "race"), (36, "checkpoint", "api")],
@@ -73,4 +86,9 @@ if __name__ == "__main__":
         for case in ["api", "race", "spike", "file"]:
             for enabled in [True, False]:
                 run_case(Path(scratch), args.arch, case, enabled)
-    print(f"{args.arch}: all four trigger scenarios passed with ring on and off")
+        for label, override in [("default", None), ("timeline-override", ("FENCEPOST_TRIGGER_SPIKE", "4:50")),
+                                ("global-override", ("FENCEPOST_SPIKE", "1"))]:
+            directory = Path(scratch) / label
+            directory.mkdir()
+            run_case(directory, args.arch, "spike", True, capture=True, spike_override=override)
+    print(f"{args.arch}: all four trigger scenarios passed with ring on and off, including capture spike defaults and overrides")

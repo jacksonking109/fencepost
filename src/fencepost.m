@@ -3972,6 +3972,9 @@ static void ring_init_triggers(void)
              isfinite(factor) && factor > 0 && isfinite(ms) && ms >= 0) {
         g_spike_factor = factor;
         g_spike_min_ns = ms * 1e6;
+    } else if (!p && !getenv("FENCEPOST_SPIKE") && !strcmp(getenv("MTL_CAPTURE_ENABLED") ?: "", "1")) {
+        g_spike_factor = 0;
+        fp_log("fencepost: timeline spike triggers disabled by default with MTL_CAPTURE_ENABLED=1\n");
     }
     p = getenv("FENCEPOST_TRIGGER_COOLDOWN");
     if (p && sscanf(p, "%lf%c", &seconds, &extra) == 1 && isfinite(seconds) && seconds >= 0)
