@@ -15,6 +15,7 @@ clang $FLAGS -dynamiclib -install_name @rpath/libfencepost.dylib -o out/.libfenc
 clang $FLAGS -o out/fptest tests/fptest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/tracetest tests/tracetest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/ringtest tests/ringtest.m -framework Metal -framework Foundation
+clang $FLAGS -o out/capturetest tests/capturetest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/fencepost-trigger tools/trigger/fencepost-trigger.c
 app='out/Fencepost Trigger.app'
 mkdir -p "$app/Contents/MacOS"
@@ -38,10 +39,10 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
-codesign -f -s - out/.libfencepost.dylib.new out/fptest out/tracetest out/ringtest 2>/dev/null
+codesign -f -s - out/.libfencepost.dylib.new out/fptest out/tracetest out/ringtest out/capturetest 2>/dev/null
 codesign -f -s - out/fencepost-trigger "$app" 2>/dev/null
 mv -f out/.libfencepost.dylib.new out/libfencepost.dylib
-echo "built out/libfencepost.dylib, out/fptest, out/tracetest, out/ringtest and out/fencepost-trigger"
+echo "built out/libfencepost.dylib, out/fptest, out/tracetest, out/ringtest, out/capturetest and out/fencepost-trigger"
 echo "built $app"
 
 if [[ $1 == release ]]; then

@@ -5,7 +5,6 @@ import json
 import os
 import platform
 from pathlib import Path
-import plistlib
 import select
 import signal
 import subprocess
@@ -14,7 +13,6 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-DOMAIN = "io.github.jacksonking109.fencepost-trigger"
 
 
 def check_cli(directory, cli, env):
@@ -38,6 +36,14 @@ def check_cli(directory, cli, env):
 
     subprocess.run([*cli, "explicit", "--file", explicit], env=cli_env, check=True)
     assert explicit.read_bytes() == b"explicit\n"
+    assert path.read_bytes() == b"same-second\n"
+
+    capture = directory / "cli.capture"
+    capture_env = dict(cli_env, FENCEPOST_CAPTURE_FILE=str(capture))
+    subprocess.run([*cli, "--capture"], env=capture_env, check=True)
+    assert capture.read_bytes() == b"manual\n"
+    subprocess.run([*cli, "--capture", "capture-override", "--file", explicit], env=capture_env, check=True)
+    assert explicit.read_bytes() == b"capture-override\n" and capture.read_bytes() == b"manual\n"
     assert path.read_bytes() == b"same-second\n"
     unwritable = directory / "unwritable"
     unwritable.mkdir(mode=0o555)
@@ -84,10 +90,6 @@ def check_ring(directory, arch, cli, env):
     assert path.read_bytes() == b"external-cli\n"
 
 
-def read_preferences():
-    return plistlib.loads(subprocess.check_output(["defaults", "export", DOMAIN, "-"]))
-
-
 def smoke_pid(executable, token):
     args = subprocess.check_output(["ps", "-ww", "-ax", "-o", "pid=,command="], text=True)
     for line in args.splitlines():
@@ -101,38 +103,30 @@ def check_app(directory, arch):
     app = ROOT / "out/Fencepost Trigger.app"
     executable = app / "Contents/MacOS/Fencepost Trigger"
     path = str(directory / "app.trigger")
+    capture = str(directory / "app.capture")
     token = f"-FencepostSmokeTest {path}"
-    original = read_preferences()
-    subprocess.run(["defaults", "write", DOMAIN, "triggerFile", "-string", path], check=True)
     try:
+        # Use the process's defaults argument domain, leaving user preferences alone.
         subprocess.run(["open", "-n", "-g", "--arch", arch, "-a", app,
-                        "--args", "-FencepostSmokeTest", path], check=True, timeout=10)
+                        "--args", "-FencepostSmokeTest", path, "-triggerFile", path, "-captureFile", capture],
+                       check=True, timeout=10)
         deadline = time.monotonic() + 5
         while smoke_pid(executable, token) is None and time.monotonic() < deadline:
             time.sleep(0.1)
         time.sleep(0.5)
         assert smoke_pid(executable, token) is not None, "Fencepost Trigger did not stay running"
     finally:
-        try:
-            pid = smoke_pid(executable, token)
-            if pid is not None:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                deadline = time.monotonic() + 5
-                while smoke_pid(executable, token) is not None and time.monotonic() < deadline:
-                    time.sleep(0.1)
-                assert smoke_pid(executable, token) is None, "Fencepost Trigger did not quit"
-        finally:
-            if "triggerFile" in original:
-                current = read_preferences()
-                current["triggerFile"] = original["triggerFile"]
-                subprocess.run(["defaults", "import", DOMAIN, "-"], input=plistlib.dumps(current), check=True)
-            else:
-                subprocess.run(["defaults", "delete", DOMAIN, "triggerFile"], check=True)
-    assert read_preferences().get("triggerFile") == original.get("triggerFile")
-    assert not Path(path).exists()
+        pid = smoke_pid(executable, token)
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 5
+            while smoke_pid(executable, token) is not None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert smoke_pid(executable, token) is None, "Fencepost Trigger did not quit"
+    assert not Path(path).exists() and not Path(capture).exists()
 
 
 def main():
