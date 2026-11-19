@@ -509,6 +509,7 @@ static double g_capture_cooldown;
 static uint64_t g_capture_frame, g_capture_opened, g_capture_until, g_capture_started, g_capture_stopped;
 static uint64_t g_capture_boundary, g_capture_durations[120], g_capture_duration_count;
 static char g_capture_reason[33];
+static int g_capture_available;              /* set once before the device hooks are installed */
 static int g_capture_busy;                   /* starting, active or stopping (g_lock) */
 static unsigned g_capture_commits;           /* tracked commits still in Metal (g_lock) */
 static NSString *g_capture_path;
@@ -1433,7 +1434,7 @@ static int frame_duration_spiked(uint64_t duration, const uint64_t history[120],
 
 static void capture_frame_boundary(void)
 {
-    if (!(g_capture_on & CAP_SPIKE)) return;
+    if (!g_capture_available || !(g_capture_on & CAP_SPIKE)) return;
     uint64_t now = trace_clock();
     if (g_capture_boundary) {
         uint64_t duration = now - g_capture_boundary;
@@ -2741,7 +2742,7 @@ static void capture_after_commit(void)
 static id h_q_cb(id self, SEL _cmd)
 {
     ENTER;
-    if (OUTER && g_capture_prefix) capture_before_cb(self);
+    if (OUTER && g_capture_available) capture_before_cb(self);
     id cb = ORIG(H_Q_CB, id (*)(id, SEL))(self, _cmd);
     LEAVE;
     if (OUTER) on_cb(self, cb);
@@ -2750,7 +2751,7 @@ static id h_q_cb(id self, SEL _cmd)
 static id h_q_cbu(id self, SEL _cmd)
 {
     ENTER;
-    if (OUTER && g_capture_prefix) capture_before_cb(self);
+    if (OUTER && g_capture_available) capture_before_cb(self);
     id cb = ORIG(H_Q_CBU, id (*)(id, SEL))(self, _cmd);
     LEAVE;
     if (OUTER) on_cb(self, cb);
@@ -2759,7 +2760,7 @@ static id h_q_cbu(id self, SEL _cmd)
 static id h_q_cbd(id self, SEL _cmd, id d)
 {
     ENTER;
-    if (OUTER && g_capture_prefix) capture_before_cb(self);
+    if (OUTER && g_capture_available) capture_before_cb(self);
     id cb = ORIG(H_Q_CBD, id (*)(id, SEL, id))(self, _cmd, d);
     LEAVE;
     if (OUTER) on_cb(self, cb);
@@ -3044,7 +3045,7 @@ static void h_cb_commit(id self, SEL _cmd)
         fp_cb *c = cb_find_open((void *)self);
         if (c && c->state == 1) {
             uid = c->uid;
-            if (g_capture_prefix) {
+            if (g_capture_available) {
                 g_capture_commits++;
                 capture_commit = 1;
             }
@@ -3567,7 +3568,7 @@ static void final_summary(void)
 {
     static atomic_int once;
     if (atomic_exchange(&once, 1)) return;
-    if (g_capture_prefix && !pthread_mutex_trylock(&g_capture_lock)) {
+    if (g_capture_available && !pthread_mutex_trylock(&g_capture_lock)) {
         tl_depth++;
         capture_stop();
         tl_depth--;
@@ -3582,9 +3583,22 @@ static void final_summary(void)
     }
 }
 
+static void capture_check_destination(void)
+{
+    /* Metal can report no destinations until the first device is initialized. */
+    @autoreleasepool {
+        g_capture_available = [MTLCaptureManager.sharedCaptureManager
+                              supportsDestination:MTLCaptureDestinationGPUTraceDocument];
+        if (!g_capture_available)
+            fp_log("fencepost: Metal does not support GPU trace documents; capture disabled\n");
+    }
+}
+
 static void on_device(id dev)
 {
     if (!dev) return;
+    static pthread_once_t capture_check = PTHREAD_ONCE_INIT;
+    if (g_capture_prefix) pthread_once(&capture_check, capture_check_destination);
     int first = 0;
     pthread_mutex_lock(&g_lock);
     if (!g_started) { g_started = 1; first = 1; }
@@ -3645,10 +3659,6 @@ static void capture_init(const char *prefix)
     @autoreleasepool {
         if (strcmp(getenv("MTL_CAPTURE_ENABLED") ?: "", "1")) {
             fp_log("fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; capture disabled\n");
-            return;
-        }
-        if (![MTLCaptureManager.sharedCaptureManager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
-            fp_log("fencepost: Metal does not support GPU trace documents; capture disabled\n");
             return;
         }
         g_capture_prefix = strdup(prefix);
