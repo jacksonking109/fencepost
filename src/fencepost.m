@@ -3653,11 +3653,8 @@ static void capture_init(const char *prefix)
         }
         g_capture_prefix = strdup(prefix);
         const char *file = getenv("FENCEPOST_CAPTURE_FILE");
-        static char default_path[64];
-        if (!file) {
-            snprintf(default_path, sizeof default_path, "/tmp/fencepost-capture-%u", getuid());
-            file = default_path;
-        }
+        char default_path[64];
+        if (!file) file = capture_default_path(default_path);
         struct stat st;
         if (*file) {
             g_capture_file = strdup(file);

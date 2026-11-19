@@ -18,6 +18,14 @@ static inline const char *trigger_default_path(char buffer[64])
     return buffer;
 }
 
+static inline const char *capture_default_path(char buffer[64])
+{
+    const char *path = getenv("FENCEPOST_CAPTURE_FILE");
+    if (path && *path) return path;
+    snprintf(buffer, 64, "/tmp/fencepost-capture-%u", getuid());
+    return buffer;
+}
+
 static inline int trigger_time_newer(struct timespec a, struct timespec b)
 {
     return a.tv_sec > b.tv_sec || (a.tv_sec == b.tv_sec && a.tv_nsec > b.tv_nsec);

@@ -3,6 +3,8 @@
 #include "trigger_write.h"
 
 static NSString *const DefaultHotkey = @"ctrl+opt+cmd+f";
+static NSString *const DefaultCaptureHotkey = @"ctrl+opt+cmd+c";
+enum { SaveHotkey = 1, CaptureHotkey };
 
 static BOOL parse_key(NSString *key, UInt32 *code)
 {
@@ -55,37 +57,20 @@ static BOOL parse_hotkey(NSString *hotkey, UInt32 *code, UInt32 *modifiers)
     return YES;
 }
 
-@interface TriggerApp : NSObject <NSApplicationDelegate>
-- (void)saveWithReason:(const char *)reason;
-@end
-
-static OSStatus handle_hotkey(EventHandlerCallRef next, EventRef event, void *context)
+static NSString *configured_path(NSUserDefaults *defaults, NSString *key, BOOL capture)
 {
-    [(__bridge TriggerApp *)context saveWithReason:"hotkey"];
-    return noErr;
+    NSString *path = [defaults stringForKey:key];
+    if (path.length) return path;
+    char buffer[64];
+    const char *fallback = capture ? capture_default_path(buffer) : trigger_default_path(buffer);
+    return [NSFileManager.defaultManager stringWithFileSystemRepresentation:fallback length:strlen(fallback)];
 }
 
-@implementation TriggerApp {
-    NSString *_path;
-    NSStatusItem *_status;
-    NSTimer *_feedback;
-    EventHandlerRef _handler;
-    EventHotKeyRef _hotkey;
-}
-
-- (void)applicationDidFinishLaunching:(NSNotification *)notification
+static NSString *register_hotkey(id preference, NSString *fallback, UInt32 action,
+                                 OSStatus handlerStatus, EventHotKeyRef *reference)
 {
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    _path = [defaults stringForKey:@"triggerFile"];
-    if (!_path.length) {
-        char buffer[64];
-        const char *path = trigger_default_path(buffer);
-        _path = [NSFileManager.defaultManager stringWithFileSystemRepresentation:path length:strlen(path)];
-    }
-
     UInt32 code, modifiers;
-    id preference = [defaults objectForKey:@"hotkey"];
-    NSString *hotkey = DefaultHotkey;
+    NSString *hotkey = fallback;
     parse_hotkey(hotkey, &code, &modifiers);
     if (preference) {
         UInt32 customCode, customModifiers;
@@ -94,17 +79,54 @@ static OSStatus handle_hotkey(EventHandlerCallRef next, EventRef event, void *co
             code = customCode;
             modifiers = customModifiers;
         } else {
-            NSLog(@"Invalid fencepost hotkey %@. Using %@.", preference, DefaultHotkey);
+            NSLog(@"Invalid fencepost hotkey %@. Using %@.", preference, fallback);
         }
     }
 
+    OSStatus status = handlerStatus;
+    if (status == noErr) {
+        EventHotKeyID identifier = {'Fnce', action};
+        status = RegisterEventHotKey(code, modifiers, identifier, GetApplicationEventTarget(),
+                                     kEventHotKeyExclusive, reference);
+    }
+    if (status != noErr) NSLog(@"Could not register fencepost hotkey %@ (%d)", hotkey, (int)status);
+    return hotkey;
+}
+
+@interface TriggerApp : NSObject <NSApplicationDelegate>
+- (void)saveWithReason:(const char *)reason capture:(BOOL)capture;
+@end
+
+static OSStatus handle_hotkey(EventHandlerCallRef next, EventRef event, void *context)
+{
+    EventHotKeyID identifier;
+    if (GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL,
+                          sizeof identifier, NULL, &identifier) != noErr ||
+        identifier.signature != 'Fnce' || (identifier.id != SaveHotkey && identifier.id != CaptureHotkey))
+        return eventNotHandledErr;
+    [(__bridge TriggerApp *)context saveWithReason:"hotkey" capture:identifier.id == CaptureHotkey];
+    return noErr;
+}
+
+@implementation TriggerApp {
+    NSString *_path, *_capturePath;
+    NSStatusItem *_status;
+    NSTimer *_feedback;
+    EventHandlerRef _handler;
+    EventHotKeyRef _hotkey, _captureHotkey;
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification
+{
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    _path = configured_path(defaults, @"triggerFile", NO);
+    _capturePath = configured_path(defaults, @"captureFile", YES);
+
     EventTypeSpec event = {kEventClassKeyboard, kEventHotKeyPressed};
     OSStatus status = InstallApplicationEventHandler(handle_hotkey, 1, &event, (__bridge void *)self, &_handler);
-    if (status == noErr) {
-        EventHotKeyID identifier = {'Fnce', 1};
-        status = RegisterEventHotKey(code, modifiers, identifier, GetApplicationEventTarget(),
-                                     kEventHotKeyExclusive, &_hotkey);
-    }
+    NSString *hotkey = register_hotkey([defaults objectForKey:@"hotkey"], DefaultHotkey, SaveHotkey, status, &_hotkey);
+    NSString *captureHotkey = register_hotkey([defaults objectForKey:@"captureHotkey"], DefaultCaptureHotkey,
+                                              CaptureHotkey, status, &_captureHotkey);
 
     _status = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
     _status.button.title = @"FP";
@@ -114,11 +136,15 @@ static OSStatus handle_hotkey(EventHandlerCallRef next, EventRef event, void *co
     NSString *title = [NSString stringWithFormat:@"Save timeline now (%@)", hotkey.uppercaseString];
     NSMenuItem *save = [menu addItemWithTitle:title action:@selector(saveFromMenu:) keyEquivalent:@""];
     save.target = self;
-    if (status != noErr) {
-        NSLog(@"Could not register fencepost hotkey %@ (%d)", hotkey, (int)status);
+    if (!_hotkey)
         [menu addItemWithTitle:@"Global hotkey unavailable" action:NULL keyEquivalent:@""].enabled = NO;
-    }
     [menu addItemWithTitle:_path action:NULL keyEquivalent:@""].enabled = NO;
+    title = [NSString stringWithFormat:@"Capture next frame (%@)", captureHotkey.uppercaseString];
+    NSMenuItem *capture = [menu addItemWithTitle:title action:@selector(captureFromMenu:) keyEquivalent:@""];
+    capture.target = self;
+    if (!_captureHotkey)
+        [menu addItemWithTitle:@"Capture hotkey unavailable" action:NULL keyEquivalent:@""].enabled = NO;
+    [menu addItemWithTitle:_capturePath action:NULL keyEquivalent:@""].enabled = NO;
     [menu addItem:NSMenuItem.separatorItem];
     NSMenuItem *quit = [menu addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@""];
     quit.target = NSApp;
@@ -127,14 +153,20 @@ static OSStatus handle_hotkey(EventHandlerCallRef next, EventRef event, void *co
 
 - (void)saveFromMenu:(id)sender
 {
-    [self saveWithReason:"menu"];
+    [self saveWithReason:"menu" capture:NO];
 }
 
-- (void)saveWithReason:(const char *)reason
+- (void)captureFromMenu:(id)sender
 {
-    const char *path = _path.fileSystemRepresentation;
+    [self saveWithReason:"menu" capture:YES];
+}
+
+- (void)saveWithReason:(const char *)reason capture:(BOOL)capture
+{
+    NSString *destination = capture ? _capturePath : _path;
+    const char *path = destination.fileSystemRepresentation;
     BOOL saved = path && trigger_write(path, reason) == 0;
-    if (!saved) NSLog(@"Could not write fencepost trigger %@: %s", _path, strerror(path ? errno : EINVAL));
+    if (!saved) NSLog(@"Could not write fencepost request %@: %s", destination, strerror(path ? errno : EINVAL));
     _status.button.title = saved ? @"FP ✓" : @"FP !";
     [_feedback invalidate];
     _feedback = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:NO block:^(NSTimer *timer) {
@@ -145,6 +177,7 @@ static OSStatus handle_hotkey(EventHandlerCallRef next, EventRef event, void *co
 - (void)applicationWillTerminate:(NSNotification *)notification
 {
     if (_hotkey) UnregisterEventHotKey(_hotkey);
+    if (_captureHotkey) UnregisterEventHotKey(_captureHotkey);
     if (_handler) RemoveEventHandler(_handler);
 }
 @end
