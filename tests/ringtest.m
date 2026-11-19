@@ -42,6 +42,7 @@ int main(int argc, char **argv)
             fill(cb, buffer);
             if (race && (i == 30 || i == 35)) fill(cb, buffer);
             if (!strcmp(mode, "api") && i == 30) trigger("Bad Frame");
+            if (race && i == 36) trigger("checkpoint");
             if (spike) usleep(i == 131 ? 60000 : 5000);
             if (file && (i == 30 || i == 33)) {
                 usleep(300000); /* cross the stat throttle */

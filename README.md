@@ -256,10 +256,13 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_RING_MB` | 64 | memory budget in MiB for retained timeline records and metadata |
 | `FENCEPOST_TRIGGER_RACE` | new | `new` fires on detailed reports, `all` on every race or ORDER hit, `0` disables |
 | `FENCEPOST_TRIGGER_GPUERR` | 1 | trigger on command buffer errors, `0` disables |
-| `FENCEPOST_TRIGGER_SPIKE` | 2:8 | median multiplier and minimum increase in ms (`factor:min_ms`), `0` disables |
+| `FENCEPOST_SPIKE` | 1 | `0` disables spike triggers for both timeline dumps and GPU captures |
+| `FENCEPOST_TRIGGER_SPIKE` | 4:50 | timeline spike median multiplier and minimum increase in ms (`factor:min_ms`), `0` disables timeline spikes |
 | `FENCEPOST_TRIGGER_FILE` | `/tmp/fencepost-trigger-<uid>` | watch this file for a newer modification time, empty disables |
 | `FENCEPOST_TRIGGER_COOLDOWN` | 5 | seconds between accepted triggers in one process |
-| `FENCEPOST_MAX_DUMPS` | 20 | maximum dumps per process |
+| `FENCEPOST_MAX_AUTO_DUMPS` | 20 | timeline dumps per process from race, GPU-error and spike triggers |
+| `FENCEPOST_MAX_MANUAL_DUMPS` | 20 | timeline dumps per process from file, hotkey, CLI and API requests |
+| `FENCEPOST_MAX_DUMPS` | 20 | fallback for either timeline dump quota when its own knob is unset |
 
 Each distinct race is printed once and counted after that.
 

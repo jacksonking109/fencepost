@@ -25,6 +25,8 @@ def run_case(directory, arch, mode, ring):
     }
     if ring:
         knobs["FENCEPOST_RING"] = 10
+    if mode == "race":
+        knobs.update(FENCEPOST_TRIGGER_RACE="all", FENCEPOST_MAX_AUTO_DUMPS=1, FENCEPOST_MAX_MANUAL_DUMPS=1)
     cmd = ["arch", "-" + arch]
     for k, v in knobs.items():
         cmd.extend(["-e", f"{k}={v}"])
@@ -38,7 +40,7 @@ def run_case(directory, arch, mode, ring):
     assert not prefix.exists()
     expected = {
         "api": [(30, "bad-frame", "api")],
-        "race": [(30, "race", "race")],
+        "race": [(30, "race", "race"), (36, "checkpoint", "api")],
         "spike": [(131, "spike", "spike")],
         "file": [(30, "flicker", "file"), (36, "checkpoint", "api")],
     }[mode]

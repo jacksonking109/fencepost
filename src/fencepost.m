@@ -396,6 +396,8 @@ static fp_frame *frame_get(uint64_t f);
 #define FP_TRACE_MARKERS 20000
 #define FP_TRACE_RESERVE 4096
 #define FP_TRACE_ATTACHMENTS 4
+#define FP_SPIKE_FACTOR 4
+#define FP_SPIKE_MIN_NS 50e6
 
 enum { TR_CB, TR_GPU, TR_CPU, TR_QUEUE_TRACKS };
 enum { TR_FENCE, TR_EVENT, TR_COMPLETED, TR_RACE, TR_POSSIBLE, TR_ORDER, TR_FRAGMENT };
@@ -619,10 +621,12 @@ static uint64_t g_ring_floor, g_ring_latest, g_ring_evictions, g_ring_cap_evicti
 static fp_trace_endpoint *g_ring_history;
 static char *g_ring_prefix;
 static int g_ring_encoded, g_ring_race = 1, g_ring_gpuerr = 1;
-static double g_spike_factor = 2, g_spike_min_ns = 8e6, g_cooldown_ns = 5e9;
+static int g_spike_enabled = 1;
+static double g_spike_factor = FP_SPIKE_FACTOR, g_spike_min_ns = FP_SPIKE_MIN_NS, g_cooldown_ns = 5e9;
 static uint64_t g_durations[120], g_duration_count;
 static uint64_t g_last_fire, g_last_poll, g_suppressed;
-static unsigned g_max_dumps = 20, g_dumps, g_pending_dumps;
+enum { DUMP_MANUAL, DUMP_AUTO, DUMP_KINDS };
+static unsigned g_max_dumps[DUMP_KINDS], g_dumps[DUMP_KINDS], g_pending_dumps[DUMP_KINDS];
 static dispatch_queue_t g_ring_writer;
 static char *g_trigger_file;
 static struct timespec g_file_mtime;
@@ -630,6 +634,7 @@ static int g_trigger_owner_warned;
 
 typedef struct {
     int active;
+    unsigned kind;
     uint64_t frame, first, last, timestamp;
     char reason[33];
     const char *source;
@@ -638,7 +643,8 @@ typedef struct {
 
 static fp_trigger g_trigger;
 static void ring_update(int final);
-static void ring_trigger(const char *reason, const char *source, uint64_t frame, uint64_t timestamp, const char *error);
+static void ring_trigger(unsigned kind, const char *reason, const char *source, uint64_t frame,
+                         uint64_t timestamp, const char *error);
 
 
 static fp_trace_chunk *trace_chunk(uint64_t frame)
@@ -1419,7 +1425,7 @@ static void trace_cb_finish(fp_trace_cb *c)
 {
     if (!c->phased || !c->completed) return;
     if (c->gpu_error) {
-        ring_trigger("gpu-error", "gpu-error", c->span.frame, c->error_time, c->gpu_error);
+        ring_trigger(DUMP_AUTO, "gpu-error", "gpu-error", c->span.frame, c->error_time, c->gpu_error);
         free(c->gpu_error);
         c->gpu_error = NULL;
     }
@@ -1513,11 +1519,11 @@ static int frame_duration_spiked(uint64_t duration, const uint64_t history[120],
 
 static void capture_frame_boundary(void)
 {
-    if (!g_capture_available || !(g_capture_on & CAP_SPIKE)) return;
+    if (!g_capture_available || !g_spike_enabled || !(g_capture_on & CAP_SPIKE)) return;
     uint64_t now = trace_clock();
     if (g_capture_boundary) {
         uint64_t duration = now - g_capture_boundary;
-        if (frame_duration_spiked(duration, g_capture_durations, g_capture_duration_count, 2, 8e6))
+        if (frame_duration_spiked(duration, g_capture_durations, g_capture_duration_count, FP_SPIKE_FACTOR, FP_SPIKE_MIN_NS))
             capture_request("spike");
         g_capture_durations[g_capture_duration_count++ % 120] = duration;
     }
@@ -1526,10 +1532,10 @@ static void capture_frame_boundary(void)
 
 static void ring_frame_duration(uint64_t frame, uint64_t timestamp)
 {
-    if (!frame || !g_spike_factor) return; /* frame 1 starts at first CB, not at a boundary */
+    if (!frame || !g_spike_enabled || !g_spike_factor) return; /* frame 1 starts at first CB, not at a boundary */
     uint64_t duration = timestamp - g_trace_frame_start;
     if (frame_duration_spiked(duration, g_durations, g_duration_count, g_spike_factor, g_spike_min_ns))
-        ring_trigger("spike", "spike", frame, timestamp, NULL);
+        ring_trigger(DUMP_AUTO, "spike", "spike", frame, timestamp, NULL);
     g_durations[g_duration_count++ % 120] = duration;
 }
 
@@ -1643,17 +1649,18 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
     fputs("}}", f);
 }
 
-static void ring_trigger(const char *reason, const char *source, uint64_t frame, uint64_t timestamp, const char *error)
+static void ring_trigger(unsigned kind, const char *reason, const char *source, uint64_t frame,
+                         uint64_t timestamp, const char *error)
 {
     if (!g_ring_encoded || g_trace_stopped || !trace_frame_selected(frame)) return;
     uint64_t now = trace_clock();
-    if (g_trigger.active || g_dumps + g_pending_dumps >= g_max_dumps ||
+    if (g_trigger.active || g_dumps[kind] + g_pending_dumps[kind] >= g_max_dumps[kind] ||
         (g_last_fire && now - g_last_fire < g_cooldown_ns)) {
         g_suppressed++;
         return;
     }
     g_last_fire = now;
-    fp_trigger trigger = { .active = 1, .frame = frame, .timestamp = timestamp, .source = source };
+    fp_trigger trigger = { .active = 1, .kind = kind, .frame = frame, .timestamp = timestamp, .source = source };
     trigger.first = frame >= g_ring ? frame - g_ring + 1 : 0;
     trigger.last = frame + g_ring_after;
     size_t n = 0;
@@ -1672,7 +1679,7 @@ __attribute__((visibility("default"))) void fencepost_trigger(const char *reason
 {
     if (!g_ring) return;
     pthread_mutex_lock(&g_lock);
-    ring_trigger(reason, "api", g_frame_cur, trace_clock(), NULL);
+    ring_trigger(DUMP_MANUAL, reason, "api", g_frame_cur, trace_clock(), NULL);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1808,7 +1815,8 @@ static void ring_update(int final)
             free(g_trigger.error);
             g_trigger = (fp_trigger){0};
             if (dump) {
-                g_pending_dumps++;
+                unsigned kind = dump->trigger.kind;
+                g_pending_dumps[kind]++;
                 dispatch_async(g_ring_writer, ^{
                     /* The producer has released the detector lock before we start writing. */
                     pthread_mutex_lock(&g_lock);
@@ -1818,8 +1826,8 @@ static void ring_update(int final)
                     free(dump->trigger.error);
                     free(dump);
                     pthread_mutex_lock(&g_lock);
-                    g_pending_dumps--;
-                    if (ok) g_dumps++;
+                    g_pending_dumps[kind]--;
+                    if (ok) g_dumps[kind]++;
                     pthread_mutex_unlock(&g_lock);
                 });
             }
@@ -1893,7 +1901,7 @@ static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
     }
     if (g_capture_on & CAP_RACE) capture_request("race");
     if (g_ring && g_ring_race && (print || g_ring_race == 2))
-        ring_trigger("race", "race", s->frame, trace_clock(), NULL);
+        ring_trigger(DUMP_AUTO, "race", "race", s->frame, trace_clock(), NULL);
     if (!print && !marker) return;
 
     const char *prefix = certain ? "RACE" : "possible race";
@@ -2226,7 +2234,7 @@ static void check_barrier(fp_node *y)
     }
     if (g_capture_on & CAP_RACE) capture_request("race");
     if (g_ring && g_ring_race && (print || g_ring_race == 2))
-        ring_trigger("race", "race", y->frame, trace_clock(), NULL);
+        ring_trigger(DUMP_AUTO, "race", "race", y->frame, trace_clock(), NULL);
     if (!print && !marker) return;
     char d1[256], d2[256], barrier[96], second[384];
     describe_node(d1, sizeof d1, x);
@@ -3227,7 +3235,7 @@ static void ring_poll_file(void)
         if (n > 0) {
             reason[n] = 0;
             g_file_mtime = st.st_mtimespec;
-            ring_trigger(reason, "file", g_frame_cur, now, NULL);
+            ring_trigger(DUMP_MANUAL, reason, "file", g_frame_cur, now, NULL);
         }
     }
     close(fd);
@@ -3901,7 +3909,9 @@ static void ring_init_triggers(void)
     if (p && !strcmp(p, "all")) g_ring_race = 2;
     else if (p && !strcmp(p, "0")) g_ring_race = 0;
     g_ring_gpuerr = trace_unsigned("FENCEPOST_TRIGGER_GPUERR", 1) != 0;
-    g_max_dumps = trace_unsigned("FENCEPOST_MAX_DUMPS", 20);
+    unsigned max_dumps = trace_unsigned("FENCEPOST_MAX_DUMPS", 20);
+    g_max_dumps[DUMP_MANUAL] = trace_unsigned("FENCEPOST_MAX_MANUAL_DUMPS", max_dumps);
+    g_max_dumps[DUMP_AUTO] = trace_unsigned("FENCEPOST_MAX_AUTO_DUMPS", max_dumps);
     char extra;
     double factor, ms, seconds;
     p = getenv("FENCEPOST_TRIGGER_SPIKE");
@@ -3963,6 +3973,7 @@ static void trace_init(const char *path)
 
 __attribute__((constructor)) static void fp_init(void)
 {
+    g_spike_enabled = strcmp(getenv("FENCEPOST_SPIKE") ?: "", "0") != 0;
     const char *p = getenv("FENCEPOST_LOG");
     if (p && *p) g_out = fp_open_path(p, "a");
     if ((p = getenv("FENCEPOST_CAPTURE")) && *p) capture_init(p);
