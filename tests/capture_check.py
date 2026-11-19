@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DISABLED = "fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; capture disabled"
 
 
-def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_secs=10,
+def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_secs=10, max_secs=120,
              reason=None, message=None, foreign=None):
     prefix = directory / "capture"
     request = directory / "request"
@@ -28,6 +28,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_s
         "FENCEPOST_CAPTURE_FILE": request,
         "FENCEPOST_CAPTURE_MIN_FREE_GB": min_free,
         "FENCEPOST_CAPTURE_FRAMES": frames,
+        "FENCEPOST_CAPTURE_IDLE_SECS": idle_secs,
         "FENCEPOST_CAPTURE_MAX_SECS": max_secs,
         "FENCEPOST_CAPTURE_COOLDOWN": 0,
     }
@@ -68,7 +69,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_s
             idle_log = b""
             if mode == "idle":
                 deadline = time.monotonic() + 15
-                while b" (time limit)\n" not in idle_log:
+                while b" (idle limit)\n" not in idle_log:
                     timeout = max(0, deadline - time.monotonic())
                     assert select.select([test.stderr], [], [], timeout)[0], idle_log
                     chunk = os.read(test.stderr.fileno(), 4096)
@@ -98,9 +99,11 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, max_s
     size = sum(path.stat().st_size for path in expected.rglob("*") if path.is_file())
     assert size >= 4096, (size, log)
     assert starts == [f"fencepost: capturing frame {frame} ({reason}) -> {expected}"], log
-    suffix = r" \(time limit\)" if mode == "idle" else ""
+    suffix = {"idle": r" \(idle limit\)", "hard-limit": r" \(time limit\)"}.get(mode, "")
     assert len(stops) == 1 and re.fullmatch(
         rf"fencepost: capture written {re.escape(str(expected))}, \d+\.\d{{2}} MB, \d+\.\d s{suffix}", stops[0]), log
+    if mode == "slow-frame":
+        assert "fencepost:   frames: 2;" in log, log
     if mode == "api":
         snapshots = [path for path in expected.rglob("MTLBuffer-*") if path.is_file()]
         assert len(snapshots) == 1, (snapshots, log)
@@ -130,8 +133,12 @@ def main():
             ("no-frame", "no capture without a frame boundary", {}),
             ("api", "capture API and active-request suppression", {"reason": "api-request"}),
             ("multi-frame", "capture spans two frame ends", {"reason": "api-request", "frames": 2}),
-            ("idle", "capture time limit while submissions are idle",
-             {"reason": "api-request", "frames": 2, "max_secs": 1}),
+            ("slow-frame", "slow frame finishes while submissions continue",
+             {"reason": "api-request", "idle_secs": 2}),
+            ("idle", "idle limit stops capture after submissions stop",
+             {"reason": "api-request", "frames": 2, "idle_secs": 1}),
+            ("hard-limit", "hard cap stops capture while frames continue",
+             {"reason": "api-request", "frames": 1000, "idle_secs": 2, "max_secs": 3}),
             ("exit-active", "exit during a multi-frame capture", {"reason": "api-request", "frames": 3}),
             ("app-capture", "app-owned capture left running", {
                 "message": "fencepost: capture refused: Metal capture already running"}),

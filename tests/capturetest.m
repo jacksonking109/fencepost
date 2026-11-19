@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static int submit(id<MTLCommandBuffer> cb, id<MTLBuffer> buffer, void (*frame)(id))
 {
@@ -27,8 +28,10 @@ int main(int argc, char **argv)
         int emptyFile = !strcmp(mode, "empty-file");
         int api = !strcmp(mode, "api"), exitActive = !strcmp(mode, "exit-active");
         int appCapture = !strcmp(mode, "app-capture"), multi = !strcmp(mode, "multi-frame");
-        int idle = !strcmp(mode, "idle");
-        if (!file && !emptyFile && !noFrame && !api && !exitActive && !appCapture && !multi && !idle) return 2;
+        int idle = !strcmp(mode, "idle"), slow = !strcmp(mode, "slow-frame");
+        int hardLimit = !strcmp(mode, "hard-limit");
+        if (!file && !emptyFile && !noFrame && !api && !exitActive && !appCapture && !multi &&
+            !idle && !slow && !hardLimit) return 2;
 
         void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
         void (*capture)(const char *) = dlsym(RTLD_DEFAULT, "fencepost_capture");
@@ -68,11 +71,28 @@ int main(int argc, char **argv)
         MTLCommandBufferDescriptor *descriptor = [[[MTLCommandBufferDescriptor alloc] init] autorelease];
         id<MTLCommandBuffer> second = [queue commandBufferWithDescriptor:descriptor];
         if (emptyFile && manager.isCapturing) return 3;
-        if (api || exitActive || multi || idle) {
+        if (api || exitActive || multi || idle || slow || hardLimit) {
             if (!manager.isCapturing) return 3;
             capture("Ignore While Active");
         }
-        if (!submit(second, buffer, noFrame ? NULL : frame)) return 1;
+        if (!submit(second, buffer, noFrame || slow ? NULL : frame)) return 1;
+        if (slow) {
+            /* Frame 2 takes more than 2 s, but commits arrive every 750 ms. */
+            for (int i = 0; i < 4; i++) @autoreleasepool {
+                usleep(750000);
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                if (!manager.isCapturing) return 3;
+                if (!submit(cb, buffer, i == 3 ? frame : NULL)) return 1;
+            }
+            return manager.isCapturing ? 3 : 0;
+        }
+        if (hardLimit) {
+            for (int i = 0; i < 60 && manager.isCapturing; i++) @autoreleasepool {
+                usleep(100000);
+                if (!submit([queue commandBuffer], buffer, frame)) return 1;
+            }
+            return manager.isCapturing ? 3 : 0;
+        }
         if (emptyFile) {
             puts("empty polled");
             fflush(stdout);
