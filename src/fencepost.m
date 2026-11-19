@@ -2889,6 +2889,7 @@ static NSString *capture_resource_name(NSString *entry)
     size_t prefix;
     if ([name hasPrefix:@"MTLBuffer-"]) prefix = sizeof "MTLBuffer-" - 1;
     else if ([name hasPrefix:@"MTLTexture-"]) prefix = sizeof "MTLTexture-" - 1;
+    else if ([name hasPrefix:@"MTLHeap-"]) prefix = sizeof "MTLHeap-" - 1;
     else return nil;
 
     /* Metal uses names like MTLBuffer-4-0, with the snapshot index last. */
