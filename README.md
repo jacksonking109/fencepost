@@ -170,6 +170,37 @@ the program is rendering. A function-key hotkey also needs Fn on keyboards whose
 top row sends media keys. The **FP** item should
 briefly show a checkmark, and fencepost should log a dump whose filename ends in `-hotkey.json`.
 
+## Xcode capture
+
+Launch a Metal program with `MTL_CAPTURE_ENABLED=1` and `FENCEPOST_CAPTURE` set to a filename prefix in an
+existing directory. Capture is opt-in and works independently of `FENCEPOST_TRACE` and `FENCEPOST_RING`.
+In our submission probe, `MTL_CAPTURE_ENABLED=1` added about 67% CPU overhead even with no capture running.
+
+```sh
+MTL_CAPTURE_ENABLED=1 FENCEPOST_CAPTURE=/tmp/fencepost \
+    DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib your-metal-program
+out/fencepost-trigger --capture flicker
+```
+
+You can also choose **Capture next frame** in the **FP** menu, press **Control–Option–Command–C**, or call
+`void fencepost_capture(const char *reason)` through `dlsym`. To customise the app, set `captureHotkey` and
+`captureFile` in the same defaults domain as the timeline helper and restart it. Set the matching
+`FENCEPOST_CAPTURE_FILE` in the Metal program. The request file uses its modification time and first line,
+just like the timeline trigger file.
+
+After the program has ended at least one frame, fencepost starts capture before allocating the next frame's
+first command buffer. It ignores requests while a capture is active. Open the logged
+`<prefix>-<pid>-f<frame>-<reason>.gputrace` in Xcode with **File → Open**.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FENCEPOST_CAPTURE_FILE` | `/tmp/fencepost-capture-<uid>` | request file, empty disables polling |
+| `FENCEPOST_CAPTURE_ON` | empty | comma-separated `race`, `gpu-error`, `spike` auto triggers |
+| `FENCEPOST_CAPTURE_FRAMES` | 1 | frame ends to record |
+| `FENCEPOST_CAPTURE_MAX` | 3 | captures allowed per process |
+| `FENCEPOST_CAPTURE_MIN_FREE_GB` | 10 | minimum free GiB on the output volume |
+| `FENCEPOST_CAPTURE_COOLDOWN` | 10 | seconds after a capture before another can start |
+
 ## How it works
 
 - **Nodes:** every encoder is one. A render encoder has two stages, vertex and fragment.
@@ -266,6 +297,8 @@ python3 -I tests/ring_check.py arm64
 python3 -I tests/ring_check.py x86_64
 python3 -I tests/trigger_check.py arm64
 python3 -I tests/trigger_check.py x86_64
+python3 -I tests/capture_check.py arm64
+python3 -I tests/capture_check.py x86_64
 ```
 
 `tests/fptest.m` holds 34 small Metal programs with and without the synchronisation they need, each with the number of
