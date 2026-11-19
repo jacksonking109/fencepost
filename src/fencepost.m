@@ -624,9 +624,10 @@ static int g_ring_encoded, g_ring_race = 1, g_ring_gpuerr = 1;
 static int g_spike_enabled = 1;
 static double g_spike_factor = FP_SPIKE_FACTOR, g_spike_min_ns = FP_SPIKE_MIN_NS, g_cooldown_ns = 5e9;
 static uint64_t g_durations[120], g_duration_count;
-static uint64_t g_last_fire, g_last_poll, g_suppressed;
+static uint64_t g_last_poll, g_suppressed;
 enum { DUMP_MANUAL, DUMP_AUTO, DUMP_KINDS };
 static unsigned g_max_dumps[DUMP_KINDS], g_dumps[DUMP_KINDS], g_pending_dumps[DUMP_KINDS];
+static uint64_t g_last_fire[DUMP_KINDS];     /* cooldown per kind: automatic dumps never hold off a manual one */
 static dispatch_queue_t g_ring_writer;
 static char *g_trigger_file;
 static struct timespec g_file_mtime;
@@ -642,6 +643,9 @@ typedef struct {
 } fp_trigger;
 
 static fp_trigger g_trigger;
+/* One manual request that arrived while another dump was still collecting frames; it fires
+ * as soon as that dump is snapshotted (g_lock). */
+static struct { int active; uint64_t frame, timestamp; char reason[33]; const char *source; } g_queued;
 static void ring_update(int final);
 static void ring_trigger(unsigned kind, const char *reason, const char *source, uint64_t frame,
                          uint64_t timestamp, const char *error);
@@ -1654,12 +1658,29 @@ static void ring_trigger(unsigned kind, const char *reason, const char *source, 
 {
     if (!g_ring_encoded || g_trace_stopped || !trace_frame_selected(frame)) return;
     uint64_t now = trace_clock();
-    if (g_trigger.active || g_dumps[kind] + g_pending_dumps[kind] >= g_max_dumps[kind] ||
-        (g_last_fire && now - g_last_fire < g_cooldown_ns)) {
+    const char *refusal = NULL;
+    const char *shown = reason && *reason && *reason != '\n' && *reason != '\r' ? reason : "manual";
+    int shown_len = (int)MIN(strcspn(shown, "\r\n"), 32);
+    if (g_dumps[kind] + g_pending_dumps[kind] >= g_max_dumps[kind]) refusal = "dump limit reached";
+    else if (g_last_fire[kind] && now - g_last_fire[kind] < g_cooldown_ns) refusal = "cooldown in effect";
+    else if (g_trigger.active && kind == DUMP_MANUAL && !g_queued.active) {
+        /* Don't drop a request someone made by hand: save it as the next dump. */
+        g_queued.active = 1;
+        g_queued.frame = frame;
+        g_queued.timestamp = timestamp;
+        g_queued.source = source;
+        snprintf(g_queued.reason, sizeof g_queued.reason, "%s", reason ? reason : "");
+        g_last_fire[kind] = now;
+        fp_log("fencepost: dump request (%.*s) queued behind the pending %s dump\n", shown_len, shown, g_trigger.reason);
+        return;
+    } else if (g_trigger.active) refusal = "another dump is pending";
+    if (refusal) {
         g_suppressed++;
+        if (kind == DUMP_MANUAL)
+            fp_log("fencepost: dump request (%.*s) refused: %s\n", shown_len, shown, refusal);
         return;
     }
-    g_last_fire = now;
+    g_last_fire[kind] = now;
     fp_trigger trigger = { .active = 1, .kind = kind, .frame = frame, .timestamp = timestamp, .source = source };
     trigger.first = frame >= g_ring ? frame - g_ring + 1 : 0;
     trigger.last = frame + g_ring_after;
@@ -1814,6 +1835,11 @@ static void ring_update(int final)
             fp_ring_dump *dump = ring_snapshot();
             free(g_trigger.error);
             g_trigger = (fp_trigger){0};
+            if (g_queued.active) {
+                g_queued.active = 0;
+                g_last_fire[DUMP_MANUAL] = 0;   /* already charged when it was queued */
+                ring_trigger(DUMP_MANUAL, g_queued.reason, g_queued.source, g_queued.frame, g_queued.timestamp, NULL);
+            }
             if (dump) {
                 unsigned kind = dump->trigger.kind;
                 g_pending_dumps[kind]++;

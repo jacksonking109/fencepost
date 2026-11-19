@@ -150,6 +150,11 @@ arrows and markers dropped because their source is outside the dump, frame evict
 while another dump was pending, during cooldown, or after the dump limit. Detector counters cover the process
 up to the dump.
 
+Manual requests (trigger file, hotkey, CLI, `fencepost_trigger`) and automatic ones (race, GPU error, spike) have
+separate cooldowns, so an automatic dump never holds off one you asked for. A manual request that arrives while
+another dump is still collecting frames is queued and saved as the next dump; a second one is refused. Fencepost
+logs a line for every manual request it queues or refuses, with the reason.
+
 ### Hotkey helper
 
 Run `./build.sh`, then `open "out/Fencepost Trigger.app"`. Choose **Save timeline now** in the **FP** menu
@@ -262,7 +267,7 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_SPIKE` | 1 | `0` disables spike triggers for both timeline dumps and GPU captures |
 | `FENCEPOST_TRIGGER_SPIKE` | 4:50 (off with `MTL_CAPTURE_ENABLED=1` unless explicitly enabled) | timeline spike median multiplier and minimum increase in ms (`factor:min_ms`), `0` disables timeline spikes |
 | `FENCEPOST_TRIGGER_FILE` | `/tmp/fencepost-trigger-<uid>` | watch this file for a newer modification time, empty disables |
-| `FENCEPOST_TRIGGER_COOLDOWN` | 5 | seconds between accepted triggers in one process |
+| `FENCEPOST_TRIGGER_COOLDOWN` | 5 | seconds between accepted triggers of one kind (manual or automatic) in one process |
 | `FENCEPOST_MAX_AUTO_DUMPS` | 20 | timeline dumps per process from race, GPU-error and spike triggers |
 | `FENCEPOST_MAX_MANUAL_DUMPS` | 20 | timeline dumps per process from file, hotkey, CLI and API requests |
 | `FENCEPOST_MAX_DUMPS` | 20 | fallback for either timeline dump quota when its own knob is unset |

@@ -26,6 +26,9 @@ int main(int argc, char **argv)
         const char *mode = argc == 2 ? argv[1] : "api";
         int race = !strcmp(mode, "race"), spike = !strcmp(mode, "spike"), file = !strcmp(mode, "file");
         int external = !strcmp(mode, "external");
+        /* queue: a hand request made while the spike dump is still collecting frames */
+        int queued = !strcmp(mode, "queue");
+        if (queued) spike = 1;
         if (!race && !spike && !file && !external && strcmp(mode, "api")) return 2;
         const char *path = getenv("FENCEPOST_TRIGGER_FILE");
         if ((file || external) && (!path || !*path)) return 2;
@@ -44,6 +47,7 @@ int main(int argc, char **argv)
             if (!strcmp(mode, "api") && i == 30) trigger("Bad Frame");
             if (race && i == 36) trigger("checkpoint");
             if (spike) usleep(i == 131 ? 60000 : 5000);
+            if (queued && i == 132) trigger("hand press");
             if (file && (i == 30 || i == 33)) {
                 usleep(300000); /* cross the stat throttle */
                 FILE *f = fopen(path, "w");

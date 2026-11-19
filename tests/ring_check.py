@@ -36,8 +36,17 @@ def run_case(directory, arch, mode, ring, *, capture=False, spike_override=None)
     cmd = ["arch", "-" + arch]
     for k, v in knobs.items():
         cmd.extend(["-e", f"{k}={v}"])
-    test = subprocess.run([*cmd, ROOT / "out/ringtest", mode], env=env, check=not capture,
-                          stderr=subprocess.PIPE if capture else None, text=True)
+    logged = capture or mode in ("file", "queue")
+    test = subprocess.run([*cmd, ROOT / "out/ringtest", mode], env=env, check=not logged,
+                          stderr=subprocess.PIPE if logged else None, text=True)
+    if logged and not capture:
+        assert test.returncode == 0, (test.returncode, test.stderr)
+        lines = test.stderr.splitlines()
+        if ring and mode == "file":
+            # the frame-33 write lands in the cooldown: refused, and now said so
+            assert "fencepost: dump request (flicker) refused: cooldown in effect" in lines, test.stderr
+        if ring and mode == "queue":
+            assert "fencepost: dump request (hand press) queued behind the pending spike dump" in lines, test.stderr
     if capture:
         assert test.returncode == 0, (test.returncode, test.stderr)
         assert test.stderr.splitlines().count(CAPTURE_SPIKES_OFF) == int(spike_override is None), test.stderr
@@ -56,6 +65,7 @@ def run_case(directory, arch, mode, ring, *, capture=False, spike_override=None)
         "race": [(30, "race", "race"), (36, "checkpoint", "api")],
         "spike": [(131, "spike", "spike")],
         "file": [(30, "flicker", "file"), (36, "checkpoint", "api")],
+        "queue": [(131, "spike", "spike"), (132, "hand-press", "api")],
     }[mode]
     assert len(dumps) == len(expected), dumps
     for path, (frame, reason, source) in zip(dumps, expected):
@@ -83,7 +93,7 @@ if __name__ == "__main__":
     parser.add_argument("arch", choices=["arm64", "x86_64"])
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as scratch:
-        for case in ["api", "race", "spike", "file"]:
+        for case in ["api", "race", "spike", "file", "queue"]:
             for enabled in [True, False]:
                 run_case(Path(scratch), args.arch, case, enabled)
         for label, override in [("default", None), ("timeline-override", ("FENCEPOST_TRIGGER_SPIKE", "4:50")),
@@ -91,4 +101,4 @@ if __name__ == "__main__":
             directory = Path(scratch) / label
             directory.mkdir()
             run_case(directory, args.arch, "spike", True, capture=True, spike_override=override)
-    print(f"{args.arch}: all four trigger scenarios passed with ring on and off, including capture spike defaults and overrides")
+    print(f"{args.arch}: all five trigger scenarios passed with ring on and off, including capture spike defaults and overrides")
