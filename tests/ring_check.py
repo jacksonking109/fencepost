@@ -21,7 +21,7 @@ def run_case(directory, arch, mode, ring):
         "DYLD_INSERT_LIBRARIES": ROOT / "out/libfencepost.dylib",
         "FENCEPOST_TRIGGER_FILE": trigger_file,
         "FENCEPOST_TRACE": prefix,
-        "FENCEPOST_TRIGGER_COOLDOWN": 1 if mode == "file" else 0,
+        "FENCEPOST_TRIGGER_COOLDOWN": 3 if mode == "file" else 0,
     }
     if ring:
         knobs["FENCEPOST_RING"] = 10

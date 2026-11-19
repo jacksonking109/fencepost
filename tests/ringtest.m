@@ -52,7 +52,7 @@ int main(int argc, char **argv)
             }
             if (file && i == 36) {
                 /* A later dump exposes suppression after the first dump closed. */
-                usleep(1100000);
+                usleep(3100000);
                 trigger("checkpoint");
             }
             frame(cb);
