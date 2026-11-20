@@ -326,6 +326,12 @@ int main(int argc, const char **argv)
             puts("cross-queue wait selected the first signal");
             return 0;
         }
+        if (argc == 2 && !strcmp(argv[1], "--signal-window")) {
+            int (*test_window)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_signal_window");
+            if (!test_window || !test_window()) return fail("signal outside recent queue entries did not retire");
+            puts("signal outside the queue window retired");
+            return 0;
+        }
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--drawable")) drawable = true;
             else if (!strcmp(argv[i], "--trigger")) pause_for_trigger = true;

@@ -91,6 +91,7 @@ typedef struct { uint64_t src; uint8_t after, before; } fp_edge;
 typedef struct { void *ev; uint64_t val, queue_seq; uint8_t before; } fp_evwait;
 typedef struct { void *f; uint64_t src; uint8_t st; } fp_fwait;
 typedef struct { void *f; uint8_t st; } fp_fupd;
+typedef struct { uint64_t uid, seq; } fp_queue_signal;
 
 struct fp_queue;
 typedef struct fp_node {
@@ -135,7 +136,8 @@ typedef struct fp_queue {
     fp_evwait *mtl4_waits;
     int mtl4_nwaits, mtl4_cwaits;
     struct fp_trace_cb *mtl4_last_trace;
-    uint64_t mtl4_signal_limit, mtl4_signals_done;
+    fp_queue_signal *mtl4_signals;
+    int mtl4_sig_first, mtl4_nsignals, mtl4_csignals;
 } fp_queue;
 
 typedef struct { fp_acc a; uint64_t uid, aseq; } fp_ent;
@@ -3709,7 +3711,7 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
     fp_queue *q = queue_get_kind((void *)queue, 1);
     if (q) {
         submission->queue = q;
-        submission->signal_limit = q->mtl4_signal_limit;
+        submission->signal_limit = q->nrecent;
         submission->frame = g_frame_cur;
         if (!g_inflight && g_tick) { frame_get(g_frame_cur)->idle++; g_st[ST_GPU_IDLE]++; }
         uint64_t tick = ++g_tick;
@@ -3749,19 +3751,28 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
 
 /* Successful completion proves that the queue passed every signal scheduled
  * before this submission. Earlier submissions cannot retire trailing signals. */
+static void mtl4_compact_signals(fp_queue *q)
+{
+    if (q->mtl4_sig_first < (q->mtl4_nsignals + 1) / 2) return;
+    q->mtl4_nsignals -= q->mtl4_sig_first;
+    if (q->mtl4_nsignals)
+        memmove(q->mtl4_signals, q->mtl4_signals + q->mtl4_sig_first,
+                (size_t)q->mtl4_nsignals * sizeof *q->mtl4_signals);
+    q->mtl4_sig_first = 0;
+}
+
 static void mtl4_retire_signals(fp_queue *q, uint64_t limit)
 {
-    uint64_t floor = q->nrecent > FP_QRECENT ? q->nrecent - FP_QRECENT : 0;
-    for (uint64_t k = MAX(floor, q->mtl4_signals_done); k < limit; k++) {
-        fp_node *n = node_get(q->recent[k % FP_QRECENT]);
-        if (n && n->kind == FPK_SIGNAL && !n->done_tick) {
+    while (q->mtl4_sig_first < q->mtl4_nsignals && q->mtl4_signals[q->mtl4_sig_first].seq < limit) {
+        fp_node *n = node_get(q->mtl4_signals[q->mtl4_sig_first++].uid);
+        if (n && !n->done_tick) {
             n->done_tick = g_tick;
 #ifdef FENCEPOST_TEST_HOOKS
             g_mtl4_signals_retired++;
 #endif
         }
     }
-    q->mtl4_signals_done = MAX(q->mtl4_signals_done, limit);
+    mtl4_compact_signals(q);
 }
 
 API_AVAILABLE(macos(26.0))
@@ -3944,7 +3955,11 @@ static void mtl4_record_event(id queue, fp_item item)
         fp_node *n = phase_signal(q, 0, ++g_tick, &item);
         n->mtl4 = 1;
         phase_node(q, n, g_tick, NULL, q->mtl4_waits, q->mtl4_nwaits);
-        q->mtl4_signal_limit = q->nrecent;
+        while (q->mtl4_sig_first < q->mtl4_nsignals && !node_get(q->mtl4_signals[q->mtl4_sig_first].uid))
+            q->mtl4_sig_first++;
+        mtl4_compact_signals(q);
+        fp_queue_signal signal = { n->uid, n->queue_seq };
+        PUSH(q->mtl4_signals, q->mtl4_nsignals, q->mtl4_csignals, signal);
         trace_mtl4_signal(q, n->uid, item.val);
         process_pending(0);
     } else if (q) {
@@ -4787,6 +4802,23 @@ __attribute__((visibility("default"))) long fencepost_test_retired_signals(void)
 {
     pthread_mutex_lock(&g_lock);
     long retired = g_mtl4_signals_retired;
+    pthread_mutex_unlock(&g_lock);
+    return retired;
+}
+
+__attribute__((visibility("default"))) int fencepost_test_signal_window(void)
+{
+    pthread_mutex_lock(&g_lock);
+    fp_node *signal = node_new(FPK_SIGNAL);
+    fp_queue_signal entry = { signal->uid, 0 };
+    fp_queue queue = { .nrecent = FP_QRECENT + 1, .mtl4_signals = &entry, .mtl4_nsignals = 1 };
+    uint64_t saved_tick = g_tick;
+    g_tick = 1;
+    mtl4_retire_signals(&queue, 1);
+    g_tick = saved_tick;
+    int retired = signal->done_tick == 1 && !queue.mtl4_nsignals;
+    signal->state = 0;
+    g_mtl4_signals_retired -= retired;
     pthread_mutex_unlock(&g_lock);
     return retired;
 }
