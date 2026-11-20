@@ -109,7 +109,7 @@ typedef struct fp_node {
     struct fp_queue *req_q;         /* declared barrier: must follow req_q's nodes before req_mark */
     uint64_t req_mark, bar_cb;
     int bar_idx;
-    uint64_t frame, chain_prev;     /* chain_prev: the node before this one on its longest ordered chain */
+    uint64_t frame, queue_seq, chain_prev;   /* chain_prev: earlier node on the longest ordered chain */
     uint32_t depth;                 /* encoders on that chain within the frame, this one included */
     fp_bits anc[2];                 /* what is ordered before this node's vertex / fragment work */
 } fp_node;
@@ -225,7 +225,7 @@ static fp_node *node_new(int kind)   /* lock held */
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
     n->mtl4 = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
-    n->frame = 0; n->chain_prev = 0; n->depth = 0;
+    n->frame = 0; n->queue_seq = 0; n->chain_prev = 0; n->depth = 0;
     n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
     for (int i = 0; i < 10; i++) n->att[i] = -1;
     return n;
@@ -2393,7 +2393,8 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
     if (g_trace_enabled) trace_analyse(y);
 }
 
-/* force 0: wait for event signals and unanalysed sources; 1: resolve what is left */
+/* force 1 clears waits with no candidate, leaving pending signal dependencies
+ * for another analysis pass. Force 2 is the final fallback. */
 static int ready(fp_node *n, int force)
 {
     int i, j;
@@ -2403,16 +2404,29 @@ static int ready(fp_node *n, int force)
         int done = 0;
         if (!ev || !ev->known) done = 1;   /* event made outside our view (e.g. from a mach port): CPU-side */
         else {
+            int pending_signal = 0;
+            uint64_t source = 0, first_settled = UINT64_MAX;
             unsigned first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
-            for (unsigned k = first; k < ev->nh; k++)
-                if (ev->h[k % FP_EVHIST].val >= w.val) {
-                    fp_edge e = { ev->h[k % FP_EVHIST].uid, 1, w.before };
-                    PUSH(n->ed, n->ned, n->ced, e);
-                    done = 1;
-                    break;
-                }
+            for (unsigned k = first; k < ev->nh; k++) {
+                if (ev->h[k % FP_EVHIST].val < w.val) continue;
+                uint64_t uid = ev->h[k % FP_EVHIST].uid;
+                fp_node *signal = node_get(uid);
+                if (signal && signal->req_q == n->req_q && signal->queue_seq >= n->queue_seq) continue;
+                /* An unresolved signal may itself be blocked by this wait,
+                 * including through another queue. Only use settled sources. */
+                if (signal && !signal->aseq) { pending_signal = 1; continue; }
+                /* Prefer the first settled signal that reaches the requested
+                 * value. A dependent signal can be registered before its source. */
+                uint64_t aseq = signal ? signal->aseq : 0;
+                if (aseq < first_settled) { first_settled = aseq; source = uid; }
+            }
+            if (source) {
+                fp_edge e = { source, 1, w.before };
+                PUSH(n->ed, n->ned, n->ced, e);
+                done = 1;
+            }
             if (!done && ev->cpu_max >= w.val) done = 1;
-            if (!done && (force || g_tick - n->pend_since > FP_PEND_TIMEOUT)) {
+            if (!done && (force == 2 || (force && !pending_signal) || g_tick - n->pend_since > FP_PEND_TIMEOUT)) {
                 if (ev->gpu) { n->uncertain = 1; g_st[ST_UNCERTAIN]++; }
                 if (!force) g_st[ST_TIMEOUTS]++;
                 done = 1;
@@ -2460,7 +2474,10 @@ static void process_pending(int force)   /* lock held */
             for (int i = 0; i < g_npend; i++) { fp_node *n = node_get(g_pend[i]); if (n) (void)ready(n, 1); }
     }
     if (force) {   /* whatever still waits on a node that never got analysed */
-        for (int i = 0; i < g_npend; i++) { fp_node *n = node_get(g_pend[i]); if (n && n->state == 3) analyse(n); }
+        for (int i = 0; i < g_npend; i++) {
+            fp_node *n = node_get(g_pend[i]);
+            if (n && n->state == 3) { (void)ready(n, 2); analyse(n); }
+        }
         g_npend = 0;
     }
     frames_settle(force);
@@ -2512,6 +2529,7 @@ static void phase_node(fp_queue *q, fp_node *n, uint64_t tick, fp_trace_cb *trac
     n->frame = g_frame_cur; frame_get(g_frame_cur)->queued++;
     if (trace) trace_phase_node(trace, n, waits, nwaits);
     n->state = 3;
+    n->queue_seq = q->nrecent;
     queue_recent(q, n->uid);
     PUSH(g_pend, g_npend, g_cpend, n->uid);
 }

@@ -254,6 +254,14 @@ int main(void)
         a = newcb(q1, 0); rclear(a, t, nil, 0, nil, 0); [a encodeSignalEvent:ev value:1]; [a commit];
         check("across queues, wait committed before the signal", 0, 0);
 
+        /* The consumer's own signal is behind its wait. The independent
+         * producer is committed immediately, with no CPU wait in between. */
+        t = tex(1, 1); ev = [dev newSharedEvent];
+        b = newcb(q2, 0); [b encodeWaitForEvent:ev value:1]; cuse(b, t, RD, nil, nil);
+        [b encodeSignalEvent:ev value:2]; [b commit];
+        a = newcb(q1, 0); rclear(a, t, nil, 0, nil, 0); [a encodeSignalEvent:ev value:1]; [a commit];
+        check("wait then signal the same event: use the other queue", 0, 0);
+
         t = tex(1, 1); f = [dev newFence];
         a = newcb(q1, 0); b = newcb(q1, 0);
         [a enqueue]; [b enqueue];

@@ -74,6 +74,18 @@ def run(arch, directory):
         print(injected.strip(), flush=True)
         check_trace(path, list(range(1, 7)))
 
+    path = directory / "self-wait.json"
+    subprocess.run(command(arch, dict(injection, FENCEPOST_TRACE=path), "--self-wait"),
+                   env=env, check=True, timeout=20)
+    subprocess.run([sys.executable, "-I", ROOT / "tests/trace_check.py", path], check=True)
+    events = json.loads(path.read_text(), parse_float=Decimal)
+    summary = events[-1]["args"]
+    assert summary["timeouts"] == summary["uncertain"] == 0 and summary["frames"] == 1
+    producer, = (e for e in events if e.get("cat") == "command buffer" and e["name"].endswith(" producer"))
+    arrows = [e for e in events if e["ph"] == "s" and e["cat"] == "event" and e["tid"] == producer["tid"]]
+    assert len(arrows) == 2
+    print("same-event wait: 2 producer arrows, 0 timeouts, 0 uncertain", flush=True)
+
     trigger_file = directory / "mtl4.trigger"
     prefix = directory / "ring"
     knobs = dict(injection, FENCEPOST_TRACE=prefix, FENCEPOST_RING=3, FENCEPOST_RING_AFTER=2,

@@ -137,7 +137,7 @@ static bool encode_render(id<MTL4CommandBuffer> cb, id<MTL4CommandAllocator> all
 }
 
 API_AVAILABLE(macos(26.0))
-static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger, unsigned frames)
+static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger, unsigned frames, bool self_wait)
 {
     void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
     long (*trace_cbs)(long *) = dlsym(RTLD_DEFAULT, "fencepost_test_trace_cbs");
@@ -241,8 +241,17 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
             atomic_fetch_add(&batch_count, 1);
             dispatch_semaphore_signal(batch_feedback);
         }];
-        [producer signalEvent:produced value:i];   // Submit the signal before any GPU wait.
-        [consumer waitForEvent:produced value:i];
+        if (self_wait) {
+            // The producer is already committed and independent. Submit its
+            // signal immediately after the consumer's wait and dependent signal.
+            [consumer waitForEvent:produced value:1];
+            [consumer signalEvent:produced value:2];
+            [producer signalEvent:produced value:1];
+            [consumer waitForEvent:produced value:2];
+        } else {
+            [producer signalEvent:produced value:i];
+            [consumer waitForEvent:produced value:i];
+        }
         [consumer commit:render count:2 options:batch];
         if (drawable) {
             [consumer signalDrawable:drawable];
@@ -276,26 +285,29 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
                initial_live, final_live, peak);
         if (initial_live > 8 || final_live > 8 || peak > 16) return fail("unbounded live trace records");
     }
-    return fresh_total != 1 || shared_total != 1 || added_total != 1 || batch_total != (int)frames || error_total != 0;
+    int expected_producer_feedback = self_wait ? 0 : 1;
+    return fresh_total != expected_producer_feedback || shared_total != expected_producer_feedback ||
+           added_total != expected_producer_feedback || batch_total != (int)frames || error_total != 0;
 }
 
 int main(int argc, const char **argv)
 {
     @autoreleasepool {
         setvbuf(stdout, NULL, _IOLBF, 0);
-        bool drawable = false, pause_for_trigger = false, threaded = false;
+        bool drawable = false, pause_for_trigger = false, threaded = false, self_wait = false;
         unsigned frames = FrameCount;
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--drawable")) drawable = true;
             else if (!strcmp(argv[i], "--trigger")) pause_for_trigger = true;
             else if (!strcmp(argv[i], "--threads")) threaded = true;
             else if (!strcmp(argv[i], "--long")) frames = 512;
-            else return fail("usage: mtl4frames [--drawable] [--trigger] [--long] | --threads");
+            else if (!strcmp(argv[i], "--self-wait")) self_wait = true;
+            else return fail("usage: mtl4frames [--drawable] [--trigger] [--long] | --threads | --self-wait");
         }
         if (@available(macOS 26.0, *)) {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
             if (device && [device supportsFamily:MTLGPUFamilyMetal4])
-                return threaded ? run_threads(device) : run(device, drawable, pause_for_trigger, frames);
+                return threaded ? run_threads(device) : run(device, drawable, pause_for_trigger, self_wait ? 1 : frames, self_wait);
         }
         puts("skip: Metal 4 unavailable");
         return 77;
