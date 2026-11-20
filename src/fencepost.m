@@ -159,7 +159,10 @@ static uint64_t g_sig[FP_SIGMAP];
 static uint64_t *g_pend; static int g_npend, g_cpend;
 static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
 static long g_st[ST_COUNT];
-static long g_mtl4_ml_encoders;
+static long g_mtl4_ml_encoders, g_mtl4_gpu_errors;
+#ifdef FENCEPOST_TEST_HOOKS
+static unsigned g_mtl4_test_error_commit;
+#endif
 static FILE *g_out;
 static long g_max_reports = 200, g_printed;
 static int g_show_possible = 1, g_summary_secs = 10, g_started, g_bind_maywrite;
@@ -1660,6 +1663,7 @@ typedef struct {
 
 typedef struct {
     long stats[ST_COUNT];
+    long mtl4_gpu_errors;
     uint64_t pool_exhausted, suppressed, evictions, cap_evictions, alloc_dropped;
     uint64_t origin;
     int stopped, sampling_supported;
@@ -1670,6 +1674,7 @@ static fp_trace_summary trace_summary_state(void)
     fp_trace_summary state = {
         .pool_exhausted = g_trace_pool_exhausted, .stopped = g_trace_stopped,
         .origin = g_trace_origin, .sampling_supported = g_trace_sampling_supported,
+        .mtl4_gpu_errors = g_mtl4_gpu_errors,
         .suppressed = g_suppressed, .evictions = g_ring_evictions, .cap_evictions = g_ring_cap_evictions,
         .alloc_dropped = g_trace_alloc_dropped
     };
@@ -1694,6 +1699,7 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
             TRACE_U64(totals.markers), TRACE_U64(totals.dropped), state->sampling_supported ? "true" : "false",
             state->stopped ? "true" : "false");
     for (int i = 0; i < ST_COUNT; i++) fprintf(f, ",\"%s\":%ld", stats[i], state->stats[i]);
+    if (state->mtl4_gpu_errors) fprintf(f, ",\"mtl4_gpu_errors\":%ld", state->mtl4_gpu_errors);
     static const char *const types[] = { "race", "possible", "order", "partial" };
     for (int i = 0; i < 4; i++)
         fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(totals.hits[i]),
@@ -1709,10 +1715,10 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
     fputs("}}", f);
 }
 
-static void ring_trigger(unsigned kind, const char *reason, const char *source, uint64_t frame,
-                         uint64_t timestamp, const char *error)
+static void ring_trigger_impl(unsigned kind, const char *reason, const char *source, uint64_t frame,
+                              uint64_t timestamp, const char *error, int allow_untraced)
 {
-    if (!g_ring_encoded || g_trace_stopped || !trace_frame_selected(frame)) return;
+    if (!allow_untraced && (!g_ring_encoded || g_trace_stopped || !trace_frame_selected(frame))) return;
     uint64_t now = trace_clock();
     const char *refusal = NULL;
     const char *shown = reason && *reason && *reason != '\n' && *reason != '\r' ? reason : "manual";
@@ -1750,6 +1756,12 @@ static void ring_trigger(unsigned kind, const char *reason, const char *source, 
     if (!n) strcpy(trigger.reason, "manual");
     if (error) trigger.error = strdup(error);
     g_trigger = trigger;
+}
+
+static void ring_trigger(unsigned kind, const char *reason, const char *source, uint64_t frame,
+                         uint64_t timestamp, const char *error)
+{
+    ring_trigger_impl(kind, reason, source, frame, timestamp, error, 0);
 }
 
 __attribute__((visibility("default"))) void fencepost_trigger(const char *reason)
@@ -2162,6 +2174,8 @@ static void summary(int final)
                g_st[ST_PARTIAL_UNIQ], g_st[ST_PARTIAL_HITS]);
     if (g_st[ST_TRACKED])
         fp_log("fencepost:   %ld uses of tracked resources skipped (Metal orders those itself)\n", g_st[ST_TRACKED]);
+    if (g_mtl4_gpu_errors)
+        fp_log("fencepost:   Metal 4 GPU commit errors: %ld\n", g_mtl4_gpu_errors);
     fp_log("fencepost:   cost: %.2f s analysing at commit; %ld resources with live history%s\n",
            g_st[ST_ANALYSIS_NS] / 1e9, g_st[ST_OBJS], g_st[ST_OBJ_DROPS] ? " (TABLE FULL: some accesses not checked)" : "");
     frame_line();
@@ -3631,7 +3645,10 @@ static void h_cb_commit(id self, SEL _cmd)
 typedef struct {
     fp_trace_cb *trace;
     fp_queue *queue;
-    uint64_t signal_limit;
+    uint64_t signal_limit, frame;
+#ifdef FENCEPOST_TEST_HOOKS
+    int inject_error;
+#endif
     NSUInteger ncbs;
     uint64_t cbs[];
 } fp_mtl4_submission;
@@ -3699,6 +3716,7 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
     if (q) {
         submission->queue = q;
         submission->signal_limit = q->mtl4_signal_limit;
+        submission->frame = g_frame_cur;
         if (!g_inflight && g_tick) { frame_get(g_frame_cur)->idle++; g_st[ST_GPU_IDLE]++; }
         uint64_t tick = ++g_tick;
         int nenc = 0;
@@ -3717,7 +3735,13 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
             phase1(c);
         }
         trace_mtl4_submit(q, submission->trace);
-        if (submission->ncbs) g_inflight++;
+        if (submission->ncbs) {
+            g_inflight++;
+            if (submission->trace) submission->frame = submission->trace->span.frame;
+#ifdef FENCEPOST_TEST_HOOKS
+            submission->inject_error = g_mtl4_test_error_commit && --g_mtl4_test_error_commit == 0;
+#endif
+        }
         if (nenc) q->mtl4_nwaits = 0;
         process_pending(0);
         if (g_trace) trace_stream_flush();
@@ -3751,17 +3775,26 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
 {
     NSError *error = feedback.error;
     double start = feedback.GPUStartTime, end = feedback.GPUEndTime;
+    int failed = error != nil;
+#ifdef FENCEPOST_TEST_HOOKS
+    failed |= submission->inject_error;
+#endif
+    char *message = NULL;
+    if (failed && g_ring && g_ring_gpuerr) @autoreleasepool {
+        message = strdup(error ? (error.localizedDescription.UTF8String ?: "Metal 4 commit error")
+                               : "debug-only simulated Metal 4 feedback error");
+    }
     pthread_mutex_lock(&g_lock);
     g_inflight--;
     for (NSUInteger i = 0; i < submission->ncbs; i++) cb_mark_done(submission->cbs[i]);
-    if (!error) mtl4_retire_signals(submission->queue, submission->signal_limit);
+    if (failed) {
+        g_mtl4_gpu_errors++;
+        if (g_ring && g_ring_gpuerr)
+            ring_trigger_impl(DUMP_AUTO, "gpu-error", "gpu-error", submission->frame, trace_clock(), message, 1);
+    } else mtl4_retire_signals(submission->queue, submission->signal_limit);
     fp_trace_cb *trace = submission->trace;
     if (trace) {
-        if (error && g_ring && g_ring_gpuerr) @autoreleasepool {
-            trace->error_time = trace_clock();
-            trace->gpu_error = strdup(error.localizedDescription.UTF8String ?: "Metal 4 commit error");
-        }
-        if (!error && start > 0 && end >= start && end <= (double)trace_clock() / 1e9 + 1) {
+        if (!failed && start > 0 && end >= start && end <= (double)trace_clock() / 1e9 + 1) {
             trace->gpu_start = (uint64_t)(start * 1e9);
             trace->gpu_end = (uint64_t)(end * 1e9);
         }
@@ -3771,6 +3804,7 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
     if (g_ring) ring_update(0);
     if (g_trace) trace_stream_flush();
     pthread_mutex_unlock(&g_lock);
+    free(message);
     free(submission);
 }
 
@@ -4489,7 +4523,7 @@ static void final_summary(void)
         tl_depth--;
         pthread_mutex_unlock(&g_capture_lock);
     }
-    if (g_st[ST_NODES]) summary(1);   /* helper processes that never encoded: quiet */
+    if (g_st[ST_NODES] || g_mtl4_gpu_errors) summary(1);   /* helper processes that never encoded: quiet */
     if (g_mtl4_ml_encoders) fp_log("fencepost: Metal 4 machine-learning encoders: %ld\n", g_mtl4_ml_encoders);
     if (g_trace_enabled) {
         pthread_mutex_lock(&g_lock);
@@ -4685,6 +4719,9 @@ static void trace_init(const char *path)
 
 __attribute__((constructor)) static void fp_init(void)
 {
+#ifdef FENCEPOST_TEST_HOOKS
+    g_mtl4_test_error_commit = trace_unsigned("FENCEPOST_MTL4_TEST_ERROR_COMMIT", 0);
+#endif
     if (@available(macOS 26.0, *)) {
         g_mtl4_options_class = objc_lookUpClass("MTL4CommitOptions");
         if (g_mtl4_options_class) {
