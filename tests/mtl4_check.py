@@ -7,6 +7,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+import re
 import select
 from statistics import median
 import subprocess
@@ -83,6 +84,35 @@ def check_threads(arch):
           f"{median(timing[True]):.3f} ms with fencepost")
 
 
+def check_testhooks(arch, directory, env):
+    injection = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost-testhooks.dylib"}
+    for scenario in ("--wait-source", "--signal-window"):
+        subprocess.run(command(arch, injection, scenario), env=env, check=True, timeout=20)
+    path = directory / "long.json"
+    result = subprocess.check_output(command(arch, dict(injection, FENCEPOST_TRACE=path), "--long"),
+                                     env=env, text=True, timeout=20)
+    live = re.search(r"live Metal 4 trace records at frame 64 and end: (\d+), (\d+) \(peak (\d+)\)", result)
+    chain = re.search(r"longest frame chain at start and end: (\d+), (\d+) \(max (\d+)\)", result)
+    retired = re.search(r"retired Metal 4 queue signals: (\d+)", result)
+    assert live and max(map(int, live.groups()[:2])) <= 8 and int(live[3]) <= 16, result
+    assert chain and chain.groups() == ("2", "2", "2"), result
+    assert retired and int(retired[1]) > 0, result
+    print(result.strip(), flush=True)
+    subprocess.run([sys.executable, "-I", ROOT / "tests/trace_check.py", path], check=True)
+
+    knobs = dict(injection, FENCEPOST_TRACE=directory / "test-error", FENCEPOST_RING=3,
+                 FENCEPOST_TRACE_FRAMES="1:1", FENCEPOST_TRIGGER_FILE="", FENCEPOST_MTL4_TEST_ERROR_COMMIT=3)
+    result = subprocess.run(command(arch, knobs), env=env, capture_output=True, text=True, check=True, timeout=20)
+    assert "Metal 4 GPU commit errors: 1" in result.stderr, result.stderr
+    dump, = directory.glob("test-error-*-f2-gpu-error.json")
+    subprocess.run([sys.executable, "-I", ROOT / "tests/trace_check.py", dump, "--dump", "--trigger", "2", "gpu-error"],
+                   check=True)
+    events = json.loads(dump.read_text())
+    assert events[-1]["args"]["mtl4_gpu_errors"] == 1
+    marker, = (e for e in events if e["name"] == "TRIGGER gpu-error")
+    assert marker["args"]["error"] == "debug-only simulated Metal 4 feedback error"
+
+
 def run(arch, directory):
     env = clean_env()
     injection = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost.dylib"}
@@ -141,6 +171,7 @@ def run(arch, directory):
     dump = dumps[0]
     assert not list(directory.glob("*.gputrace"))
     check_trace(dump, list(range(1, 6)), dump=True)
+    check_testhooks(arch, directory, env)
 
 
 if __name__ == "__main__":

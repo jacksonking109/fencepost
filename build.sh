@@ -13,6 +13,13 @@ FLAGS=(-arch arm64 -arch x86_64 -O2 -g -Wall -Wextra -Wno-unused-parameter -fno-
 # mapped (a Steam session) keeps its copy intact, instead of hanging on a rewritten file.
 clang $FLAGS -dynamiclib -install_name @rpath/libfencepost.dylib -o out/.libfencepost.dylib.new src/fencepost.m \
     -framework Metal -framework Foundation
+if [[ $1 != release ]]; then
+    clang $FLAGS -DFENCEPOST_TEST_HOOKS -dynamiclib -install_name @rpath/libfencepost-testhooks.dylib \
+        -o out/.libfencepost-testhooks.dylib.new src/fencepost.m -framework Metal -framework Foundation
+    codesign -f -s - out/.libfencepost-testhooks.dylib.new 2>/dev/null
+    mv -f out/.libfencepost-testhooks.dylib.new out/libfencepost-testhooks.dylib
+    echo "built out/libfencepost-testhooks.dylib"
+fi
 clang $FLAGS -o out/fptest tests/fptest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/tracetest tests/tracetest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/ringtest tests/ringtest.m -framework Metal -framework Foundation
