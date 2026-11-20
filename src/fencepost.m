@@ -133,6 +133,7 @@ typedef struct fp_queue {
     uint64_t *held; int nheld, cheld;
     fp_evwait mtl4_waits[32];
     int mtl4_nwaits;
+    struct fp_trace_cb *mtl4_last_trace;
 } fp_queue;
 
 typedef struct { fp_acc a; uint64_t uid, aseq; } fp_ent;
@@ -406,7 +407,7 @@ static fp_frame *frame_get(uint64_t f);
 #define FP_SPIKE_FACTOR 4
 #define FP_SPIKE_MIN_NS 50e6
 
-enum { TR_CB, TR_GPU, TR_CPU, TR_QUEUE_TRACKS };
+enum { TR_CB, TR_GPU, TR_CPU, TR_MTL4_EVENT, TR_QUEUE_TRACKS };
 enum { TR_FENCE, TR_EVENT, TR_COMPLETED, TR_RACE, TR_POSSIBLE, TR_ORDER, TR_FRAGMENT };
 static const char *const trace_categories[] = { "fence", "event", "completed", "race", "race", "order", "order" };
 
@@ -453,7 +454,7 @@ typedef struct fp_trace_encoder {
     struct fp_trace_cb *cb;
     uint64_t uid, start, end, thread, gpu_start, gpu_end;
     int sample, selected, kind, args_dropped;
-    char label[64];
+    char label[64], mtl4_cb_label[48];
     char *args;
     fp_evwait *waits;
     int nwaits;
@@ -479,7 +480,7 @@ typedef struct fp_trace_cb {
     char *gpu_error;
     uint64_t error_time;
     uint64_t gpu_start, gpu_end;
-    int queue, phased, completed, selected, has_encoder;
+    int queue, phased, completed, selected, has_encoder, mtl4;
     char label[48];
 } fp_trace_cb;
 
@@ -897,6 +898,8 @@ static int trace_queue_lane(int queue, int type, const fp_trace_span *span)
     if (type == TR_CB) {
         const char *label = g_trace_queue_labels[queue];
         snprintf(name, sizeof name, "Queue %d%s%s - command buffers", queue, *label ? " " : "", label);
+    } else if (type == TR_MTL4_EVENT) {
+        snprintf(name, sizeof name, "Queue %d %s - events", queue, g_trace_queue_labels[queue]);
     } else if (g_q[queue].mtl4) {
         snprintf(name, sizeof name, "Queue %d %s - encoders%s", queue, g_trace_queue_labels[queue],
                  type == TR_CPU ? " (CPU encode time)" : "");
@@ -1154,7 +1157,7 @@ static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4)
     }
     if (g_trace_stopped || g_frame_cur >= g_trace_last) return NULL;
     fp_trace_cb *c = calloc(1, sizeof *c);
-    c->refs = 1; c->uid = uid; c->queue = queue; c->encoder_tail = &c->encoders;
+    c->refs = 1; c->uid = uid; c->queue = queue; c->encoder_tail = &c->encoders; c->mtl4 = mtl4;
     if (g_trace_gpu && !mtl4) c->device = trace_device([cb device]);
     if (!g_trace_origin) trace_start();
     if (!owner) {
@@ -1382,11 +1385,13 @@ static void trace_analyse(const fp_node *n)
     FILE *f = open_memstream(&e->args, &length);
     if (!f) goto drop;
     fprintf(f, "\"uid\":%llu,\"cb\":%llu,\"queue\":%d,\"frame\":%llu,\"chain_depth\":%u,\"accesses\":%d,"
-            "\"after_declared_barrier\":%s", TRACE_U64(n->uid), TRACE_U64(n->cb_uid), e->cb->queue,
+            "\"after_declared_barrier\":%s", TRACE_U64(n->uid),
+            TRACE_U64(e->cb->mtl4 ? e->cb->uid : n->cb_uid), e->cb->queue,
             TRACE_U64(n->frame + 1), n->depth, n->nacc, n->req_mark ? "true" : "false");
+    if (e->cb->mtl4) fprintf(f, ",\"logical_cb\":%llu", TRACE_U64(n->cb_uid));
     trace_label(f, "kind", kind_name[n->kind]);
     trace_label(f, "label", n->label);
-    trace_label(f, "cb_label", e->cb->label);
+    trace_label(f, "cb_label", e->cb->mtl4 ? e->mtl4_cb_label : e->cb->label);
     fputs(",\"fence_waits\":[", f);
     for (int i = 0; i < n->nfw; i++)
         fprintf(f, "%s{\"fence\":\"%p\",\"last_updater_uid\":%llu,\"stage\":\"%s\"}", i ? "," : "",
@@ -1464,7 +1469,8 @@ static void trace_cb_finish(fp_trace_cb *c)
             c->span.gpu = 1;
             c->span.tid = trace_queue_lane(c->queue, TR_CB, &c->span);
             char name[96];
-            snprintf(name, sizeof name, "CB #%llu%s%s", TRACE_U64(c->uid), c->label[0] ? " " : "", c->label);
+            snprintf(name, sizeof name, "%s #%llu%s%s", c->mtl4 ? "MTL4 commit" : "CB",
+                     TRACE_U64(c->uid), c->label[0] ? " " : "", c->label);
             char *record = NULL;
             size_t length = 0;
             FILE *f = open_memstream(&record, &length);
@@ -1501,7 +1507,7 @@ static void trace_cb_finish(fp_trace_cb *c)
         fp_trace_chunk *chunk = c->span.counted ? trace_chunk(c->span.frame) : NULL;
         if (chunk) chunk->outstanding--;
         ring_release_cb(c);
-    } else if (!c->selected) free(c);
+    } else if (!c->selected) ring_release_cb(c);
 }
 
 static void trace_cb_completed(fp_trace_cb *c, id<MTLCommandBuffer> cb)
@@ -2496,8 +2502,10 @@ static void phase1(fp_cb *c)
         nactive = q->mtl4_nwaits;
         memcpy(active, q->mtl4_waits, (size_t)nactive * sizeof *active);
     }
-    if (trace) trace->span.frame = g_frame_cur;  /* fallback for an encoderless CB */
-    if (trace && trace_frame_selected(g_frame_cur) && !g_trace_stopped) trace->selected = 1;
+    if (trace && !c->mtl4) {
+        trace->span.frame = g_frame_cur;  /* fallback for an encoderless CB */
+        if (trace_frame_selected(g_frame_cur) && !g_trace_stopped) trace->selected = 1;
+    }
     g_st[ST_CBS]++;
     for (int i = 0; i < c->nit; i++) {
         fp_item *it = &c->it[i];
@@ -2535,7 +2543,7 @@ static void phase1(fp_cb *c)
         }
         phase_node(q, n, c->commit_tick, trace, active, nactive);
     }
-    if (trace) {
+    if (trace && !c->mtl4) {
         if (g_ring && trace->selected) {
             fp_trace_chunk *chunk = trace_chunk(trace->span.frame);
             if (chunk) {
@@ -2568,16 +2576,21 @@ static void queue_submit(fp_queue *q, fp_cb *c)   /* in enqueue order */
     }
 }
 
-static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
+static void cb_mark_done(uint64_t uid)
 {
-    pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_get(uid);
-    g_inflight--;
     if (c)
         for (int i = 0; i < c->nit; i++) {
             fp_node *n = c->it[i].type != 2 ? node_get(c->it[i].uid) : NULL;
             if (n && !n->done_tick) n->done_tick = g_tick;
         }
+}
+
+static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
+{
+    pthread_mutex_lock(&g_lock);
+    g_inflight--;
+    cb_mark_done(uid);
     if ((g_capture_on & CAP_GPU_ERROR) && b.status == MTLCommandBufferStatusError)
         capture_request("gpu-error");
     if (trace) trace_cb_completed(trace, b);
@@ -3567,11 +3580,66 @@ static void h_cb_commit(id self, SEL _cmd)
     LEAVE;
 }
 
-static void mtl4_record_commit(id queue, const id *buffers, NSUInteger count)
+typedef struct {
+    fp_trace_cb *trace;
+    NSUInteger ncbs;
+    uint64_t cbs[];
+} fp_mtl4_submission;
+
+static void trace_mtl4_join(fp_trace_cb **batch, fp_cb *c)
 {
+    fp_trace_cb *trace = c->trace;
+    if (!trace) return;
+    trace->owner->record = NULL;
+    trace->owner = nil;
+    if (!*batch) {
+        *batch = trace;
+        trace->queue = c->q->idx;
+        trace->span.frame = g_frame_cur;
+        trace->selected = trace_frame_selected(g_frame_cur) && !g_trace_stopped;
+        memcpy(trace->label, c->label, sizeof trace->label);
+    }
+    for (fp_trace_encoder *e = trace->encoders; e; e = e->next) {
+        e->cb = *batch;
+        memcpy(e->mtl4_cb_label, c->label, sizeof e->mtl4_cb_label);
+    }
+    if (trace != *batch) {
+        if (trace->encoders) {
+            *(*batch)->encoder_tail = trace->encoders;
+            (*batch)->encoder_tail = trace->encoder_tail;
+        }
+        free(trace);
+        c->trace = *batch;
+    }
+}
+
+static void trace_mtl4_submit(fp_queue *q, fp_trace_cb *trace)
+{
+    if (q->mtl4_last_trace) ring_release_cb(q->mtl4_last_trace);
+    q->mtl4_last_trace = trace;
+    if (!trace) return;
+    trace->refs++;   /* A queue signal can refer to the commit after feedback arrives. */
+    trace->completed_before = malloc(sizeof g_trace_completed);
+    memcpy(trace->completed_before, g_trace_completed, sizeof g_trace_completed);
+    if (g_ring && trace->selected) {
+        fp_trace_chunk *chunk = trace_chunk(trace->span.frame);
+        if (chunk) {
+            chunk->outstanding++;
+            trace->span.counted = 1;
+        }
+    }
+    trace->phased = 1;
+}
+
+static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUInteger count)
+{
+    if (!count || count > (SIZE_MAX - sizeof(fp_mtl4_submission)) / sizeof(uint64_t)) return NULL;
+    fp_mtl4_submission *submission = calloc(1, sizeof *submission + count * sizeof submission->cbs[0]);
+    if (!submission) return NULL;
     pthread_mutex_lock(&g_lock);
     fp_queue *q = queue_get_kind((void *)queue, 1);
-    if (q && count) {
+    if (q) {
+        if (!g_inflight && g_tick) { frame_get(g_frame_cur)->idle++; g_st[ST_GPU_IDLE]++; }
         uint64_t tick = ++g_tick;
         int nenc = 0;
         if (g_ring) ring_poll_file();
@@ -3583,46 +3651,132 @@ static void mtl4_record_commit(id queue, const id *buffers, NSUInteger count)
             if (label) snprintf(c->label, sizeof c->label, "%s", label);
             c->q = q;
             c->commit_tick = tick;
+            submission->cbs[submission->ncbs++] = c->uid;
             nenc += c->nenc;
             cb_close((void *)cb);
-            if (c->trace) {
-                c->trace->owner->record = NULL;
-                c->trace->queue = q->idx;
-                c->trace->completed = 1;
-                memcpy(c->trace->label, c->label, sizeof c->label);
-            }
+            trace_mtl4_join(&submission->trace, c);
             phase1(c);
         }
+        trace_mtl4_submit(q, submission->trace);
+        if (submission->ncbs) g_inflight++;
         if (nenc) q->mtl4_nwaits = 0;
         process_pending(0);
         if (g_trace) trace_stream_flush();
     }
     pthread_mutex_unlock(&g_lock);
+    if (submission->ncbs) return submission;
+    free(submission);
+    return NULL;
 }
 
-/* Serialize recording and Metal submission together so the model sees the same queue order. */
+API_AVAILABLE(macos(26.0))
+static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback> feedback)
+{
+    NSError *error = feedback.error;
+    double start = feedback.GPUStartTime, end = feedback.GPUEndTime;
+    pthread_mutex_lock(&g_lock);
+    g_inflight--;
+    for (NSUInteger i = 0; i < submission->ncbs; i++) cb_mark_done(submission->cbs[i]);
+    fp_trace_cb *trace = submission->trace;
+    if (trace) {
+        if (!error && start > 0 && end >= start && end <= (double)trace_clock() / 1e9 + 1) {
+            trace->gpu_start = (uint64_t)(start * 1e9);
+            trace->gpu_end = (uint64_t)(end * 1e9);
+        }
+        trace->completed = 1;
+        trace_cb_finish(trace);
+    }
+    if (g_ring) ring_update(0);
+    if (g_trace) trace_stream_flush();
+    pthread_mutex_unlock(&g_lock);
+    free(submission);
+}
+
+API_AVAILABLE(macos(26.0))
+static int mtl4_add_feedback(id queue, const id *buffers, NSUInteger count, MTL4CommitOptions *options)
+{
+    if (![options respondsToSelector:@selector(addFeedbackHandler:)]) return 0;
+    fp_mtl4_submission *submission = mtl4_record_commit(queue, buffers, count);
+    if (!submission) return 0;
+    /* Metal consumes the registered blocks at submission. Appending one per
+     * call preserves app registrations and also works when it reuses options. */
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        mtl4_completed(submission, feedback);
+    }];
+    return 1;
+}
+
+/* Keep the registration and native submission together, including when the
+ * same options object is used by different queues. Nested calls pass through. */
 static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count)
 {
     ENTER;
+    int submitted = 0;
     if (OUTER) {
         pthread_mutex_lock(&g_mtl4_submit_lock);
-        mtl4_record_commit(self, buffers, count);
+        if (@available(macOS 26.0, *)) {
+            if (count && [self respondsToSelector:@selector(commit:count:options:)]) {
+                MTL4CommitOptions *options = [[NSClassFromString(@"MTL4CommitOptions") alloc] init];
+                if (mtl4_add_feedback(self, buffers, count, options)) {
+                    [(id<MTL4CommandQueue>)self commit:(const id<MTL4CommandBuffer> *)buffers count:count options:options];
+                    submitted = 1;
+                }
+                [options release];
+            }
+        }
     }
-    ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
+    if (!submitted) ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
     if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
     LEAVE;
+    if (submitted) maybe_summary();
 }
 
 static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger count, id options)
 {
     ENTER;
+    int recorded = 0;
     if (OUTER) {
         pthread_mutex_lock(&g_mtl4_submit_lock);
-        mtl4_record_commit(self, buffers, count);
+        if (@available(macOS 26.0, *)) recorded = mtl4_add_feedback(self, buffers, count, options);
     }
     ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, options);
     if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
     LEAVE;
+    if (recorded) maybe_summary();
+}
+
+static void trace_mtl4_signal(fp_queue *q, uint64_t uid, uint64_t value)
+{
+    if (!g_trace_enabled || g_trace_stopped || !trace_frame_selected(g_frame_cur)) return;
+    fp_trace_cb *last = q->mtl4_last_trace;
+    if (last && last->selected && (!last->completed || last->span.tid)) {
+        if (g_ring && last->completed) ring_archive(uid, &last->span);
+        else {
+            CFDictionarySetValue(g_trace_nodes, TRACE_KEY(uid), &last->span);
+            if (g_ring) PUSH(last->signals, last->nsignals, last->csignals, uid);
+        }
+        return;
+    }
+    /* A queue can signal before its first commit. The scheduling timestamp is
+     * a lower bound for when that signal reaches the GPU. */
+    if (!g_trace_origin) trace_start();
+    uint64_t now = trace_clock();
+    fp_trace_span span = { .start = now, .end = now, .frame = g_frame_cur, .ready = 1, .gpu = 1 };
+    span.tid = trace_queue_lane(q->idx, TR_MTL4_EVENT, &span);
+    char *record = NULL;
+    size_t length = 0;
+    FILE *f = open_memstream(&record, &length);
+    if (f) {
+        trace_slice(f, &span, "event signal", "MTL4 event signal");
+        fprintf(f, ",\"args\":{\"uid\":%llu,\"value\":%llu,\"estimated\":true}}", TRACE_U64(uid), TRACE_U64(value));
+    }
+    if (!trace_write(span.frame, f, &record, &length, 1)) return;
+    if (g_ring) ring_archive(uid, &span);
+    else {
+        fp_trace_span *saved = malloc(sizeof *saved);
+        *saved = span;
+        CFDictionarySetValue(g_trace_nodes, TRACE_KEY(uid), saved);
+    }
 }
 
 static void mtl4_record_event(id queue, fp_item item)
@@ -3633,6 +3787,7 @@ static void mtl4_record_event(id queue, fp_item item)
         fp_node *n = phase_signal(q, 0, ++g_tick, &item);
         n->mtl4 = 1;
         phase_node(q, n, g_tick, NULL, q->mtl4_waits, q->mtl4_nwaits);
+        trace_mtl4_signal(q, n->uid, item.val);
         process_pending(0);
     } else if (q && q->mtl4_nwaits < 32) {
         q->mtl4_waits[q->mtl4_nwaits++] = (fp_evwait){ item.ev, item.val, 0 };
