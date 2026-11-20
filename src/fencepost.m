@@ -97,7 +97,7 @@ typedef struct fp_node {
     uint64_t cb_uid, commit_tick, done_tick, pend_since;
     int kind, state, idx;           /* state: 1 encoding, 2 ended, 3 committed, 4 analysed */
     void *enc;
-    uint8_t uncertain, exempt;
+    uint8_t uncertain, exempt, mtl4;
     int att[10];                    /* acc index of colour 0-7, depth, stencil attachments */
     char label[64];
     fp_acc *acc;     int nacc, cacc;
@@ -118,7 +118,7 @@ typedef struct {
     uint64_t uid, enq, commit_tick;
     void *cb;
     struct fp_queue *q;
-    int state, nenc;
+    int state, nenc, mtl4;
     fp_item *it; int nit, cit;
     char label[48];
     struct fp_trace_cb *trace;
@@ -126,7 +126,7 @@ typedef struct {
 
 typedef struct fp_queue {
     void *q;
-    int idx;
+    int idx, mtl4;
     uint64_t enq_assign, enq_next;
     uint64_t recent[FP_QRECENT]; uint64_t nrecent;
     uint64_t bar_mark, bar_cb; int bar_idx;   /* the last declared barrier */
@@ -153,6 +153,7 @@ static uint64_t g_sig[FP_SIGMAP];
 static uint64_t *g_pend; static int g_npend, g_cpend;
 static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
 static long g_st[ST_COUNT];
+static long g_mtl4_ml_encoders;
 static FILE *g_out;
 static long g_max_reports = 200, g_printed;
 static int g_show_possible = 1, g_summary_secs = 10, g_started, g_bind_maywrite;
@@ -217,6 +218,7 @@ static fp_node *node_new(int kind)   /* lock held */
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
+    n->mtl4 = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->frame = 0; n->chain_prev = 0; n->depth = 0;
     n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
@@ -1133,17 +1135,26 @@ static void trace_resolve(fp_trace_encoder *e)
     e->gpu_start = (uint64_t)start; e->gpu_end = (uint64_t)end;
 }
 
-static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue)
+static void trace_discard_cb(fp_trace_cb *c);
+
+static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4)
 {
+    FPTraceOwner *owner = mtl4 ? objc_getAssociatedObject(cb, &g_trace_owner_key) : nil;
+    if (owner && owner->record) {
+        trace_discard_cb(owner->record);
+        owner->record = NULL;
+    }
     if (g_trace_stopped || g_frame_cur >= g_trace_last) return NULL;
     fp_trace_cb *c = calloc(1, sizeof *c);
     c->refs = 1; c->uid = uid; c->queue = queue; c->encoder_tail = &c->encoders;
-    if (g_trace_gpu) c->device = trace_device([cb device]);
+    if (g_trace_gpu && !mtl4) c->device = trace_device([cb device]);
     if (!g_trace_origin) trace_start();
-    FPTraceOwner *owner = [[FPTraceOwner alloc] init];
+    if (!owner) {
+        owner = [[FPTraceOwner alloc] init];
+        objc_setAssociatedObject(cb, &g_trace_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [owner release];
+    }
     owner->record = c; c->owner = owner;
-    objc_setAssociatedObject(cb, &g_trace_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [owner release];
     return c;
 }
 
@@ -1155,18 +1166,23 @@ static void trace_discard_encoder(fp_trace_encoder *e)
     free(e->args); free(e->waits); free(e);
 }
 
+static void trace_discard_cb(fp_trace_cb *c)
+{
+    fp_trace_encoder *e = c->encoders;
+    while (e) {
+        fp_trace_encoder *next = e->next;
+        trace_discard_encoder(e);
+        e = next;
+    }
+    free(c);
+}
+
 @implementation FPTraceOwner
 - (void)dealloc
 {
     if (record) {
         pthread_mutex_lock(&g_lock);
-        fp_trace_encoder *e = record->encoders;
-        while (e) {
-            fp_trace_encoder *next = e->next;
-            trace_discard_encoder(e);
-            e = next;
-        }
-        free(record);
+        trace_discard_cb(record);
         pthread_mutex_unlock(&g_lock);
     }
     [super dealloc];
@@ -2678,6 +2694,8 @@ enum {
     H_R_CSA, H_R_DSA, H_R_SSA,
     H_C_TEX, H_C_TEXS, H_C_BUF, H_C_BUFS, H_C_DISPIND,
     H_B_BB, H_B_BT, H_B_BT_O, H_B_TB, H_B_TB_O, H_B_TT, H_B_TT_N, H_B_TT_ALL, H_B_FILL, H_B_MIP, H_B_SYNCR, H_B_SYNCT,
+    H_4_DEV_Q, H_4_DEV_Q_DESC, H_4_DEV_CB, H_4_BEGIN, H_4_BEGIN_OPTS, H_4_END,
+    H_4_RENDER, H_4_RENDER_OPTS, H_4_COMPUTE, H_4_ML,
     H_COUNT
 };
 
@@ -2717,6 +2735,8 @@ static void hook_queue(Class cls);
 static void hook_cb(Class cls);
 static void hook_encoder(Class cls, int kind);
 static void hook_event(Class cls);
+static void hook_mtl4_cb(Class cls);
+static void hook_mtl4_encoder(Class cls);
 
 /* device */
 
@@ -2771,25 +2791,29 @@ static id h_dev_newev(id self, SEL _cmd)
 
 /* queue */
 
+static fp_cb *cb_record_new(id cb, fp_queue *q, int mtl4)   /* g_lock held */
+{
+    uint64_t uid = ++g_cbuid;
+    fp_cb *c = &g_cbs[uid % FP_CBPOOL];
+    c->uid = uid; c->cb = (void *)cb; c->q = q; c->state = 1; c->nenc = 0; c->nit = 0; c->mtl4 = mtl4;
+    c->enq = 0; c->commit_tick = 0; c->label[0] = 0;
+    c->trace = g_trace_enabled ? trace_cb_new(cb, uid, q ? q->idx : -1, mtl4) : NULL;
+    unsigned slot = FP_OPENCB;
+    for (unsigned i = 0; i < FP_OPENCB; i++) {
+        if (g_opencb[i].cb == (void *)cb) { slot = i; break; }   /* stale entry for a reused address */
+        if (slot == FP_OPENCB && !g_opencb[i].cb) slot = i;
+    }
+    if (slot == FP_OPENCB) slot = g_opencb_rr++ % FP_OPENCB;
+    g_opencb[slot].cb = (void *)cb; g_opencb[slot].uid = uid;
+    return c;
+}
+
 static void on_cb(id q, id cb)
 {
     if (!cb) return;
     pthread_mutex_lock(&g_lock);
     fp_queue *fq = queue_get((void *)q);
-    if (fq) {
-        uint64_t uid = ++g_cbuid;
-        fp_cb *c = &g_cbs[uid % FP_CBPOOL];
-        c->uid = uid; c->cb = (void *)cb; c->q = fq; c->state = 1; c->nenc = 0; c->nit = 0;
-        c->enq = 0; c->commit_tick = 0; c->label[0] = 0;
-        if (g_trace_enabled) c->trace = trace_cb_new(cb, uid, fq->idx);
-        unsigned slot = FP_OPENCB;
-        for (unsigned i = 0; i < FP_OPENCB; i++) {
-            if (g_opencb[i].cb == (void *)cb) { slot = i; break; }   /* stale entry for a reused address */
-            if (slot == FP_OPENCB && !g_opencb[i].cb) slot = i;
-        }
-        if (slot == FP_OPENCB) slot = g_opencb_rr++ % FP_OPENCB;
-        g_opencb[slot].cb = (void *)cb; g_opencb[slot].uid = uid;
-    }
+    if (fq) cb_record_new(cb, fq, 0);
     pthread_mutex_unlock(&g_lock);
     hook_cb(object_getClass(cb));
 }
@@ -3076,15 +3100,17 @@ static id h_q_cbd(id self, SEL _cmd, id d)
 
 /* command buffer */
 
-static fp_node *on_encoder(id cb, id enc, int kind, fp_trace_encoder *trace)
+static fp_node *on_encoder_kind(id cb, id enc, int kind, fp_trace_encoder *trace, int mtl4)
 {
     if (!enc) return NULL;
-    hook_encoder(object_getClass(enc), kind);
+    if (mtl4) hook_mtl4_encoder(object_getClass(enc));
+    else hook_encoder(object_getClass(enc), kind);
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)cb);
     fp_node *n = NULL;
     if (c) {
         n = node_new(kind);
+        n->mtl4 = mtl4;
         n->enc = (void *)enc; n->cb_uid = c->uid; n->idx = ++c->nenc;
         if (g_ring) g_ring_encoded = 1;
         if (trace) trace_encoder_register(trace, n);
@@ -3101,6 +3127,11 @@ static fp_node *on_encoder(id cb, id enc, int kind, fp_trace_encoder *trace)
     }
     pthread_mutex_unlock(&g_lock);
     return n;
+}
+
+static fp_node *on_encoder(id cb, id enc, int kind, fp_trace_encoder *trace)
+{
+    return on_encoder_kind(cb, enc, kind, trace, 0);
 }
 
 /* The descriptor selectors may themselves call a hooked selector. Keep tl_depth
@@ -3247,6 +3278,112 @@ static id h_cb_benc_d(id self, SEL _cmd, id d)
     if (sampled) [sampled release];
     LEAVE;
     if (OUTER) on_encoder(self, enc, FPK_BLIT, trace);
+    return enc;
+}
+
+/* Metal 4 buffers are recorded independently of the queue that submits them. */
+static void on_mtl4_queue(id queue)
+{
+    if (!queue) return;
+    const char *label = [[queue label] UTF8String];
+    pthread_mutex_lock(&g_lock);
+    fp_queue *q = queue_get((void *)queue);
+    if (q) {
+        q->mtl4 = 1;
+        snprintf(g_trace_queue_labels[q->idx], sizeof g_trace_queue_labels[0], "MTL4%s%s",
+                 label && *label ? " " : "", label ?: "");
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+static id h_mtl4_dev_q(id self, SEL _cmd)
+{
+    ENTER; id queue = ORIG(H_4_DEV_Q, id (*)(id, SEL))(self, _cmd); LEAVE;
+    if (OUTER) on_mtl4_queue(queue);
+    return queue;
+}
+
+static id h_mtl4_dev_q_desc(id self, SEL _cmd, id desc, NSError **error)
+{
+    ENTER; id queue = ORIG(H_4_DEV_Q_DESC, id (*)(id, SEL, id, NSError **))(self, _cmd, desc, error); LEAVE;
+    if (OUTER) on_mtl4_queue(queue);
+    return queue;
+}
+
+static id h_mtl4_dev_cb(id self, SEL _cmd)
+{
+    ENTER; id cb = ORIG(H_4_DEV_CB, id (*)(id, SEL))(self, _cmd); LEAVE;
+    if (OUTER && cb) hook_mtl4_cb(object_getClass(cb));
+    return cb;
+}
+
+static void on_mtl4_begin(id cb)
+{
+    pthread_mutex_lock(&g_lock);
+    cb_record_new(cb, NULL, 1);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void h_mtl4_begin(id self, SEL _cmd, id allocator)
+{
+    ENTER; ORIG(H_4_BEGIN, void (*)(id, SEL, id))(self, _cmd, allocator); LEAVE;
+    if (OUTER) on_mtl4_begin(self);
+}
+
+static void h_mtl4_begin_opts(id self, SEL _cmd, id allocator, id options)
+{
+    ENTER; ORIG(H_4_BEGIN_OPTS, void (*)(id, SEL, id, id))(self, _cmd, allocator, options); LEAVE;
+    if (OUTER) on_mtl4_begin(self);
+}
+
+static void h_mtl4_end(id self, SEL _cmd)
+{
+    ENTER; ORIG(H_4_END, void (*)(id, SEL))(self, _cmd); LEAVE;
+    if (!OUTER) return;
+    pthread_mutex_lock(&g_lock);
+    fp_cb *c = cb_find_open((void *)self);
+    if (c) c->state = 2;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static id h_mtl4_render(id self, SEL _cmd, id desc)
+{
+    ENTER;
+    fp_trace_encoder *trace = TRACE_ENCODER();
+    id enc = ORIG(H_4_RENDER, id (*)(id, SEL, id))(self, _cmd, desc);
+    LEAVE;
+    if (OUTER) on_encoder_kind(self, enc, FPK_RENDER, trace, 1);
+    return enc;
+}
+
+static id h_mtl4_render_opts(id self, SEL _cmd, id desc, NSUInteger options)
+{
+    ENTER;
+    fp_trace_encoder *trace = TRACE_ENCODER();
+    id enc = ORIG(H_4_RENDER_OPTS, id (*)(id, SEL, id, NSUInteger))(self, _cmd, desc, options);
+    LEAVE;
+    if (OUTER) on_encoder_kind(self, enc, FPK_RENDER, trace, 1);
+    return enc;
+}
+
+static id h_mtl4_compute(id self, SEL _cmd)
+{
+    ENTER;
+    fp_trace_encoder *trace = TRACE_ENCODER();
+    id enc = ORIG(H_4_COMPUTE, id (*)(id, SEL))(self, _cmd);
+    LEAVE;
+    if (OUTER) on_encoder_kind(self, enc, FPK_COMPUTE, trace, 1);
+    return enc;
+}
+
+static id h_mtl4_ml(id self, SEL _cmd)
+{
+    ENTER; id enc = ORIG(H_4_ML, id (*)(id, SEL))(self, _cmd); LEAVE;
+    if (OUTER && enc) {
+        pthread_mutex_lock(&g_lock);
+        g_mtl4_ml_encoders++;
+        pthread_mutex_unlock(&g_lock);
+    }
     return enc;
 }
 
@@ -3413,7 +3550,8 @@ static void h_end(id self, SEL _cmd)
     if (!n) return;
     NSString *l = [self label];
     pthread_mutex_lock(&g_lock);
-    if (l) snprintf(n->label, sizeof n->label, "%s", l.UTF8String);
+    if (n->mtl4) snprintf(n->label, sizeof n->label, "MTL4 %s", l.length ? l.UTF8String : kind_name[n->kind]);
+    else if (l) snprintf(n->label, sizeof n->label, "%s", l.UTF8String);
     if (g_trace_enabled) trace_encoder_end(n);
     n->state = 2;
     for (unsigned i = 0; i < FP_OPENENC; i++) if (g_openenc[i].enc == (void *)self) { g_openenc[i].enc = NULL; g_openenc[i].uid = 0; }
@@ -3758,6 +3896,23 @@ static const hook_def device_hooks[] = {
     HD(H_DEV_NEWSEV, "newSharedEvent", h_dev_newsev),
     HD(H_DEV_NEWEV, "newEvent", h_dev_newev),
 };
+static const hook_def mtl4_device_hooks[] = {
+    HD(H_4_DEV_Q, "newMTL4CommandQueue", h_mtl4_dev_q),
+    HD(H_4_DEV_Q_DESC, "newMTL4CommandQueueWithDescriptor:error:", h_mtl4_dev_q_desc),
+    HD(H_4_DEV_CB, "newCommandBuffer", h_mtl4_dev_cb),
+};
+static const hook_def mtl4_cb_hooks[] = {
+    HD(H_4_BEGIN, "beginCommandBufferWithAllocator:", h_mtl4_begin),
+    HD(H_4_BEGIN_OPTS, "beginCommandBufferWithAllocator:options:", h_mtl4_begin_opts),
+    HD(H_4_END, "endCommandBuffer", h_mtl4_end),
+    HD(H_4_RENDER, "renderCommandEncoderWithDescriptor:", h_mtl4_render),
+    HD(H_4_RENDER_OPTS, "renderCommandEncoderWithDescriptor:options:", h_mtl4_render_opts),
+    HD(H_4_COMPUTE, "computeCommandEncoder", h_mtl4_compute),
+    HD(H_4_ML, "machineLearningCommandEncoder", h_mtl4_ml),
+};
+static const hook_def mtl4_encoder_hooks[] = {
+    HD(H_END, "endEncoding", h_end),
+};
 static const hook_def queue_hooks[] = {
     HD(H_Q_CB, "commandBuffer", h_q_cb),
     HD(H_Q_CBU, "commandBufferWithUnretainedReferences", h_q_cbu),
@@ -3859,10 +4014,16 @@ static void install(Class cls, int kind, const hook_def *defs, size_t n)
     pthread_mutex_unlock(&g_lock);
 }
 #define N(a) (sizeof a / sizeof a[0])
-static void hook_device(Class cls) { install(cls, 100, device_hooks, N(device_hooks)); }
+static void hook_device(Class cls)
+{
+    install(cls, 100, device_hooks, N(device_hooks));
+    if (@available(macOS 26.0, *)) install(cls, 104, mtl4_device_hooks, N(mtl4_device_hooks));
+}
 static void hook_queue(Class cls) { install(cls, 101, queue_hooks, N(queue_hooks)); }
 static void hook_cb(Class cls) { install(cls, 102, cb_hooks, N(cb_hooks)); }
 static void hook_event(Class cls) { install(cls, 103, event_hooks, N(event_hooks)); }
+static void hook_mtl4_cb(Class cls) { install(cls, 105, mtl4_cb_hooks, N(mtl4_cb_hooks)); }
+static void hook_mtl4_encoder(Class cls) { install(cls, 106, mtl4_encoder_hooks, N(mtl4_encoder_hooks)); }
 static void hook_encoder(Class cls, int kind)
 {
     if (kind == FPK_RENDER) install(cls, kind, render_hooks, N(render_hooks));
@@ -3881,6 +4042,7 @@ static void final_summary(void)
         pthread_mutex_unlock(&g_capture_lock);
     }
     if (g_st[ST_NODES]) summary(1);   /* helper processes that never encoded: quiet */
+    if (g_mtl4_ml_encoders) fp_log("fencepost: Metal 4 machine-learning encoders: %ld\n", g_mtl4_ml_encoders);
     if (g_trace_enabled) {
         pthread_mutex_lock(&g_lock);
         trace_final();
@@ -4103,7 +4265,7 @@ __attribute__((visibility("default"))) void fencepost_barrier(id cb)
 {
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)cb);
-    if (c) { fp_item it = { 3, 0, NULL, (uint64_t)c->nenc }; PUSH(c->it, c->nit, c->cit, it); }
+    if (c && !c->mtl4) { fp_item it = { 3, 0, NULL, (uint64_t)c->nenc }; PUSH(c->it, c->nit, c->cit, it); }
     pthread_mutex_unlock(&g_lock);
 }
 
