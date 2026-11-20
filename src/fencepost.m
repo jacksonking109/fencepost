@@ -162,6 +162,7 @@ static uint64_t *g_pend; static int g_npend, g_cpend;
 static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
 static long g_st[ST_COUNT];
 static long g_mtl4_ml_encoders, g_mtl4_gpu_errors;
+static atomic_long g_fp4_address_misses, g_fp4_id_misses;
 #ifdef FENCEPOST_TEST_HOOKS
 static unsigned g_mtl4_test_error_commit;
 #endif
@@ -1665,7 +1666,7 @@ typedef struct {
 
 typedef struct {
     long stats[ST_COUNT];
-    long mtl4_gpu_errors;
+    long mtl4_gpu_errors, mtl4_address_misses, mtl4_id_misses;
     uint64_t pool_exhausted, suppressed, evictions, cap_evictions, alloc_dropped;
     uint64_t origin;
     int stopped, sampling_supported;
@@ -1677,6 +1678,8 @@ static fp_trace_summary trace_summary_state(void)
         .pool_exhausted = g_trace_pool_exhausted, .stopped = g_trace_stopped,
         .origin = g_trace_origin, .sampling_supported = g_trace_sampling_supported,
         .mtl4_gpu_errors = g_mtl4_gpu_errors,
+        .mtl4_address_misses = atomic_load_explicit(&g_fp4_address_misses, memory_order_relaxed),
+        .mtl4_id_misses = atomic_load_explicit(&g_fp4_id_misses, memory_order_relaxed),
         .suppressed = g_suppressed, .evictions = g_ring_evictions, .cap_evictions = g_ring_cap_evictions,
         .alloc_dropped = g_trace_alloc_dropped
     };
@@ -1702,6 +1705,9 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
             state->stopped ? "true" : "false");
     for (int i = 0; i < ST_COUNT; i++) fprintf(f, ",\"%s\":%ld", stats[i], state->stats[i]);
     if (state->mtl4_gpu_errors) fprintf(f, ",\"mtl4_gpu_errors\":%ld", state->mtl4_gpu_errors);
+    if (state->mtl4_address_misses || state->mtl4_id_misses)
+        fprintf(f, ",\"mtl4_address_misses\":%ld,\"mtl4_resource_id_misses\":%ld",
+                state->mtl4_address_misses, state->mtl4_id_misses);
     static const char *const types[] = { "race", "possible", "order", "partial" };
     for (int i = 0; i < 4; i++)
         fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(totals.hits[i]),
@@ -2178,6 +2184,10 @@ static void summary(int final)
         fp_log("fencepost:   %ld uses of tracked resources skipped (Metal orders those itself)\n", g_st[ST_TRACKED]);
     if (g_mtl4_gpu_errors)
         fp_log("fencepost:   Metal 4 GPU commit errors: %ld\n", g_mtl4_gpu_errors);
+    long address_misses = atomic_load_explicit(&g_fp4_address_misses, memory_order_relaxed);
+    long id_misses = atomic_load_explicit(&g_fp4_id_misses, memory_order_relaxed);
+    if (address_misses || id_misses)
+        fp_log("fencepost:   Metal 4 unknown bindings: %ld GPU addresses, %ld resource IDs\n", address_misses, id_misses);
     fp_log("fencepost:   cost: %.2f s analysing at commit; %ld resources with live history%s\n",
            g_st[ST_ANALYSIS_NS] / 1e9, g_st[ST_OBJS], g_st[ST_OBJ_DROPS] ? " (TABLE FULL: some accesses not checked)" : "");
     frame_line();
@@ -2705,6 +2715,174 @@ static uint32_t tex_slices(id<MTLTexture> t)
     return n ? (uint32_t)n : 1;
 }
 
+/* Resource metadata outlives a lookup without retaining an application allocation. */
+typedef struct {
+    void *store;
+    uint64_t address, end, offset;
+    uint32_t level, levels, slice, slices;
+    int texture, shader_write;
+} fp4_resource;
+
+@interface FP4ResourceOwner : NSObject {
+@public
+    fp4_resource info;
+    uintptr_t device;
+    uint64_t resource_id;
+    int indexed;
+}
+@end
+
+typedef struct {
+    FP4ResourceOwner **items;
+    int n, cap, is_id;
+} fp4_resource_index;
+
+static fp4_resource_index g_fp4_addresses, g_fp4_ids = { .is_id = 1 };
+static pthread_mutex_t g_fp4_resource_lock = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t g_fp4_store_id;
+static char g_fp4_resource_key;
+
+static uint64_t fp4_index_key(const fp4_resource_index *index, const FP4ResourceOwner *owner)
+{
+    return index->is_id ? owner->resource_id : owner->info.address;
+}
+
+static int fp4_index_lower(const fp4_resource_index *index, uintptr_t device, uint64_t key)
+{
+    int lo = 0, hi = index->n;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        const FP4ResourceOwner *owner = index->items[mid];
+        if (owner->device < device || (owner->device == device && fp4_index_key(index, owner) < key)) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static void fp4_index_insert(fp4_resource_index *index, FP4ResourceOwner *owner)
+{
+    uint64_t start = fp4_index_key(index, owner);
+    int low = fp4_index_lower(index, owner->device, start), high = low;
+    if (index->is_id) {
+        if (high < index->n && index->items[high]->device == owner->device && index->items[high]->resource_id == start)
+            high++;
+    } else {
+        if (low && index->items[low - 1]->device == owner->device && index->items[low - 1]->info.end > start) low--;
+        high = fp4_index_lower(index, owner->device, owner->info.end);
+    }
+    if (high > low) {
+        memmove(index->items + low + 1, index->items + high,
+                (size_t)(index->n - high) * sizeof *index->items);
+        index->n -= high - low - 1;
+    } else {
+        PUSH(index->items, index->n, index->cap, owner);
+        memmove(index->items + low + 1, index->items + low,
+                (size_t)(index->n - low - 1) * sizeof *index->items);
+    }
+    index->items[low] = owner;
+    owner->indexed = 1;
+}
+
+@implementation FP4ResourceOwner
+- (void)dealloc
+{
+    if (indexed) {
+        pthread_mutex_lock(&g_fp4_resource_lock);
+        fp4_resource_index *index = resource_id ? &g_fp4_ids : &g_fp4_addresses;
+        int i = fp4_index_lower(index, device, fp4_index_key(index, self));
+        if (i < index->n && index->items[i] == self) {
+            index->n--;
+            memmove(index->items + i, index->items + i + 1, (size_t)(index->n - i) * sizeof *index->items);
+        }
+        pthread_mutex_unlock(&g_fp4_resource_lock);
+    }
+    [super dealloc];
+}
+@end
+
+static fp4_resource fp4_install_resource(id resource, FP4ResourceOwner *owner, int index_address)
+{
+    pthread_mutex_lock(&g_fp4_resource_lock);
+    FP4ResourceOwner *existing = objc_getAssociatedObject(resource, &g_fp4_resource_key);
+    if (!existing) {
+        /* Tagged keys distinguish allocation lifetimes and don't alias Metal 3
+         * object pointers in the shadow table. */
+        if (!owner->info.store) owner->info.store = (void *)((++g_fp4_store_id << 4) | 1);
+        if (owner->resource_id) fp4_index_insert(&g_fp4_ids, owner);
+        else if (index_address && owner->info.address && owner->info.end > owner->info.address)
+            fp4_index_insert(&g_fp4_addresses, owner);
+        objc_setAssociatedObject(resource, &g_fp4_resource_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        existing = owner;
+    }
+    fp4_resource info = existing->info;
+    pthread_mutex_unlock(&g_fp4_resource_lock);
+    [owner release];
+    return info;
+}
+
+static fp4_resource fp4_buffer(id<MTLBuffer> b)
+{
+    FP4ResourceOwner *existing = objc_getAssociatedObject(b, &g_fp4_resource_key);
+    if (existing) return existing->info;
+    if (!b) return (fp4_resource){0};
+    FP4ResourceOwner *owner = [[FP4ResourceOwner alloc] init];
+    owner->device = (uintptr_t)b.device;
+    if ([b respondsToSelector:@selector(gpuAddress)]) owner->info.address = b.gpuAddress;
+    uint64_t size = b.length, address = owner->info.address;
+    if (size <= UINT64_MAX - address) owner->info.end = address + size;
+    return fp4_install_resource(b, owner, 1);
+}
+
+static fp4_resource fp4_texture(id<MTLTexture> t)
+{
+    FP4ResourceOwner *existing = objc_getAssociatedObject(t, &g_fp4_resource_key);
+    if (existing) return existing->info;
+    if (!t) return (fp4_resource){0};
+    FP4ResourceOwner *owner = [[FP4ResourceOwner alloc] init];
+    owner->device = (uintptr_t)t.device;
+    fp4_resource *info = &owner->info;
+    info->texture = 1;
+    info->levels = MAX(1, t.mipmapLevelCount);
+    info->slices = tex_slices(t);
+    info->shader_write = (t.usage & MTLTextureUsageShaderWrite) != 0;
+    if ([t respondsToSelector:@selector(gpuResourceID)]) owner->resource_id = t.gpuResourceID._impl;
+
+    id<MTLTexture> parent = t;
+    while (parent.parentTexture) {
+        info->level += parent.parentRelativeLevel;
+        info->slice += parent.parentRelativeSlice;
+        parent = parent.parentTexture;
+    }
+    id<MTLBuffer> backing = parent.buffer;
+    if (backing) {
+        fp4_resource root = fp4_buffer(backing);
+        info->store = root.store;
+        info->address = root.address;
+        info->end = root.end;
+        info->offset = parent.bufferOffset;
+        info->texture = 0;
+    } else if (parent != t) info->store = fp4_texture(parent).store;
+    return fp4_install_resource(t, owner, 0);
+}
+
+static __attribute__((unused)) fp4_resource fp4_lookup(uintptr_t device, uint64_t key, int by_id)
+{
+    if (!key) return (fp4_resource){0};
+    pthread_mutex_lock(&g_fp4_resource_lock);
+    const fp4_resource_index *index = by_id ? &g_fp4_ids : &g_fp4_addresses;
+    int i = fp4_index_lower(index, device, key);
+    if (!by_id && i && (i == index->n || index->items[i]->device != device || index->items[i]->info.address != key)) i--;
+    FP4ResourceOwner *owner = i < index->n ? index->items[i] : nil;
+    fp4_resource info = {0};
+    if (owner && owner->device == device &&
+        (by_id ? owner->resource_id == key : owner->info.address <= key && key < owner->info.end))
+        info = owner->info;
+    pthread_mutex_unlock(&g_fp4_resource_lock);
+    if (!info.store)
+        atomic_fetch_add_explicit(by_id ? &g_fp4_id_misses : &g_fp4_address_misses, 1, memory_order_relaxed);
+    return info;
+}
+
 static int acc_buf(fp_node *n, id<MTLBuffer> b, uint64_t off, uint64_t end, int rw, int sf, int sl, int via)
 {
     if (!b || !n) return -1;
@@ -2800,6 +2978,10 @@ enum {
     H_4_RENDER, H_4_RENDER_OPTS, H_4_COMPUTE, H_4_ML,
     H_4_COMMIT, H_4_COMMIT_OPTS, H_4_SIGNAL, H_4_WAIT, H_4_DRAWABLE_SIGNAL, H_4_DRAWABLE_WAIT,
     H_4_OPTIONS_INIT, H_4_ADD_FEEDBACK,
+    H_4_NEW_HEAP, H_4_NEW_BUFFER, H_4_NEW_BYTES, H_4_NEW_BYTES_NOCOPY, H_4_NEW_SPARSE_BUFFER,
+    H_4_NEW_TEXTURE, H_4_NEW_IOSURFACE, H_4_SHARED_TEXTURE, H_4_SHARED_HANDLE,
+    H_4_HEAP_BUFFER_OFFSET, H_4_HEAP_TEXTURE_OFFSET, H_4_BUFFER_TEXTURE,
+    H_4_VIEW_FORMAT, H_4_VIEW_RANGE, H_4_VIEW_SWIZZLE, H_4_VIEW_DESC,
     H_COUNT
 };
 
@@ -2842,8 +3024,130 @@ static void hook_event(Class cls);
 static void hook_mtl4_cb(Class cls);
 static void hook_mtl4_encoder(Class cls);
 static void hook_mtl4_queue(Class cls);
+static void hook_mtl4_heap(Class cls);
+static void hook_mtl4_buffer(Class cls);
+static void hook_mtl4_texture(Class cls);
 
 /* device */
+
+static void on_mtl4_buffer(id buffer)
+{
+    if (!buffer) return;
+    fp4_buffer(buffer);
+    hook_mtl4_buffer(object_getClass(buffer));
+}
+
+static void on_mtl4_texture(id texture)
+{
+    if (!texture) return;
+    fp4_texture(texture);
+    hook_mtl4_texture(object_getClass(texture));
+}
+
+#define FP4_FACTORY1(fn, hook_id, type, observe) \
+    static id fn(id self, SEL _cmd, type arg) { \
+        ENTER; id result = ORIG(hook_id, id (*)(id, SEL, type))(self, _cmd, arg); LEAVE; \
+        if (OUTER) observe(result); \
+        return result; \
+    }
+
+static void on_mtl4_heap(id heap)
+{
+    if (heap) hook_mtl4_heap(object_getClass(heap));
+}
+FP4_FACTORY1(h_mtl4_new_heap, H_4_NEW_HEAP, id, on_mtl4_heap)
+FP4_FACTORY1(h_mtl4_new_texture, H_4_NEW_TEXTURE, id, on_mtl4_texture)
+FP4_FACTORY1(h_mtl4_shared_texture, H_4_SHARED_TEXTURE, id, on_mtl4_texture)
+FP4_FACTORY1(h_mtl4_shared_handle, H_4_SHARED_HANDLE, id, on_mtl4_texture)
+FP4_FACTORY1(h_mtl4_view_format, H_4_VIEW_FORMAT, NSUInteger, on_mtl4_texture)
+FP4_FACTORY1(h_mtl4_view_desc, H_4_VIEW_DESC, id, on_mtl4_texture)
+#undef FP4_FACTORY1
+
+static id h_mtl4_new_buffer(id self, SEL _cmd, NSUInteger len, NSUInteger options)
+{
+    ENTER; id b = ORIG(H_4_NEW_BUFFER, id (*)(id, SEL, NSUInteger, NSUInteger))(self, _cmd, len, options); LEAVE;
+    if (OUTER) on_mtl4_buffer(b);
+    return b;
+}
+
+static id h_mtl4_new_bytes(id self, SEL _cmd, const void *bytes, NSUInteger len, NSUInteger options)
+{
+    ENTER;
+    id b = ORIG(H_4_NEW_BYTES, id (*)(id, SEL, const void *, NSUInteger, NSUInteger))(self, _cmd, bytes, len, options);
+    LEAVE;
+    if (OUTER) on_mtl4_buffer(b);
+    return b;
+}
+
+static id h_mtl4_new_bytes_nocopy(id self, SEL _cmd, void *bytes, NSUInteger len, NSUInteger options, id dealloc)
+{
+    ENTER;
+    id b = ORIG(H_4_NEW_BYTES_NOCOPY, id (*)(id, SEL, void *, NSUInteger, NSUInteger, id))(self, _cmd,
+                                                                                        bytes, len, options, dealloc);
+    LEAVE;
+    if (OUTER) on_mtl4_buffer(b);
+    return b;
+}
+
+static id h_mtl4_sparse_buffer(id self, SEL _cmd, NSUInteger len, NSUInteger options, NSInteger page)
+{
+    ENTER;
+    id b = ORIG(H_4_NEW_SPARSE_BUFFER, id (*)(id, SEL, NSUInteger, NSUInteger, NSInteger))(self, _cmd, len, options, page);
+    LEAVE;
+    if (OUTER) on_mtl4_buffer(b);
+    return b;
+}
+
+static id h_mtl4_heap_buffer_offset(id self, SEL _cmd, NSUInteger len, NSUInteger options, NSUInteger offset)
+{
+    ENTER;
+    id b = ORIG(H_4_HEAP_BUFFER_OFFSET, id (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, len, options, offset);
+    LEAVE;
+    if (OUTER) on_mtl4_buffer(b);
+    return b;
+}
+
+static id h_mtl4_heap_texture_offset(id self, SEL _cmd, id desc, NSUInteger offset)
+{
+    ENTER; id t = ORIG(H_4_HEAP_TEXTURE_OFFSET, id (*)(id, SEL, id, NSUInteger))(self, _cmd, desc, offset); LEAVE;
+    if (OUTER) on_mtl4_texture(t);
+    return t;
+}
+
+static id h_mtl4_buffer_texture(id self, SEL _cmd, id desc, NSUInteger offset, NSUInteger row)
+{
+    ENTER; id t = ORIG(H_4_BUFFER_TEXTURE, id (*)(id, SEL, id, NSUInteger, NSUInteger))(self, _cmd, desc, offset, row); LEAVE;
+    if (OUTER) on_mtl4_texture(t);
+    return t;
+}
+
+static id h_mtl4_iosurface(id self, SEL _cmd, id desc, IOSurfaceRef surface, NSUInteger plane)
+{
+    ENTER; id t = ORIG(H_4_NEW_IOSURFACE, id (*)(id, SEL, id, IOSurfaceRef, NSUInteger))(self, _cmd, desc, surface, plane); LEAVE;
+    if (OUTER) on_mtl4_texture(t);
+    return t;
+}
+
+static id h_mtl4_view_range(id self, SEL _cmd, NSUInteger format, NSUInteger type, NSRange levels, NSRange slices)
+{
+    ENTER;
+    id t = ORIG(H_4_VIEW_RANGE, id (*)(id, SEL, NSUInteger, NSUInteger, NSRange, NSRange))(self, _cmd,
+                                                                                       format, type, levels, slices);
+    LEAVE;
+    if (OUTER) on_mtl4_texture(t);
+    return t;
+}
+
+static id h_mtl4_view_swizzle(id self, SEL _cmd, NSUInteger format, NSUInteger type, NSRange levels, NSRange slices,
+                             MTLTextureSwizzleChannels channels)
+{
+    ENTER;
+    id t = ORIG(H_4_VIEW_SWIZZLE, id (*)(id, SEL, NSUInteger, NSUInteger, NSRange, NSRange, MTLTextureSwizzleChannels))
+                (self, _cmd, format, type, levels, slices, channels);
+    LEAVE;
+    if (OUTER) on_mtl4_texture(t);
+    return t;
+}
 
 static void on_queue(id q)
 {
@@ -4383,6 +4687,30 @@ static const hook_def mtl4_device_hooks[] = {
     HD(H_4_DEV_Q, "newMTL4CommandQueue", h_mtl4_dev_q),
     HD(H_4_DEV_Q_DESC, "newMTL4CommandQueueWithDescriptor:error:", h_mtl4_dev_q_desc),
     HD(H_4_DEV_CB, "newCommandBuffer", h_mtl4_dev_cb),
+    HD(H_4_NEW_HEAP, "newHeapWithDescriptor:", h_mtl4_new_heap),
+    HD(H_4_NEW_BUFFER, "newBufferWithLength:options:", h_mtl4_new_buffer),
+    HD(H_4_NEW_BYTES, "newBufferWithBytes:length:options:", h_mtl4_new_bytes),
+    HD(H_4_NEW_BYTES_NOCOPY, "newBufferWithBytesNoCopy:length:options:deallocator:", h_mtl4_new_bytes_nocopy),
+    HD(H_4_NEW_SPARSE_BUFFER, "newBufferWithLength:options:placementSparsePageSize:", h_mtl4_sparse_buffer),
+    HD(H_4_NEW_TEXTURE, "newTextureWithDescriptor:", h_mtl4_new_texture),
+    HD(H_4_NEW_IOSURFACE, "newTextureWithDescriptor:iosurface:plane:", h_mtl4_iosurface),
+    HD(H_4_SHARED_TEXTURE, "newSharedTextureWithDescriptor:", h_mtl4_shared_texture),
+    HD(H_4_SHARED_HANDLE, "newSharedTextureWithHandle:", h_mtl4_shared_handle),
+};
+static const hook_def mtl4_heap_hooks[] = {
+    HD(H_4_NEW_BUFFER, "newBufferWithLength:options:", h_mtl4_new_buffer),
+    HD(H_4_HEAP_BUFFER_OFFSET, "newBufferWithLength:options:offset:", h_mtl4_heap_buffer_offset),
+    HD(H_4_NEW_TEXTURE, "newTextureWithDescriptor:", h_mtl4_new_texture),
+    HD(H_4_HEAP_TEXTURE_OFFSET, "newTextureWithDescriptor:offset:", h_mtl4_heap_texture_offset),
+};
+static const hook_def mtl4_buffer_hooks[] = {
+    HD(H_4_BUFFER_TEXTURE, "newTextureWithDescriptor:offset:bytesPerRow:", h_mtl4_buffer_texture),
+};
+static const hook_def mtl4_texture_hooks[] = {
+    HD(H_4_VIEW_FORMAT, "newTextureViewWithPixelFormat:", h_mtl4_view_format),
+    HD(H_4_VIEW_RANGE, "newTextureViewWithPixelFormat:textureType:levels:slices:", h_mtl4_view_range),
+    HD(H_4_VIEW_SWIZZLE, "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:", h_mtl4_view_swizzle),
+    HD(H_4_VIEW_DESC, "newTextureViewWithDescriptor:", h_mtl4_view_desc),
 };
 static const hook_def mtl4_cb_hooks[] = {
     HD(H_4_BEGIN, "beginCommandBufferWithAllocator:", h_mtl4_begin),
@@ -4516,6 +4844,9 @@ static void hook_event(Class cls) { install(cls, 103, event_hooks, N(event_hooks
 static void hook_mtl4_cb(Class cls) { install(cls, 105, mtl4_cb_hooks, N(mtl4_cb_hooks)); }
 static void hook_mtl4_encoder(Class cls) { install(cls, 106, mtl4_encoder_hooks, N(mtl4_encoder_hooks)); }
 static void hook_mtl4_queue(Class cls) { install(cls, 107, mtl4_queue_hooks, N(mtl4_queue_hooks)); }
+static void hook_mtl4_heap(Class cls) { install(cls, 108, mtl4_heap_hooks, N(mtl4_heap_hooks)); }
+static void hook_mtl4_buffer(Class cls) { install(cls, 109, mtl4_buffer_hooks, N(mtl4_buffer_hooks)); }
+static void hook_mtl4_texture(Class cls) { install(cls, 110, mtl4_texture_hooks, N(mtl4_texture_hooks)); }
 static void hook_encoder(Class cls, int kind)
 {
     if (kind == FPK_RENDER) install(cls, kind, render_hooks, N(render_hooks));
