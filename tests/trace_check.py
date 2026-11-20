@@ -106,6 +106,7 @@ def check_trace(events, args):
     track_names = {event["tid"]: event["args"]["name"] for event in events if event["name"] == "thread_name"}
     slices = [event for event in events if event["ph"] == "X"]
     command_buffers = {event["args"]["uid"]: event for event in slices if event["cat"] == "command buffer"}
+    standalone_signals = {event["args"]["uid"]: event for event in slices if event["cat"] == "event signal"}
 
     def cpu_domain(event):
         return "(CPU encode time)" in track_names[event["tid"]]
@@ -167,10 +168,14 @@ def check_trace(events, args):
         else:
             target = encoders[second]
             if cat == "event":
-                matches = [event for event in command_buffers.values()
-                           if event["tid"] == start["tid"] and event["ts"] <= start["ts"] < slice_end(event)]
-                assert len(matches) == 1, start
-                source = matches[0]
+                if first in standalone_signals:
+                    source = standalone_signals[first]
+                    assert source["args"]["estimated"] is True
+                else:
+                    matches = [event for event in command_buffers.values()
+                               if event["tid"] == start["tid"] and event["ts"] <= start["ts"] < slice_end(event)]
+                    assert len(matches) == 1, start
+                    source = matches[0]
             else:
                 source = encoders[first]
         assert cpu_domain(start) == cpu_domain(finish), (start, finish)
