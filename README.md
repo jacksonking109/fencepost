@@ -1,7 +1,7 @@
 # fencepost
 
-A race detector for Metal GPU synchronisation. Inject it into any Metal program and it reports two encoders that
-touch the same memory with nothing ordering them: the missing `MTLFence`.
+A race detector for Metal 3 GPU synchronisation, with timeline support for Metal 4. Inject it into a Metal 3
+program to find encoders that touch the same memory without a fence or other synchronisation.
 
 ```
 DYLD_INSERT_LIBRARIES=/path/to/libfencepost.dylib  your-metal-program
@@ -112,6 +112,18 @@ for the descriptorless calls). A program that attaches its own counter sample bu
 such as Madeira with `gpu-pass-profile`, keeps its samples. Fencepost skips sampling those encoders and also skips
 sampling if all attachment slots are occupied. A capture can change the timing of the work it observes.
 Set `FENCEPOST_TRACE_GPU=0` to disable encoder counter sampling and keep command buffer GPU timing.
+
+## Metal 4
+
+On macOS 26 and later, fencepost records Metal 4 queues, render and compute encoders (including blit commands),
+and event signals and waits. Each queue commit has one measured GPU span, including commits that batch several
+logical command buffers. Encoders appear in submission and encoding order with estimated GPU positions.
+Machine-learning encoders are counted in the log.
+
+`signalDrawable:` marks the end of a frame. Programs can use `fencepost_frame` to supply their own frame
+boundaries. Ring dumps support manual requests, frame spikes, and GPU errors reported by commit feedback.
+Metal 4 race detection is pending. `FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
+because fencepost learns the submitting queue after encoding.
 
 The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
 process stopped before writing the closing bracket.
