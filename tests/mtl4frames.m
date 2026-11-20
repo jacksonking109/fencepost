@@ -3,13 +3,114 @@
 #import <QuartzCore/CAMetalLayer.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include <time.h>
 
-enum { FrameCount = 6, BufferSize = 16 };
+enum { FrameCount = 6, BufferSize = 16, ThreadCommits = 256, ThreadSlots = 8 };
 
 static int fail(const char *message)
 {
     fprintf(stderr, "mtl4frames: %s\n", message);
     return 1;
+}
+
+static bool wait_cpu(dispatch_semaphore_t ready)
+{
+    return dispatch_semaphore_wait(ready, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0;
+}
+
+API_AVAILABLE(macos(26.0))
+static bool submit_thread(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTLSharedEvent> event,
+                          id<MTLBuffer> source, id<MTLBuffer> dest, dispatch_semaphore_t signal_scheduled,
+                          bool producer, atomic_int *callbacks, atomic_int *errors)
+{
+    id<MTL4CommandBuffer> cb = [device newCommandBuffer];
+    MTL4CommitOptions *opts = [MTL4CommitOptions new];
+    id<MTL4CommandAllocator> allocators[ThreadSlots];
+    dispatch_semaphore_t retired[ThreadSlots];
+    if (!cb || !opts) return false;
+    for (int slot = 0; slot < ThreadSlots; slot++) {
+        allocators[slot] = [device newCommandAllocator];
+        retired[slot] = dispatch_semaphore_create(0);
+        if (!allocators[slot]) return false;
+    }
+    for (NSUInteger i = 0; i < ThreadCommits; i++) @autoreleasepool {
+        NSUInteger slot = i % ThreadSlots, offset = i * BufferSize;
+        id<MTL4CommandAllocator> allocator = allocators[slot];
+        dispatch_semaphore_t done = retired[slot];
+        if (i >= ThreadSlots) {
+            if (!wait_cpu(done)) return false;
+            [allocator reset];
+        }
+        if (!producer) {
+            // The producer publishes only after submitting this signal to Metal.
+            if (!wait_cpu(signal_scheduled)) return false;
+            [queue waitForEvent:event value:i + 1];
+        }
+        [cb beginCommandBufferWithAllocator:allocator];
+        id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return false;
+        if (producer)
+            [enc fillBuffer:source range:NSMakeRange(offset, BufferSize) value:(uint8_t)i];
+        else
+            [enc copyFromBuffer:source sourceOffset:offset toBuffer:dest destinationOffset:offset size:BufferSize];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            if (feedback.error) atomic_fetch_add(errors, 1);
+            atomic_fetch_add(callbacks, 1);
+            dispatch_semaphore_signal(done);
+        }];
+        [queue commit:&cb count:1 options:opts];
+        if (producer) {
+            [queue signalEvent:event value:i + 1];
+            dispatch_semaphore_signal(signal_scheduled);
+        }
+    }
+    for (int slot = 0; slot < ThreadSlots; slot++)
+        if (!wait_cpu(retired[slot])) return false;
+    return true;
+}
+
+API_AVAILABLE(macos(26.0))
+static int run_threads(id<MTLDevice> device)
+{
+    id<MTL4CommandQueue> producer = [device newMTL4CommandQueue], consumer = [device newMTL4CommandQueue];
+    id<MTLSharedEvent> event = [device newSharedEvent];
+    id<MTLBuffer> source = [device newBufferWithLength:ThreadCommits * BufferSize options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dest = [device newBufferWithLength:ThreadCommits * BufferSize options:MTLResourceStorageModeShared];
+    id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    if (!producer || !consumer || !event || !source || !dest || !residency) return fail("thread setup failed");
+    [residency addAllocation:source];
+    [residency addAllocation:dest];
+    [residency commit];
+    [producer addResidencySet:residency];
+    [consumer addResidencySet:residency];
+    memset(dest.contents, 0xFE, dest.length);
+    dispatch_group_t threads = dispatch_group_create();
+    dispatch_semaphore_t signal_scheduled = dispatch_semaphore_create(0);
+    __block atomic_int writes = 0, reads = 0, errors = 0;
+    __block bool producer_ok = false, consumer_ok = false;
+    uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    dispatch_group_async(threads, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        producer_ok = submit_thread(device, producer, event, source, dest, signal_scheduled, true, &writes, &errors);
+    });
+    dispatch_group_async(threads, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        consumer_ok = submit_thread(device, consumer, event, source, dest, signal_scheduled, false, &reads, &errors);
+    });
+    if (dispatch_group_wait(threads, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) || !producer_ok || !consumer_ok)
+        return fail("threaded submissions did not complete");
+    double wall_ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6;
+    unsigned checksum = 0;
+    const uint8_t *bytes = dest.contents;
+    for (unsigned i = 0; i < ThreadCommits * BufferSize; i++) {
+        if (bytes[i] != i / BufferSize) return fail("threaded copy mismatch");
+        checksum += bytes[i];
+    }
+    int nwrite = atomic_load(&writes), nread = atomic_load(&reads), nerror = atomic_load(&errors);
+    printf("threaded commits=%d checksum=%u producer_feedback=%d consumer_feedback=%d errors=%d\n",
+           ThreadCommits * 2, checksum, nwrite, nread, nerror);
+    printf("threaded wall time %.3f ms\n", wall_ms);
+    return nwrite != ThreadCommits || nread != ThreadCommits || nerror != 0;
 }
 
 API_AVAILABLE(macos(26.0))
@@ -173,15 +274,17 @@ int main(int argc, const char **argv)
 {
     @autoreleasepool {
         setvbuf(stdout, NULL, _IOLBF, 0);
-        bool drawable = false, pause_for_trigger = false;
+        bool drawable = false, pause_for_trigger = false, threaded = false;
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--drawable")) drawable = true;
             else if (!strcmp(argv[i], "--trigger")) pause_for_trigger = true;
-            else return fail("usage: mtl4frames [--drawable] [--trigger]");
+            else if (!strcmp(argv[i], "--threads")) threaded = true;
+            else return fail("usage: mtl4frames [--drawable] [--trigger] | --threads");
         }
         if (@available(macOS 26.0, *)) {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            if (device && [device supportsFamily:MTLGPUFamilyMetal4]) return run(device, drawable, pause_for_trigger);
+            if (device && [device supportsFamily:MTLGPUFamilyMetal4])
+                return threaded ? run_threads(device) : run(device, drawable, pause_for_trigger);
         }
         puts("skip: Metal 4 unavailable");
         return 77;

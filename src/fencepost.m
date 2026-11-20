@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#include <Block.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <errno.h>
@@ -144,7 +145,7 @@ typedef struct { void *ev; int known, gpu; uint64_t cpu_max; struct { uint64_t v
     (arr) = realloc((arr), (size_t)(cap) * sizeof *(arr)); } (arr)[(n)++] = (val); } while (0)
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_mtl4_submit_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_mtl4_options_lock = PTHREAD_MUTEX_INITIALIZER;
 static fp_node g_pool[FP_POOL];
 static fp_cb g_cbs[FP_CBPOOL];
 static fp_queue g_q[FP_MAXQ]; static int g_nq;
@@ -2747,6 +2748,7 @@ enum {
     H_4_DEV_Q, H_4_DEV_Q_DESC, H_4_DEV_CB, H_4_BEGIN, H_4_BEGIN_OPTS, H_4_END,
     H_4_RENDER, H_4_RENDER_OPTS, H_4_COMPUTE, H_4_ML,
     H_4_COMMIT, H_4_COMMIT_OPTS, H_4_SIGNAL, H_4_WAIT, H_4_DRAWABLE_SIGNAL, H_4_DRAWABLE_WAIT,
+    H_4_OPTIONS_INIT, H_4_ADD_FEEDBACK,
     H_COUNT
 };
 
@@ -3638,9 +3640,17 @@ static void trace_mtl4_submit(fp_queue *q, fp_trace_cb *trace)
 
 static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUInteger count)
 {
-    if (!count || count > (SIZE_MAX - sizeof(fp_mtl4_submission)) / sizeof(uint64_t)) return NULL;
+    char local_labels[4][sizeof ((fp_cb *)0)->label];
+    if (!count || count > MIN((SIZE_MAX - sizeof(fp_mtl4_submission)) / sizeof(uint64_t),
+                             SIZE_MAX / sizeof local_labels[0])) return NULL;
     fp_mtl4_submission *submission = calloc(1, sizeof *submission + count * sizeof submission->cbs[0]);
     if (!submission) return NULL;
+    char (*labels)[sizeof local_labels[0]] = count <= 4 ? local_labels : malloc(count * sizeof local_labels[0]);
+    if (!labels) { free(submission); return NULL; }
+    for (NSUInteger i = 0; i < count; i++) {
+        const char *label = [[buffers[i] label] UTF8String];
+        snprintf(labels[i], sizeof labels[i], "%s", label ?: "");
+    }
     pthread_mutex_lock(&g_lock);
     fp_queue *q = queue_get_kind((void *)queue, 1);
     if (q) {
@@ -3652,8 +3662,7 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
             id cb = buffers[i];
             fp_cb *c = cb_find_open((void *)cb);
             if (!c || !c->mtl4 || c->state != 2) continue;
-            const char *label = [[cb label] UTF8String];
-            if (label) snprintf(c->label, sizeof c->label, "%s", label);
+            snprintf(c->label, sizeof c->label, "%s", labels[i]);
             c->q = q;
             c->commit_tick = tick;
             submission->cbs[submission->ncbs++] = c->uid;
@@ -3669,6 +3678,7 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
         if (g_trace) trace_stream_flush();
     }
     pthread_mutex_unlock(&g_lock);
+    if (labels != local_labels) free(labels);
     if (submission->ncbs) return submission;
     free(submission);
     return NULL;
@@ -3701,41 +3711,93 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
     free(submission);
 }
 
-API_AVAILABLE(macos(26.0))
-static int mtl4_add_feedback(id queue, const id *buffers, NSUInteger count, MTL4CommitOptions *options)
+@interface FPMTL4Callbacks : NSObject {
+@public
+    NSMutableArray *blocks;
+}
+@end
+
+@implementation FPMTL4Callbacks
+- (void)dealloc
 {
-    if (![options respondsToSelector:@selector(addFeedbackHandler:)]) return 0;
-    fp_mtl4_submission *submission = mtl4_record_commit(queue, buffers, count);
-    if (!submission) return 0;
-    /* Metal consumes the registered blocks at submission. Appending one per
-     * call preserves app registrations and also works when it reuses options. */
-    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-        mtl4_completed(submission, feedback);
-    }];
-    return 1;
+    [blocks release];
+    [super dealloc];
+}
+@end
+
+static Class g_mtl4_options_class;
+static char g_mtl4_callbacks_key;
+
+static id h_mtl4_options_init(id self, SEL _cmd)
+{
+    id options = ORIG(H_4_OPTIONS_INIT, id (*)(id, SEL))(self, _cmd);
+    if (!tl_depth && object_getClass(options) == g_mtl4_options_class) {
+        FPMTL4Callbacks *callbacks = [[FPMTL4Callbacks alloc] init];
+        objc_setAssociatedObject(options, &g_mtl4_callbacks_key, callbacks, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [callbacks release];
+    }
+    return options;
 }
 
-/* Keep the registration and native submission together, including when the
- * same options object is used by different queues. Nested calls pass through. */
+static void h_mtl4_app_feedback(id self, SEL _cmd, void (^handler)(id))
+{
+    FPMTL4Callbacks *callbacks = objc_getAssociatedObject(self, &g_mtl4_callbacks_key);
+    if (!callbacks || !handler) {
+        ORIG(H_4_ADD_FEEDBACK, void (*)(id, SEL, void (^)(id)))(self, _cmd, handler);
+        return;
+    }
+    void (^copied)(id) = Block_copy(handler);
+    pthread_mutex_lock(&g_mtl4_options_lock);
+    if (!callbacks->blocks) callbacks->blocks = [[NSMutableArray alloc] init];
+    [callbacks->blocks addObject:copied];
+    pthread_mutex_unlock(&g_mtl4_options_lock);
+    Block_release(copied);
+}
+
+API_AVAILABLE(macos(26.0))
+static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUInteger count, id app_options)
+{
+    FPMTL4Callbacks *callbacks = app_options ? objc_getAssociatedObject(app_options, &g_mtl4_callbacks_key) : nil;
+    if (app_options && !callbacks) return nil;
+    MTL4CommitOptions *opts = [[g_mtl4_options_class alloc] init];
+    if (!opts) return nil;
+
+    /* Metal consumes the app's registrations once per submission. Take that
+     * list under a short lock and replay it on private, per-commit options.
+     * Native submission can block and must never hold a fencepost lock. */
+    if (callbacks) {
+        pthread_mutex_lock(&g_mtl4_options_lock);
+        NSArray *blocks = callbacks->blocks;
+        callbacks->blocks = nil;
+        pthread_mutex_unlock(&g_mtl4_options_lock);
+        for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
+        [blocks release];
+    }
+    fp_mtl4_submission *submission = mtl4_record_commit(queue, buffers, count);
+    if (submission)
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            mtl4_completed(submission, feedback);
+        }];
+    return opts;
+}
+
 static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count)
 {
     ENTER;
     int submitted = 0;
     if (OUTER) {
-        pthread_mutex_lock(&g_mtl4_submit_lock);
         if (@available(macOS 26.0, *)) {
             if (count && [self respondsToSelector:@selector(commit:count:options:)]) {
-                MTL4CommitOptions *options = [[NSClassFromString(@"MTL4CommitOptions") alloc] init];
-                if (mtl4_add_feedback(self, buffers, count, options)) {
-                    [(id<MTL4CommandQueue>)self commit:(const id<MTL4CommandBuffer> *)buffers count:count options:options];
+                MTL4CommitOptions *opts = mtl4_submit_options(self, buffers, count, nil);
+                if (opts) {
+                    [(id<MTL4CommandQueue>)self commit:(const id<MTL4CommandBuffer> *)buffers count:count options:opts];
                     submitted = 1;
+                    [opts release];
                 }
-                [options release];
             }
         }
     }
     if (!submitted) ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
-    if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
     LEAVE;
     if (submitted) maybe_summary();
 }
@@ -3743,15 +3805,14 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
 static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger count, id options)
 {
     ENTER;
-    int recorded = 0;
-    if (OUTER) {
-        pthread_mutex_lock(&g_mtl4_submit_lock);
-        if (@available(macOS 26.0, *)) recorded = mtl4_add_feedback(self, buffers, count, options);
+    id opts = nil;
+    if (OUTER && options) {
+        if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options);
     }
-    ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, options);
-    if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
+    ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, opts ?: options);
+    [opts release];
     LEAVE;
-    if (recorded) maybe_summary();
+    if (opts) maybe_summary();
 }
 
 static void trace_mtl4_signal(fp_queue *q, uint64_t uid, uint64_t value)
@@ -3804,35 +3865,27 @@ static void mtl4_record_event(id queue, fp_item item)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* Record ordered calls before entering Metal. Calls that overlap on the
+ * same queue have no app-defined order; the detector uses hook entry order. */
 static void h_mtl4_signal(id self, SEL _cmd, id event, uint64_t value)
 {
     ENTER;
-    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
+    if (OUTER) mtl4_record_event(self, (fp_item){ 1, 0, (void *)event, value });
     ORIG(H_4_SIGNAL, void (*)(id, SEL, id, uint64_t))(self, _cmd, event, value);
-    if (OUTER) {
-        mtl4_record_event(self, (fp_item){ 1, 0, (void *)event, value });
-        pthread_mutex_unlock(&g_mtl4_submit_lock);
-    }
     LEAVE;
 }
 
 static void h_mtl4_wait(id self, SEL _cmd, id event, uint64_t value)
 {
     ENTER;
-    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
+    if (OUTER) mtl4_record_event(self, (fp_item){ 2, 0, (void *)event, value });
     ORIG(H_4_WAIT, void (*)(id, SEL, id, uint64_t))(self, _cmd, event, value);
-    if (OUTER) {
-        mtl4_record_event(self, (fp_item){ 2, 0, (void *)event, value });
-        pthread_mutex_unlock(&g_mtl4_submit_lock);
-    }
     LEAVE;
 }
 
 static void h_mtl4_drawable_signal(id self, SEL _cmd, id drawable)
 {
     ENTER;
-    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
-    ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
     if (OUTER) {
         pthread_mutex_lock(&g_lock);
         if (!g_frame_api) {
@@ -3840,19 +3893,17 @@ static void h_mtl4_drawable_signal(id self, SEL _cmd, id drawable)
             process_pending(0);
         }
         pthread_mutex_unlock(&g_lock);
-        pthread_mutex_unlock(&g_mtl4_submit_lock);
     }
+    ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
     LEAVE;
 }
 
 static void h_mtl4_drawable_wait(id self, SEL _cmd, id drawable)
 {
     /* This acquires the drawable for upcoming work, which ends at signalDrawable:. */
-    ENTER;
-    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
+    tl_depth++;
     ORIG(H_4_DRAWABLE_WAIT, void (*)(id, SEL, id))(self, _cmd, drawable);
-    if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
-    LEAVE;
+    tl_depth--;
 }
 
 /* shared event, CPU side */
@@ -4573,6 +4624,15 @@ static void trace_init(const char *path)
 
 __attribute__((constructor)) static void fp_init(void)
 {
+    if (@available(macOS 26.0, *)) {
+        g_mtl4_options_class = objc_lookUpClass("MTL4CommitOptions");
+        if (g_mtl4_options_class) {
+            pthread_mutex_lock(&g_lock);
+            hook(g_mtl4_options_class, H_4_OPTIONS_INIT, "init", (IMP)h_mtl4_options_init);
+            hook(g_mtl4_options_class, H_4_ADD_FEEDBACK, "addFeedbackHandler:", (IMP)h_mtl4_app_feedback);
+            pthread_mutex_unlock(&g_lock);
+        }
+    }
     g_spike_enabled = strcmp(getenv("FENCEPOST_SPIKE") ?: "", "0") != 0;
     const char *p = getenv("FENCEPOST_LOG");
     if (p && *p) g_out = fp_open_path(p, "a");
