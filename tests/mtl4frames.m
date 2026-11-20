@@ -19,9 +19,15 @@ static bool wait_cpu(dispatch_semaphore_t ready)
     return dispatch_semaphore_wait(ready, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0;
 }
 
+typedef struct {
+    atomic_int inside;
+    atomic_bool overlapped;
+} SubmitOverlap;
+
 API_AVAILABLE(macos(26.0))
 static bool submit_thread(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTLSharedEvent> event,
                           id<MTLBuffer> source, id<MTLBuffer> dest, dispatch_semaphore_t signal_scheduled,
+                          dispatch_group_t first_submit, SubmitOverlap *overlap,
                           bool producer, atomic_int *callbacks, atomic_int *errors)
 {
     id<MTL4CommandBuffer> cb = [device newCommandBuffer];
@@ -42,7 +48,7 @@ static bool submit_thread(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<M
             if (!wait_cpu(done)) return false;
             [allocator reset];
         }
-        if (!producer) {
+        if (!producer && i) {
             // The producer publishes only after submitting this signal to Metal.
             if (!wait_cpu(signal_scheduled)) return false;
             [queue waitForEvent:event value:i + 1];
@@ -50,8 +56,8 @@ static bool submit_thread(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<M
         [cb beginCommandBufferWithAllocator:allocator];
         id<MTL4ComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (!enc) return false;
-        if (producer)
-            [enc fillBuffer:source range:NSMakeRange(offset, BufferSize) value:(uint8_t)i];
+        if (producer || !i)
+            [enc fillBuffer:producer ? source : dest range:NSMakeRange(offset, BufferSize) value:(uint8_t)i];
         else
             [enc copyFromBuffer:source sourceOffset:offset toBuffer:dest destinationOffset:offset size:BufferSize];
         [enc endEncoding];
@@ -61,8 +67,17 @@ static bool submit_thread(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<M
             atomic_fetch_add(callbacks, 1);
             dispatch_semaphore_signal(done);
         }];
+        if (atomic_fetch_add(&overlap->inside, 1)) atomic_store(&overlap->overlapped, true);
+        if (!i) {
+            // First commits use independent buffers. Bring both submitters to
+            // the call together without introducing a GPU dependency.
+            dispatch_group_leave(first_submit);
+            if (dispatch_group_wait(first_submit, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
+                return false;
+        }
         [queue commit:&cb count:1 options:opts];
-        if (producer) {
+        atomic_fetch_sub(&overlap->inside, 1);
+        if (producer && i) {
             [queue signalEvent:event value:i + 1];
             dispatch_semaphore_signal(signal_scheduled);
         }
@@ -88,18 +103,25 @@ static int run_threads(id<MTLDevice> device)
     [consumer addResidencySet:residency];
     memset(dest.contents, 0xFE, dest.length);
     dispatch_group_t threads = dispatch_group_create();
+    dispatch_group_t first_submit = dispatch_group_create();
+    dispatch_group_enter(first_submit);
+    dispatch_group_enter(first_submit);
     dispatch_semaphore_t signal_scheduled = dispatch_semaphore_create(0);
     __block atomic_int writes = 0, reads = 0, errors = 0;
     __block bool producer_ok = false, consumer_ok = false;
+    __block SubmitOverlap overlap = { 0 };
     uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     dispatch_group_async(threads, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        producer_ok = submit_thread(device, producer, event, source, dest, signal_scheduled, true, &writes, &errors);
+        producer_ok = submit_thread(device, producer, event, source, dest, signal_scheduled,
+                                    first_submit, &overlap, true, &writes, &errors);
     });
     dispatch_group_async(threads, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        consumer_ok = submit_thread(device, consumer, event, source, dest, signal_scheduled, false, &reads, &errors);
+        consumer_ok = submit_thread(device, consumer, event, source, dest, signal_scheduled,
+                                    first_submit, &overlap, false, &reads, &errors);
     });
     if (dispatch_group_wait(threads, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) || !producer_ok || !consumer_ok)
         return fail("threaded submissions did not complete");
+    if (!atomic_load(&overlap.overlapped)) return fail("submit paths did not overlap");
     double wall_ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - started) / 1e6;
     unsigned checksum = 0;
     const uint8_t *bytes = dest.contents;
@@ -108,7 +130,7 @@ static int run_threads(id<MTLDevice> device)
         checksum += bytes[i];
     }
     int nwrite = atomic_load(&writes), nread = atomic_load(&reads), nerror = atomic_load(&errors);
-    printf("threaded commits=%d checksum=%u producer_feedback=%d consumer_feedback=%d errors=%d\n",
+    printf("threaded commits=%d checksum=%u producer_feedback=%d consumer_feedback=%d errors=%d overlap=yes\n",
            ThreadCommits * 2, checksum, nwrite, nread, nerror);
     printf("threaded wall time %.3f ms\n", wall_ms);
     return nwrite != ThreadCommits || nread != ThreadCommits || nerror != 0;

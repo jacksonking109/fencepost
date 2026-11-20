@@ -69,7 +69,7 @@ def clean_env():
 
 def check_threads(arch):
     env = clean_env()
-    result = "threaded commits=512 checksum=522240 producer_feedback=256 consumer_feedback=256 errors=0"
+    result = "threaded commits=512 checksum=522240 producer_feedback=256 consumer_feedback=256 errors=0 overlap=yes"
     timing = {False: [], True: []}
     prefix = "threaded wall time "
     for i in range(5):
