@@ -320,6 +320,12 @@ int main(int argc, const char **argv)
         bool drawable = false, pause_for_trigger = false, threaded = false;
         int wait_mode = WaitDefault;
         unsigned frames = FrameCount;
+        if (argc == 2 && !strcmp(argv[1], "--wait-source")) {
+            int (*test_source)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_wait_source");
+            if (!test_source || !test_source()) return fail("first pending signal was bypassed");
+            puts("cross-queue wait selected the first signal");
+            return 0;
+        }
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--drawable")) drawable = true;
             else if (!strcmp(argv[i], "--trigger")) pause_for_trigger = true;

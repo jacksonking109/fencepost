@@ -88,7 +88,7 @@ typedef struct {
 } fp_acc;
 
 typedef struct { uint64_t src; uint8_t after, before; } fp_edge;
-typedef struct { void *ev; uint64_t val; uint8_t before; } fp_evwait;
+typedef struct { void *ev; uint64_t val, queue_seq; uint8_t before; } fp_evwait;
 typedef struct { void *f; uint64_t src; uint8_t st; } fp_fwait;
 typedef struct { void *f; uint8_t st; } fp_fupd;
 
@@ -2420,27 +2420,21 @@ static int ready(fp_node *n, int force)
         if (!ev || !ev->known) done = 1;   /* event made outside our view (e.g. from a mach port): CPU-side */
         else {
             int pending_signal = 0;
-            uint64_t source = 0, first_settled = UINT64_MAX;
             unsigned first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
             for (unsigned k = first; k < ev->nh; k++) {
                 if (ev->h[k % FP_EVHIST].val < w.val) continue;
                 uint64_t uid = ev->h[k % FP_EVHIST].uid;
                 fp_node *signal = node_get(uid);
-                if (signal && signal->req_q == n->req_q && signal->queue_seq >= n->queue_seq) continue;
-                /* An unresolved signal may itself be blocked by this wait,
-                 * including through another queue. Only use settled sources. */
-                if (signal && !signal->aseq) { pending_signal = 1; continue; }
-                /* Prefer the first settled signal that reaches the requested
-                 * value. A dependent signal can be registered before its source. */
-                uint64_t aseq = signal ? signal->aseq : 0;
-                if (aseq < first_settled) { first_settled = aseq; source = uid; }
-            }
-            if (source) {
-                fp_edge e = { source, 1, w.before };
+                if (!signal || (signal->req_q == n->req_q && signal->queue_seq >= w.queue_seq)) continue;
+                /* Use the first eligible signal in history. A later signal
+                 * must not replace it while its dependencies are unresolved. */
+                if (!signal->aseq) { pending_signal = 1; break; }
+                fp_edge e = { uid, 1, w.before };
                 PUSH(n->ed, n->ned, n->ced, e);
                 done = 1;
+                break;
             }
-            if (!done && ev->cpu_max >= w.val) done = 1;
+            if (!done && !pending_signal && ev->cpu_max >= w.val) done = 1;
             if (!done && (force == 2 || (force && !pending_signal) || g_tick - n->pend_since > FP_PEND_TIMEOUT)) {
                 if (ev->gpu) { n->uncertain = 1; g_st[ST_UNCERTAIN]++; }
                 if (!force) g_st[ST_TIMEOUTS]++;
@@ -2573,7 +2567,7 @@ static void phase1(fp_cb *c)
             continue;
         }
         if (it->type == 2) {
-            if (nactive < 32) { active[nactive].ev = it->ev; active[nactive].val = it->val; active[nactive].before = 0; nactive++; }
+            if (nactive < 32) active[nactive++] = (fp_evwait){ it->ev, it->val, q->nrecent, 0 };
             continue;
         }
         fp_node *n;
@@ -3954,7 +3948,7 @@ static void mtl4_record_event(id queue, fp_item item)
         trace_mtl4_signal(q, n->uid, item.val);
         process_pending(0);
     } else if (q) {
-        fp_evwait wait = { item.ev, item.val, 0 };
+        fp_evwait wait = { item.ev, item.val, q->nrecent, 0 };
         PUSH(q->mtl4_waits, q->mtl4_nwaits, q->mtl4_cwaits, wait);
     }
     pthread_mutex_unlock(&g_lock);
@@ -4753,6 +4747,33 @@ __attribute__((visibility("default"))) int fencepost_stats(long *out, int n)
 }
 
 #ifdef FENCEPOST_TEST_HOOKS
+/* A detector-only fixture lets the later signal settle first without
+ * encoding a GPU wait that depends on an unsubmitted signal. */
+__attribute__((visibility("default"))) int fencepost_test_wait_source(void)
+{
+    pthread_mutex_lock(&g_lock);
+    static fp_queue producer, consumer;
+    static char event_key;
+    fp_node *first = node_new(FPK_SIGNAL), *second = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
+    first->req_q = second->req_q = &producer;
+    second->aseq = 1;
+    waiter->req_q = &consumer;
+    fp_ev *event = ev_get(&event_key, 1);
+    event->known = event->gpu = 1;
+    event->h[0].uid = first->uid; event->h[0].val = 1;
+    event->h[1].uid = second->uid; event->h[1].val = 2;
+    event->nh = 2;
+    fp_evwait wait = { &event_key, 1, 0, 0 };
+    PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
+    int pending = !ready(waiter, 0) && !waiter->ned;
+    first->aseq = 2;
+    int selected = ready(waiter, 0) && waiter->ned == 1 && waiter->ed[0].src == first->uid;
+    memset(event, 0, sizeof *event);
+    first->state = second->state = waiter->state = 0;
+    pthread_mutex_unlock(&g_lock);
+    return pending && selected;
+}
+
 __attribute__((visibility("default"))) long fencepost_test_trace_cbs(long *peak)
 {
     pthread_mutex_lock(&g_lock);
