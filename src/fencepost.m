@@ -135,6 +135,7 @@ typedef struct fp_queue {
     fp_evwait mtl4_waits[32];
     int mtl4_nwaits;
     struct fp_trace_cb *mtl4_last_trace;
+    uint64_t mtl4_signal_limit, mtl4_signals_done;
 } fp_queue;
 
 typedef struct { fp_acc a; uint64_t uid, aseq; } fp_ent;
@@ -629,7 +630,7 @@ static size_t g_ring_bytes, g_ring_limit = 64u * 1024u * 1024u;
 static uint64_t g_ring_floor, g_ring_latest, g_ring_evictions, g_ring_cap_evictions;
 static fp_trace_endpoint *g_ring_history;
 #ifdef FENCEPOST_TEST_HOOKS
-static long g_mtl4_trace_live, g_mtl4_trace_peak;
+static long g_mtl4_trace_live, g_mtl4_trace_peak, g_mtl4_signals_retired;
 #endif
 static char *g_ring_prefix;
 static int g_ring_encoded, g_ring_race = 1, g_ring_gpuerr = 1;
@@ -3631,6 +3632,8 @@ static void h_cb_commit(id self, SEL _cmd)
 
 typedef struct {
     fp_trace_cb *trace;
+    fp_queue *queue;
+    uint64_t signal_limit;
     NSUInteger ncbs;
     uint64_t cbs[];
 } fp_mtl4_submission;
@@ -3696,6 +3699,8 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
     pthread_mutex_lock(&g_lock);
     fp_queue *q = queue_get_kind((void *)queue, 1);
     if (q) {
+        submission->queue = q;
+        submission->signal_limit = q->mtl4_signal_limit;
         if (!g_inflight && g_tick) { frame_get(g_frame_cur)->idle++; g_st[ST_GPU_IDLE]++; }
         uint64_t tick = ++g_tick;
         int nenc = 0;
@@ -3726,6 +3731,23 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
     return NULL;
 }
 
+/* Successful completion proves that the queue passed every signal scheduled
+ * before this submission. Earlier submissions cannot retire trailing signals. */
+static void mtl4_retire_signals(fp_queue *q, uint64_t limit)
+{
+    uint64_t floor = q->nrecent > FP_QRECENT ? q->nrecent - FP_QRECENT : 0;
+    for (uint64_t k = MAX(floor, q->mtl4_signals_done); k < limit; k++) {
+        fp_node *n = node_get(q->recent[k % FP_QRECENT]);
+        if (n && n->kind == FPK_SIGNAL && !n->done_tick) {
+            n->done_tick = g_tick;
+#ifdef FENCEPOST_TEST_HOOKS
+            g_mtl4_signals_retired++;
+#endif
+        }
+    }
+    q->mtl4_signals_done = MAX(q->mtl4_signals_done, limit);
+}
+
 API_AVAILABLE(macos(26.0))
 static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback> feedback)
 {
@@ -3734,6 +3756,7 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
     pthread_mutex_lock(&g_lock);
     g_inflight--;
     for (NSUInteger i = 0; i < submission->ncbs; i++) cb_mark_done(submission->cbs[i]);
+    if (!error) mtl4_retire_signals(submission->queue, submission->signal_limit);
     fp_trace_cb *trace = submission->trace;
     if (trace) {
         if (error && g_ring && g_ring_gpuerr) @autoreleasepool {
@@ -3895,6 +3918,7 @@ static void mtl4_record_event(id queue, fp_item item)
         fp_node *n = phase_signal(q, 0, ++g_tick, &item);
         n->mtl4 = 1;
         phase_node(q, n, g_tick, NULL, q->mtl4_waits, q->mtl4_nwaits);
+        q->mtl4_signal_limit = q->nrecent;
         trace_mtl4_signal(q, n->uid, item.val);
         process_pending(0);
     } else if (q && q->mtl4_nwaits < 32) {
@@ -4700,6 +4724,14 @@ __attribute__((visibility("default"))) long fencepost_test_trace_cbs(long *peak)
     *peak = g_mtl4_trace_peak;
     pthread_mutex_unlock(&g_lock);
     return live;
+}
+
+__attribute__((visibility("default"))) long fencepost_test_retired_signals(void)
+{
+    pthread_mutex_lock(&g_lock);
+    long retired = g_mtl4_signals_retired;
+    pthread_mutex_unlock(&g_lock);
+    return retired;
 }
 #endif
 /* Declare a barrier at the current point of cb: every encoder submitted to cb's queue

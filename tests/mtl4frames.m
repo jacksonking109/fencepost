@@ -141,6 +141,8 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
 {
     void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
     long (*trace_cbs)(long *) = dlsym(RTLD_DEFAULT, "fencepost_test_trace_cbs");
+    long (*retired_signals)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_retired_signals");
+    int (*stats)(long *, int) = dlsym(RTLD_DEFAULT, "fencepost_stats");
     id<MTL4CommandQueue> producer = [device newMTL4CommandQueue];
     MTL4CommandQueueDescriptor *description = [MTL4CommandQueueDescriptor new];
     description.label = @"frames render queue";
@@ -200,7 +202,8 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
         dispatch_semaphore_signal(app_feedback);
     }];
 
-    long initial_live = -1, peak = 0;
+    enum { S_FRAME_CHAIN = 24 };
+    long initial_live = -1, peak = 0, first_chain = 0, last_chain = 0, max_chain = 0;
     for (unsigned i = 1; i <= frames; i++) @autoreleasepool {
         if (pause_for_trigger && i == 3) {
             puts("ready for trigger");
@@ -270,6 +273,13 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
         [render_allocators[0] reset];
         [render_allocators[1] reset];
         if (trace_cbs && i == 64) initial_live = trace_cbs(&peak);
+        if (stats && frames > FrameCount && frame) {
+            long counters[S_FRAME_CHAIN + 1];
+            stats(counters, S_FRAME_CHAIN + 1);
+            last_chain = counters[S_FRAME_CHAIN];
+            if (i == 1) first_chain = last_chain;
+            max_chain = MAX(max_chain, last_chain);
+        }
     }
     // Feedback runs on Metal's dispatch queues. Let the last callback drain before exit.
     [NSThread sleepForTimeInterval:0.05];
@@ -284,6 +294,15 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
         printf("live Metal 4 trace records at frame 64 and end: %ld, %ld (peak %ld)\n",
                initial_live, final_live, peak);
         if (initial_live > 8 || final_live > 8 || peak > 16) return fail("unbounded live trace records");
+    }
+    if (max_chain) {
+        printf("longest frame chain at start and end: %ld, %ld (max %ld)\n", first_chain, last_chain, max_chain);
+        if (first_chain != 2 || last_chain != 2 || max_chain > 2) return fail("unbounded frame chain");
+    }
+    if (retired_signals && frames > FrameCount) {
+        long retired = retired_signals();
+        printf("retired Metal 4 queue signals: %ld\n", retired);
+        if (retired != 2L * (frames - 1)) return fail("queue signals did not retire");
     }
     int expected_producer_feedback = self_wait ? 0 : 1;
     return fresh_total != expected_producer_feedback || shared_total != expected_producer_feedback ||
