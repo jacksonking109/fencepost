@@ -291,10 +291,13 @@ Prebuilt (universal: Apple Silicon and x86_64/Rosetta, macOS 13+) on the
 macOS then refuses to load the library ("library load disallowed by system policy"); clear the mark after extracting:
 
 ```
-tar -xzf fencepost-0.1.1-macos.tar.gz
-xattr -dr com.apple.quarantine fencepost-0.1.1-macos
-DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.1.1-macos/libfencepost.dylib  your-metal-program
+tar -xzf fencepost-0.2.0-macos.tar.gz
+xattr -dr com.apple.quarantine fencepost-0.2.0-macos
+DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.2.0-macos/libfencepost.dylib  your-metal-program
 ```
+
+The archive also holds the trigger tools: `fencepost-trigger` (command line) and `Fencepost Trigger.app` (menu-bar
+hotkeys). The `xattr` line above clears them too.
 
 The library is signed ad hoc, not by an Apple developer ID; building it yourself (below) takes seconds.
 
@@ -305,7 +308,7 @@ Needs macOS 13 or later and Apple's command-line tools (`xcode-select --install`
 ```
 git clone https://github.com/jacksonking109/fencepost && cd fencepost
 ./build.sh                                                   # universal arm64 + x86_64, signed ad hoc
-./build.sh release 0.1.0                                     # also a release archive, without debug information
+./build.sh release 0.2.0                                     # also a release archive, without debug information
 DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
 arch -x86_64 -e DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest   # the Rosetta slice
 FENCEPOST_TRACE=out/fptest.json DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest

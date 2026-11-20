@@ -2,8 +2,9 @@
 # Builds libfencepost.dylib, the test programs and the trigger helpers, all universal (arm64 + x86_64: the
 # x86_64 slice is the one Wine under Rosetta loads), signed ad hoc.
 #   ./build.sh                 build into out/
-#   ./build.sh release 0.1.0   also out/fencepost-0.1.0-macos.tar.gz: the dylib without debug
-#                              information (it holds local paths), README.md, LICENSE
+#   ./build.sh release 0.2.0   also out/fencepost-0.2.0-macos.tar.gz: the dylib, fencepost-trigger and
+#                              Fencepost Trigger.app without debug information (it holds local paths),
+#                              README.md, LICENSE
 set -e
 cd "${0:A:h}"
 mkdir -p out
@@ -49,9 +50,13 @@ if [[ $1 == release ]]; then
     v=${2:?usage: ./build.sh release VERSION}
     d=out/fencepost-$v-macos
     rm -rf $d && mkdir -p $d
-    cp out/libfencepost.dylib README.md LICENSE $d/
-    strip -S -x $d/libfencepost.dylib 2>/dev/null   # re-signed below
-    codesign -f -s - $d/libfencepost.dylib 2>/dev/null
+    cp out/libfencepost.dylib out/fencepost-trigger README.md LICENSE $d/
+    cp -R "$app" $d/
+    rapp="$d/Fencepost Trigger.app"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $v" "$rapp/Contents/Info.plist"
+    # Stripped binaries are re-signed below.
+    strip -S -x $d/libfencepost.dylib $d/fencepost-trigger "$rapp/Contents/MacOS/Fencepost Trigger" 2>/dev/null
+    codesign -f -s - $d/libfencepost.dylib $d/fencepost-trigger "$rapp" 2>/dev/null
     tar -czf $d.tar.gz -C out fencepost-$v-macos
     shasum -a 256 $d.tar.gz | sed 's|out/||' > $d.tar.gz.sha256
     echo "built $d.tar.gz"
