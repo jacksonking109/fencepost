@@ -120,6 +120,10 @@ and event signals and waits. Each queue commit has one measured GPU span, includ
 logical command buffers. Encoders appear in submission and encoding order with estimated GPU positions.
 Machine-learning encoders are counted in the log.
 
+Fencepost submits `commit:count:` as `commit:count:options:` with fresh options for its own feedback. For
+app options it tracks, it transfers the registered handlers to fresh options for that submission. Each handler
+registration is consumed once, including when the app reuses its options.
+
 `signalDrawable:` marks the end of a frame. Programs can use `fencepost_frame` to supply their own frame
 boundaries. Ring dumps support manual requests, frame spikes, and GPU errors reported by commit feedback.
 Metal 4 race detection is pending. `FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
@@ -333,9 +337,17 @@ python3 -I tests/trigger_check.py arm64
 python3 -I tests/trigger_check.py x86_64
 python3 -I tests/capture_check.py arm64
 python3 -I tests/capture_check.py x86_64
+out/mtl4test event
+out/mtl4bench metal4
+out/mtl4bench metal4-commit
+out/mtl4frames
+python3 -I tests/mtl4_check.py arm64
+python3 -I tests/mtl4_check.py x86_64
+python3 -I tests/mtl4_check.py arm64 --threads
+python3 -I tests/mtl4_check.py x86_64 --threads
 ```
 
-`tests/fptest.m` holds 34 small Metal programs with and without the synchronisation they need, each with the number of
+`tests/fptest.m` holds 35 small Metal programs with and without the synchronisation they need, each with the number of
 races, barrier violations or frame chain lengths fencepost must report. Examples:
 - a fence updated after the vertex stage while the write happens in the fragment stage;
 - a fence re-updated by an unrelated encoder before the wait;
@@ -350,6 +362,11 @@ to check that the app still gets its own timestamps when tracing is on.
 
 `tests/trigger_check.py` checks trigger file writes, one CLI-triggered ring dump and app startup in the logged-in
 macOS session. Check the global hotkey by hand as described above.
+
+On a Metal 4 device, `mtl4bench metal4-commit` measures CPU time for small submissions with up to eight in
+flight. `mtl4frames --long` checks frame chain depth over 512 frames. When the dylib is compiled with
+`-DFENCEPOST_TEST_HOOKS`, it also reports live trace records and retired queue signals. In that build,
+`FENCEPOST_MTL4_TEST_ERROR_COMMIT` selects a submission by its one-based number for simulated feedback errors.
 
 ## Results so far
 
