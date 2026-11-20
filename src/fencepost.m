@@ -628,6 +628,9 @@ static unsigned g_ring, g_ring_after = 2;
 static size_t g_ring_bytes, g_ring_limit = 64u * 1024u * 1024u;
 static uint64_t g_ring_floor, g_ring_latest, g_ring_evictions, g_ring_cap_evictions;
 static fp_trace_endpoint *g_ring_history;
+#ifdef FENCEPOST_TEST_HOOKS
+static long g_mtl4_trace_live, g_mtl4_trace_peak;
+#endif
 static char *g_ring_prefix;
 static int g_ring_encoded, g_ring_race = 1, g_ring_gpuerr = 1;
 static int g_spike_enabled = 1;
@@ -924,7 +927,7 @@ static void trace_slice(FILE *f, const fp_trace_span *span, const char *kind, co
 static fp_trace_span *trace_node(uint64_t uid)
 {
     fp_trace_span *live = (fp_trace_span *)CFDictionaryGetValue(g_trace_nodes, TRACE_KEY(uid));
-    if (live || !g_ring || !uid) return live;
+    if (live || !g_ring_history || !uid) return live;
     fp_trace_endpoint *old = &g_ring_history[uid % FP_POOL];
     return old->uid == uid ? &old->span : NULL;
 }
@@ -1159,6 +1162,13 @@ static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4)
     if (g_trace_stopped || g_frame_cur >= g_trace_last) return NULL;
     fp_trace_cb *c = calloc(1, sizeof *c);
     c->refs = 1; c->uid = uid; c->queue = queue; c->encoder_tail = &c->encoders; c->mtl4 = mtl4;
+    if (mtl4 && !g_ring_history) g_ring_history = calloc(FP_POOL, sizeof *g_ring_history);
+#ifdef FENCEPOST_TEST_HOOKS
+    if (mtl4) {
+        g_mtl4_trace_live++;
+        g_mtl4_trace_peak = MAX(g_mtl4_trace_peak, g_mtl4_trace_live);
+    }
+#endif
     if (g_trace_gpu && !mtl4) c->device = trace_device([cb device]);
     if (!g_trace_origin) trace_start();
     if (!owner) {
@@ -1178,6 +1188,14 @@ static void trace_discard_encoder(fp_trace_encoder *e)
     free(e->args); free(e->waits); free(e);
 }
 
+static void trace_free_cb(fp_trace_cb *c)
+{
+#ifdef FENCEPOST_TEST_HOOKS
+    if (c->mtl4) g_mtl4_trace_live--;
+#endif
+    free(c);
+}
+
 static void trace_discard_cb(fp_trace_cb *c)
 {
     fp_trace_encoder *e = c->encoders;
@@ -1186,7 +1204,7 @@ static void trace_discard_cb(fp_trace_cb *c)
         trace_discard_encoder(e);
         e = next;
     }
-    free(c);
+    trace_free_cb(c);
 }
 
 @implementation FPTraceOwner
@@ -1273,19 +1291,20 @@ static void trace_layout_encoders(fp_trace_cb *c)
 
 /* Keep resolved endpoints only as long as the detector can refer to their
  * UIDs. An encoder waiting for analysis still owns a reference to its CB. */
-static void ring_archive(uint64_t uid, fp_trace_span *span)
+static void trace_archive(uint64_t uid, fp_trace_span *span)
 {
     CFDictionaryRemoveValue(g_trace_nodes, TRACE_KEY(uid));
+    if (!g_ring_history) return;
     fp_trace_endpoint *slot = &g_ring_history[uid % FP_POOL];
     if (slot->uid < uid) *slot = (fp_trace_endpoint){ uid, *span };
 }
 
-static void ring_release_cb(fp_trace_cb *c)
+static void trace_release_cb(fp_trace_cb *c)
 {
-    if (!--c->refs) free(c);
+    if (!--c->refs) trace_free_cb(c);
 }
 
-static void trace_place_encoder(fp_trace_encoder *e)
+static void trace_place_encoder_impl(fp_trace_encoder *e, int finalizing)
 {
     if ((!e->args && !e->args_dropped) || e->span.ready) return;
     if (e->args_dropped) goto done;
@@ -1358,13 +1377,18 @@ static void trace_place_encoder(fp_trace_encoder *e)
 done:
     free(e->args); e->args = NULL;
     trace_ready(&e->span);
-    if (g_ring) {
+    if (!finalizing && (g_ring || e->cb->mtl4)) {
         fp_trace_chunk *chunk = e->span.counted ? trace_chunk(e->span.frame) : NULL;
         if (chunk) chunk->outstanding--;
-        ring_archive(e->uid, &e->span);
-        ring_release_cb(e->cb);
+        trace_archive(e->uid, &e->span);
+        trace_release_cb(e->cb);
         free(e);
     }
+}
+
+static void trace_place_encoder(fp_trace_encoder *e)
+{
+    trace_place_encoder_impl(e, 0);
 }
 
 static const char *trace_stage(const fp_node *n, int stage, const char *nonrender)
@@ -1443,8 +1467,8 @@ static void trace_phase_node(fp_trace_cb *c, const fp_node *n, const fp_evwait *
             chunk->outstanding++;
             e->span.counted = 1;
         }
-        c->refs++;
     }
+    if (g_ring || c->mtl4) c->refs++;
     e->span.frame = n->frame;
     e->selected = 1;
     if (count) {
@@ -1502,13 +1526,13 @@ static void trace_cb_finish(fp_trace_cb *c)
         e = next;
     }
     g_trace_completed[c->queue] = (fp_trace_endpoint){ c->span.tid ? c->uid : 0, c->span };
-    if (g_ring) {
-        for (int i = 0; i < c->nsignals; i++) ring_archive(c->signals[i], &c->span);
+    if (g_ring || c->mtl4) {
+        for (int i = 0; i < c->nsignals; i++) trace_archive(c->signals[i], &c->span);
         free(c->signals);
         fp_trace_chunk *chunk = c->span.counted ? trace_chunk(c->span.frame) : NULL;
         if (chunk) chunk->outstanding--;
-        ring_release_cb(c);
-    } else if (!c->selected) ring_release_cb(c);
+        trace_release_cb(c);
+    } else if (!c->selected) trace_release_cb(c);
 }
 
 static void trace_cb_completed(fp_trace_cb *c, id<MTLCommandBuffer> cb)
@@ -1624,7 +1648,7 @@ static void trace_final_node(const void *key, const void *value, void *context)
 {
     (void)key; (void)context;
     fp_trace_span *span = (fp_trace_span *)value;
-    if (!span->ready && span->encoder) trace_place_encoder((fp_trace_encoder *)span);
+    if (!span->ready && span->encoder) trace_place_encoder_impl((fp_trace_encoder *)span, 1);
     if (!span->ready) trace_ready(span);
 }
 
@@ -3615,14 +3639,14 @@ static void trace_mtl4_join(fp_trace_cb **batch, fp_cb *c)
             *(*batch)->encoder_tail = trace->encoders;
             (*batch)->encoder_tail = trace->encoder_tail;
         }
-        free(trace);
+        trace_free_cb(trace);
         c->trace = *batch;
     }
 }
 
 static void trace_mtl4_submit(fp_queue *q, fp_trace_cb *trace)
 {
-    if (q->mtl4_last_trace) ring_release_cb(q->mtl4_last_trace);
+    if (q->mtl4_last_trace) trace_release_cb(q->mtl4_last_trace);
     q->mtl4_last_trace = trace;
     if (!trace) return;
     trace->refs++;   /* A queue signal can refer to the commit after feedback arrives. */
@@ -3820,10 +3844,10 @@ static void trace_mtl4_signal(fp_queue *q, uint64_t uid, uint64_t value)
     if (!g_trace_enabled || g_trace_stopped || !trace_frame_selected(g_frame_cur)) return;
     fp_trace_cb *last = q->mtl4_last_trace;
     if (last && last->selected && (!last->completed || last->span.tid)) {
-        if (g_ring && last->completed) ring_archive(uid, &last->span);
+        if (last->completed) trace_archive(uid, &last->span);
         else {
             CFDictionarySetValue(g_trace_nodes, TRACE_KEY(uid), &last->span);
-            if (g_ring) PUSH(last->signals, last->nsignals, last->csignals, uid);
+            PUSH(last->signals, last->nsignals, last->csignals, uid);
         }
         return;
     }
@@ -3841,12 +3865,8 @@ static void trace_mtl4_signal(fp_queue *q, uint64_t uid, uint64_t value)
         fprintf(f, ",\"args\":{\"uid\":%llu,\"value\":%llu,\"estimated\":true}}", TRACE_U64(uid), TRACE_U64(value));
     }
     if (!trace_write(span.frame, f, &record, &length, 1)) return;
-    if (g_ring) ring_archive(uid, &span);
-    else {
-        fp_trace_span *saved = malloc(sizeof *saved);
-        *saved = span;
-        CFDictionarySetValue(g_trace_nodes, TRACE_KEY(uid), saved);
-    }
+    if (!g_ring_history) g_ring_history = calloc(FP_POOL, sizeof *g_ring_history);
+    trace_archive(uid, &span);
 }
 
 static void mtl4_record_event(id queue, fp_item item)
@@ -4653,6 +4673,17 @@ __attribute__((visibility("default"))) int fencepost_stats(long *out, int n)
     pthread_mutex_unlock(&g_lock);
     return ST_COUNT;
 }
+
+#ifdef FENCEPOST_TEST_HOOKS
+__attribute__((visibility("default"))) long fencepost_test_trace_cbs(long *peak)
+{
+    pthread_mutex_lock(&g_lock);
+    long live = g_mtl4_trace_live;
+    *peak = g_mtl4_trace_peak;
+    pthread_mutex_unlock(&g_lock);
+    return live;
+}
+#endif
 /* Declare a barrier at the current point of cb: every encoder submitted to cb's queue
  * before this point must be ordered (by fences or events) before every encoder after it.
  * A runtime calls this where its API demands full ordering (a D3D12 ResourceBarrier, a

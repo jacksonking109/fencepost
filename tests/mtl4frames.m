@@ -137,9 +137,10 @@ static bool encode_render(id<MTL4CommandBuffer> cb, id<MTL4CommandAllocator> all
 }
 
 API_AVAILABLE(macos(26.0))
-static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger)
+static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger, unsigned frames)
 {
     void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
+    long (*trace_cbs)(long *) = dlsym(RTLD_DEFAULT, "fencepost_test_trace_cbs");
     id<MTL4CommandQueue> producer = [device newMTL4CommandQueue];
     MTL4CommandQueueDescriptor *description = [MTL4CommandQueueDescriptor new];
     description.label = @"frames render queue";
@@ -199,7 +200,8 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger)
         dispatch_semaphore_signal(app_feedback);
     }];
 
-    for (unsigned i = 1; i <= FrameCount; i++) @autoreleasepool {
+    long initial_live = -1, peak = 0;
+    for (unsigned i = 1; i <= frames; i++) @autoreleasepool {
         if (pause_for_trigger && i == 3) {
             puts("ready for trigger");
             if (getchar() != '\n') return fail("trigger handshake closed");
@@ -227,7 +229,7 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger)
         }
         if (!encode_render(render[0], render_allocators[0], targets[0], false, NULL) ||
             !encode_render(render[1], render_allocators[1], targets[1], true,
-                           !drawable_mode || i == FrameCount ? frame : NULL))
+                           !drawable_mode || i == frames ? frame : NULL))
             return fail("render encoder creation failed");
 
         if (i == 1) [producer commit:&compute count:1];
@@ -254,20 +256,27 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger)
             dispatch_semaphore_wait(app_feedback, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)))
             return fail("producer feedback timeout");
         for (unsigned k = 0; k < BufferSize; k++)
-            if (((const uint8_t *)bytes.contents)[k] != i) return fail("GPU fill mismatch");
+            if (((const uint8_t *)bytes.contents)[k] != (uint8_t)i) return fail("GPU fill mismatch");
         [compute_allocator reset];
         [render_allocators[0] reset];
         [render_allocators[1] reset];
+        if (trace_cbs && i == 64) initial_live = trace_cbs(&peak);
     }
     // Feedback runs on Metal's dispatch queues. Let the last callback drain before exit.
     [NSThread sleepForTimeInterval:0.05];
     int fresh_total = atomic_load(&fresh_count), shared_total = atomic_load(&shared_count);
     int added_total = atomic_load(&added_count), batch_total = atomic_load(&batch_count);
     int error_total = atomic_load(&errors);
-    printf("frames=%d boundary=%s app_feedback fresh=%d reused=%d added=%d batch=%d errors=%d\n",
-           FrameCount, drawable_mode ? "drawable" : "api",
+    printf("frames=%u boundary=%s app_feedback fresh=%d reused=%d added=%d batch=%d errors=%d\n",
+           frames, drawable_mode ? "drawable" : "api",
            fresh_total, shared_total, added_total, batch_total, error_total);
-    return fresh_total != 1 || shared_total != 1 || added_total != 1 || batch_total != FrameCount || error_total != 0;
+    if (initial_live >= 0) {
+        long final_live = trace_cbs(&peak);
+        printf("live Metal 4 trace records at frame 64 and end: %ld, %ld (peak %ld)\n",
+               initial_live, final_live, peak);
+        if (initial_live > 8 || final_live > 8 || peak > 16) return fail("unbounded live trace records");
+    }
+    return fresh_total != 1 || shared_total != 1 || added_total != 1 || batch_total != (int)frames || error_total != 0;
 }
 
 int main(int argc, const char **argv)
@@ -275,16 +284,18 @@ int main(int argc, const char **argv)
     @autoreleasepool {
         setvbuf(stdout, NULL, _IOLBF, 0);
         bool drawable = false, pause_for_trigger = false, threaded = false;
+        unsigned frames = FrameCount;
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--drawable")) drawable = true;
             else if (!strcmp(argv[i], "--trigger")) pause_for_trigger = true;
             else if (!strcmp(argv[i], "--threads")) threaded = true;
-            else return fail("usage: mtl4frames [--drawable] [--trigger] | --threads");
+            else if (!strcmp(argv[i], "--long")) frames = 512;
+            else return fail("usage: mtl4frames [--drawable] [--trigger] [--long] | --threads");
         }
         if (@available(macOS 26.0, *)) {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
             if (device && [device supportsFamily:MTLGPUFamilyMetal4])
-                return threaded ? run_threads(device) : run(device, drawable, pause_for_trigger);
+                return threaded ? run_threads(device) : run(device, drawable, pause_for_trigger, frames);
         }
         puts("skip: Metal 4 unavailable");
         return 77;
