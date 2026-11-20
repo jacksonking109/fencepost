@@ -129,6 +129,9 @@ boundaries. Ring dumps support manual requests, frame spikes, and GPU errors rep
 Metal 4 race detection is pending. `FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
 because fencepost learns the submitting queue after encoding.
 
+Fencepost records a queue's events in the order its hooks see them. When two threads submit to the same
+`MTL4CommandQueue` without the app serializing those calls, Metal can see them in a different order.
+
 The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
 process stopped before writing the closing bracket.
 

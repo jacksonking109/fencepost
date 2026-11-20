@@ -3969,8 +3969,9 @@ static void mtl4_record_event(id queue, fp_item item)
     pthread_mutex_unlock(&g_lock);
 }
 
-/* Record ordered calls before entering Metal. Calls that overlap on the
- * same queue have no app-defined order; the detector uses hook entry order. */
+/* Record queue events in hook entry order, before entering Metal. If an app
+ * submits to the same queue from two threads without serializing its calls,
+ * this order may differ from Metal's submission order. */
 static void h_mtl4_signal(id self, SEL _cmd, id event, uint64_t value)
 {
     ENTER;
