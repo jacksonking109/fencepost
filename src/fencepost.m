@@ -131,6 +131,8 @@ typedef struct fp_queue {
     uint64_t recent[FP_QRECENT]; uint64_t nrecent;
     uint64_t bar_mark, bar_cb; int bar_idx;   /* the last declared barrier */
     uint64_t *held; int nheld, cheld;
+    fp_evwait mtl4_waits[32];
+    int mtl4_nwaits;
 } fp_queue;
 
 typedef struct { fp_acc a; uint64_t uid, aseq; } fp_ent;
@@ -141,6 +143,7 @@ typedef struct { void *ev; int known, gpu; uint64_t cpu_max; struct { uint64_t v
     (arr) = realloc((arr), (size_t)(cap) * sizeof *(arr)); } (arr)[(n)++] = (val); } while (0)
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_mtl4_submit_lock = PTHREAD_MUTEX_INITIALIZER;
 static fp_node g_pool[FP_POOL];
 static fp_cb g_cbs[FP_CBPOOL];
 static fp_queue g_q[FP_MAXQ]; static int g_nq;
@@ -245,15 +248,17 @@ static void cb_close(void *cb)
         if (g_opencb[i].cb == cb) { g_opencb[i].cb = NULL; g_opencb[i].uid = 0; }
 }
 
-static fp_queue *queue_get(void *q)   /* lock held */
+static fp_queue *queue_get_kind(void *q, int mtl4)   /* lock held */
 {
-    for (int i = 0; i < g_nq; i++) if (g_q[i].q == q) return &g_q[i];
+    for (int i = 0; i < g_nq; i++) if (g_q[i].q == q && g_q[i].mtl4 == mtl4) return &g_q[i];
     if (g_nq == FP_MAXQ) return NULL;
     fp_queue *fq = &g_q[g_nq];
     memset(fq, 0, sizeof *fq);
-    fq->q = q; fq->idx = g_nq++; fq->enq_next = 1;
+    fq->q = q; fq->idx = g_nq++; fq->enq_next = 1; fq->mtl4 = mtl4;
     return fq;
 }
+
+static fp_queue *queue_get(void *q) { return queue_get_kind(q, 0); }
 
 static fp_ev *ev_get(void *ev, int create)   /* lock held */
 {
@@ -892,6 +897,9 @@ static int trace_queue_lane(int queue, int type, const fp_trace_span *span)
     if (type == TR_CB) {
         const char *label = g_trace_queue_labels[queue];
         snprintf(name, sizeof name, "Queue %d%s%s - command buffers", queue, *label ? " " : "", label);
+    } else if (g_q[queue].mtl4) {
+        snprintf(name, sizeof name, "Queue %d %s - encoders%s", queue, g_trace_queue_labels[queue],
+                 type == TR_CPU ? " (CPU encode time)" : "");
     } else snprintf(name, sizeof name, "Queue %d - encoders%s", queue, type == TR_CPU ? " (CPU encode time)" : "");
     return trace_lane(&g_trace_tracks[queue][type], name, span);
 }
@@ -2347,8 +2355,10 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
         if (y->kind != FPK_SIGNAL) { r->nenc++; if (y->depth > r->depth) { r->depth = y->depth; r->tail = y->uid; } }
     }
     if (y->kind != FPK_SIGNAL) g_st[ST_NODES]++;
-    if (y->kind != FPK_SIGNAL && y->req_q && y->req_mark) check_barrier(y);
-    for (int i = 0; i < y->nacc; i++) check_access(y, &y->acc[i]);
+    if (!y->mtl4) {
+        if (y->kind != FPK_SIGNAL && y->req_q && y->req_mark) check_barrier(y);
+        for (int i = 0; i < y->nacc; i++) check_access(y, &y->acc[i]);
+    }
     if (g_trace_enabled) trace_analyse(y);
 }
 
@@ -2431,6 +2441,50 @@ static void queue_recent(fp_queue *q, uint64_t uid)
     q->recent[q->nrecent++ % FP_QRECENT] = uid;
 }
 
+static void frame_boundary(uint64_t timestamp, fp_trace_cb *trace)
+{
+    if (g_trace_enabled) trace_frame_boundary(g_frame_cur, timestamp, trace);
+    capture_frame_boundary();
+    g_frame_cur++;
+}
+
+static fp_node *phase_signal(fp_queue *q, uint64_t cb_uid, uint64_t tick, fp_item *it)
+{
+    fp_node *n = node_new(FPK_SIGNAL);
+    it->uid = n->uid;
+    n->cb_uid = cb_uid; n->state = 2;
+    unsigned first = q->nrecent > FP_QRECENT ? q->nrecent - FP_QRECENT : 0;
+    for (unsigned k = first; k < q->nrecent; k++) {   /* the signal follows earlier work on this queue */
+        fp_node *p = node_get(q->recent[k % FP_QRECENT]);
+        if (!p || (p->done_tick && p->done_tick < tick)) continue;
+        fp_edge e = { p->uid, 1, 0 };
+        PUSH(n->ed, n->ned, n->ced, e);
+    }
+    fp_ev *ev = ev_get(it->ev, 1);
+    if (ev) {
+        ev->gpu = 1;
+        if (q->mtl4) ev->known = 1;
+        ev->h[ev->nh % FP_EVHIST].val = it->val;
+        ev->h[ev->nh % FP_EVHIST].uid = n->uid;
+        ev->nh++;
+    }
+    return n;
+}
+
+static void phase_node(fp_queue *q, fp_node *n, uint64_t tick, fp_trace_cb *trace,
+                       const fp_evwait *waits, int nwaits)
+{
+    for (int k = 0; k < nwaits; k++) PUSH(n->ew, n->nev, n->cev, waits[k]);
+    n->commit_tick = tick;
+    n->pend_since = g_tick;
+    n->req_q = q; n->req_mark = q->bar_mark; n->bar_cb = q->bar_cb; n->bar_idx = q->bar_idx;
+    n->frame = g_frame_cur; frame_get(g_frame_cur)->queued++;
+    if (trace) trace_phase_node(trace, n, waits, nwaits);
+    n->state = 3;
+    queue_recent(q, n->uid);
+    PUSH(g_pend, g_npend, g_cpend, n->uid);
+}
+
 /* Phase 1, in submission order: resolve fence waits against the latest update, record
  * fence updates and event signals, queue the nodes for analysis. */
 static void phase1(fp_cb *c)
@@ -2438,6 +2492,10 @@ static void phase1(fp_cb *c)
     fp_evwait active[32]; int nactive = 0;
     fp_queue *q = c->q;
     fp_trace_cb *trace = g_trace_enabled ? c->trace : NULL;
+    if (c->mtl4) {
+        nactive = q->mtl4_nwaits;
+        memcpy(active, q->mtl4_waits, (size_t)nactive * sizeof *active);
+    }
     if (trace) trace->span.frame = g_frame_cur;  /* fallback for an encoderless CB */
     if (trace && trace_frame_selected(g_frame_cur) && !g_trace_stopped) trace->selected = 1;
     g_st[ST_CBS]++;
@@ -2449,9 +2507,7 @@ static void phase1(fp_cb *c)
             continue;
         }
         if (it->type == 4) {
-            if (g_trace_enabled) trace_frame_boundary(g_frame_cur, it->val, trace);
-            capture_frame_boundary();
-            g_frame_cur++;
+            frame_boundary(it->val, trace);
             continue;
         }
         if (it->type == 2) {
@@ -2460,18 +2516,7 @@ static void phase1(fp_cb *c)
         }
         fp_node *n;
         if (it->type == 1) {
-            n = node_new(FPK_SIGNAL);
-            it->uid = n->uid;
-            n->cb_uid = c->uid; n->idx = 0; n->state = 2;
-            unsigned first = q->nrecent > FP_QRECENT ? q->nrecent - FP_QRECENT : 0;
-            for (unsigned k = first; k < q->nrecent; k++) {   /* the signal follows earlier work on this queue */
-                fp_node *p = node_get(q->recent[k % FP_QRECENT]);
-                if (!p || (p->done_tick && p->done_tick < c->commit_tick)) continue;
-                fp_edge e = { p->uid, 1, 0 };
-                PUSH(n->ed, n->ned, n->ced, e);
-            }
-            fp_ev *ev = ev_get(it->ev, 1);
-            if (ev) { ev->gpu = 1; ev->h[ev->nh % FP_EVHIST].val = it->val; ev->h[ev->nh % FP_EVHIST].uid = n->uid; ev->nh++; }
+            n = phase_signal(q, c->uid, c->commit_tick, it);
         } else {
             n = node_get(it->uid);
             if (!n) continue;
@@ -2488,15 +2533,7 @@ static void phase1(fp_cb *c)
                 if (s >= 0) { g_fence[s].uid = n->uid; g_fence[s].after = n->fu[k].st; }
             }
         }
-        for (int k = 0; k < nactive; k++) PUSH(n->ew, n->nev, n->cev, active[k]);
-        n->commit_tick = c->commit_tick;
-        n->pend_since = g_tick;
-        n->req_q = q; n->req_mark = q->bar_mark; n->bar_cb = q->bar_cb; n->bar_idx = q->bar_idx;
-        n->frame = g_frame_cur; frame_get(g_frame_cur)->queued++;
-        if (trace) trace_phase_node(trace, n, active, nactive);
-        n->state = 3;
-        queue_recent(q, n->uid);
-        PUSH(g_pend, g_npend, g_cpend, n->uid);
+        phase_node(q, n, c->commit_tick, trace, active, nactive);
     }
     if (trace) {
         if (g_ring && trace->selected) {
@@ -2696,6 +2733,7 @@ enum {
     H_B_BB, H_B_BT, H_B_BT_O, H_B_TB, H_B_TB_O, H_B_TT, H_B_TT_N, H_B_TT_ALL, H_B_FILL, H_B_MIP, H_B_SYNCR, H_B_SYNCT,
     H_4_DEV_Q, H_4_DEV_Q_DESC, H_4_DEV_CB, H_4_BEGIN, H_4_BEGIN_OPTS, H_4_END,
     H_4_RENDER, H_4_RENDER_OPTS, H_4_COMPUTE, H_4_ML,
+    H_4_COMMIT, H_4_COMMIT_OPTS, H_4_SIGNAL, H_4_WAIT, H_4_DRAWABLE_SIGNAL, H_4_DRAWABLE_WAIT,
     H_COUNT
 };
 
@@ -2737,6 +2775,7 @@ static void hook_encoder(Class cls, int kind);
 static void hook_event(Class cls);
 static void hook_mtl4_cb(Class cls);
 static void hook_mtl4_encoder(Class cls);
+static void hook_mtl4_queue(Class cls);
 
 /* device */
 
@@ -3287,13 +3326,13 @@ static void on_mtl4_queue(id queue)
     if (!queue) return;
     const char *label = [[queue label] UTF8String];
     pthread_mutex_lock(&g_lock);
-    fp_queue *q = queue_get((void *)queue);
+    fp_queue *q = queue_get_kind((void *)queue, 1);
     if (q) {
-        q->mtl4 = 1;
         snprintf(g_trace_queue_labels[q->idx], sizeof g_trace_queue_labels[0], "MTL4%s%s",
                  label && *label ? " " : "", label ?: "");
     }
     pthread_mutex_unlock(&g_lock);
+    hook_mtl4_queue(object_getClass(queue));
 }
 
 static id h_mtl4_dev_q(id self, SEL _cmd)
@@ -3525,6 +3564,130 @@ static void h_cb_commit(id self, SEL _cmd)
     }
     ORIG(H_CB_COMMIT, void (*)(id, SEL))(self, _cmd);
     if (capture_commit) capture_after_commit();
+    LEAVE;
+}
+
+static void mtl4_record_commit(id queue, const id *buffers, NSUInteger count)
+{
+    pthread_mutex_lock(&g_lock);
+    fp_queue *q = queue_get_kind((void *)queue, 1);
+    if (q && count) {
+        uint64_t tick = ++g_tick;
+        int nenc = 0;
+        if (g_ring) ring_poll_file();
+        for (NSUInteger i = 0; i < count; i++) {
+            id cb = buffers[i];
+            fp_cb *c = cb_find_open((void *)cb);
+            if (!c || !c->mtl4 || c->state != 2) continue;
+            const char *label = [[cb label] UTF8String];
+            if (label) snprintf(c->label, sizeof c->label, "%s", label);
+            c->q = q;
+            c->commit_tick = tick;
+            nenc += c->nenc;
+            cb_close((void *)cb);
+            if (c->trace) {
+                c->trace->owner->record = NULL;
+                c->trace->queue = q->idx;
+                c->trace->completed = 1;
+                memcpy(c->trace->label, c->label, sizeof c->label);
+            }
+            phase1(c);
+        }
+        if (nenc) q->mtl4_nwaits = 0;
+        process_pending(0);
+        if (g_trace) trace_stream_flush();
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* Serialize recording and Metal submission together so the model sees the same queue order. */
+static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count)
+{
+    ENTER;
+    if (OUTER) {
+        pthread_mutex_lock(&g_mtl4_submit_lock);
+        mtl4_record_commit(self, buffers, count);
+    }
+    ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
+    if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
+    LEAVE;
+}
+
+static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger count, id options)
+{
+    ENTER;
+    if (OUTER) {
+        pthread_mutex_lock(&g_mtl4_submit_lock);
+        mtl4_record_commit(self, buffers, count);
+    }
+    ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, options);
+    if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
+    LEAVE;
+}
+
+static void mtl4_record_event(id queue, fp_item item)
+{
+    pthread_mutex_lock(&g_lock);
+    fp_queue *q = queue_get_kind((void *)queue, 1);
+    if (q && item.type == 1) {
+        fp_node *n = phase_signal(q, 0, ++g_tick, &item);
+        n->mtl4 = 1;
+        phase_node(q, n, g_tick, NULL, q->mtl4_waits, q->mtl4_nwaits);
+        process_pending(0);
+    } else if (q && q->mtl4_nwaits < 32) {
+        q->mtl4_waits[q->mtl4_nwaits++] = (fp_evwait){ item.ev, item.val, 0 };
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void h_mtl4_signal(id self, SEL _cmd, id event, uint64_t value)
+{
+    ENTER;
+    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
+    ORIG(H_4_SIGNAL, void (*)(id, SEL, id, uint64_t))(self, _cmd, event, value);
+    if (OUTER) {
+        mtl4_record_event(self, (fp_item){ 1, 0, (void *)event, value });
+        pthread_mutex_unlock(&g_mtl4_submit_lock);
+    }
+    LEAVE;
+}
+
+static void h_mtl4_wait(id self, SEL _cmd, id event, uint64_t value)
+{
+    ENTER;
+    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
+    ORIG(H_4_WAIT, void (*)(id, SEL, id, uint64_t))(self, _cmd, event, value);
+    if (OUTER) {
+        mtl4_record_event(self, (fp_item){ 2, 0, (void *)event, value });
+        pthread_mutex_unlock(&g_mtl4_submit_lock);
+    }
+    LEAVE;
+}
+
+static void h_mtl4_drawable_signal(id self, SEL _cmd, id drawable)
+{
+    ENTER;
+    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
+    ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
+    if (OUTER) {
+        pthread_mutex_lock(&g_lock);
+        if (!g_frame_api) {
+            frame_boundary(g_trace_enabled ? trace_clock() : 0, NULL);
+            process_pending(0);
+        }
+        pthread_mutex_unlock(&g_lock);
+        pthread_mutex_unlock(&g_mtl4_submit_lock);
+    }
+    LEAVE;
+}
+
+static void h_mtl4_drawable_wait(id self, SEL _cmd, id drawable)
+{
+    /* This acquires the drawable for upcoming work, which ends at signalDrawable:. */
+    ENTER;
+    if (OUTER) pthread_mutex_lock(&g_mtl4_submit_lock);
+    ORIG(H_4_DRAWABLE_WAIT, void (*)(id, SEL, id))(self, _cmd, drawable);
+    if (OUTER) pthread_mutex_unlock(&g_mtl4_submit_lock);
     LEAVE;
 }
 
@@ -3913,6 +4076,14 @@ static const hook_def mtl4_cb_hooks[] = {
 static const hook_def mtl4_encoder_hooks[] = {
     HD(H_END, "endEncoding", h_end),
 };
+static const hook_def mtl4_queue_hooks[] = {
+    HD(H_4_COMMIT, "commit:count:", h_mtl4_commit),
+    HD(H_4_COMMIT_OPTS, "commit:count:options:", h_mtl4_commit_opts),
+    HD(H_4_SIGNAL, "signalEvent:value:", h_mtl4_signal),
+    HD(H_4_WAIT, "waitForEvent:value:", h_mtl4_wait),
+    HD(H_4_DRAWABLE_SIGNAL, "signalDrawable:", h_mtl4_drawable_signal),
+    HD(H_4_DRAWABLE_WAIT, "waitForDrawable:", h_mtl4_drawable_wait),
+};
 static const hook_def queue_hooks[] = {
     HD(H_Q_CB, "commandBuffer", h_q_cb),
     HD(H_Q_CBU, "commandBufferWithUnretainedReferences", h_q_cbu),
@@ -4024,6 +4195,7 @@ static void hook_cb(Class cls) { install(cls, 102, cb_hooks, N(cb_hooks)); }
 static void hook_event(Class cls) { install(cls, 103, event_hooks, N(event_hooks)); }
 static void hook_mtl4_cb(Class cls) { install(cls, 105, mtl4_cb_hooks, N(mtl4_cb_hooks)); }
 static void hook_mtl4_encoder(Class cls) { install(cls, 106, mtl4_encoder_hooks, N(mtl4_encoder_hooks)); }
+static void hook_mtl4_queue(Class cls) { install(cls, 107, mtl4_queue_hooks, N(mtl4_queue_hooks)); }
 static void hook_encoder(Class cls, int kind)
 {
     if (kind == FPK_RENDER) install(cls, kind, render_hooks, N(render_hooks));
