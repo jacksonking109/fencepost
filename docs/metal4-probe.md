@@ -119,7 +119,11 @@ Each run encoded 10,000 draws per frame for 60 frames, with 5 warmups. All runs 
 | x86_64 | Metal 3 | 0.140204 / 0.152762 | 0.145846 / 0.151046 | 0.141433 / 0.145517 |
 | x86_64 | Metal 4 | 0.147050 / 0.158108 | 0.137729 / 0.141196 | 0.139417 / 0.142429 |
 
-The median of the three per-run medians fell by 7.3% on arm64 (0.092083 to 0.085396 µs/draw) and 1.4% under Rosetta (0.141433 to 0.139417 µs/draw). Metal 4 was slower in one of the three paired Rosetta runs. This workload shows a small typical gain under Rosetta. A D3D12 port’s CPU cost and frame rate remain unmeasured.
+The median of the three per-run medians fell by 7.3% on arm64 (0.092083 to 0.085396 µs/draw) and 1.4% under Rosetta (0.141433 to 0.139417 µs/draw). Metal 4 was slower in one of the three paired Rosetta runs. Under Rosetta that is within the run-to-run spread (4–7%), so there is no measurable difference. On arm64 the gain is about 6–7%.
+
+Two limits apply. The workload binds only three resources, so it can't show the per-resource tracking cost that Metal 4 removes. A translation layer with thousands of resources may gain more. The final-pixel check sees only the last draw. A scratch variant that gave each draw its own pixel (1,000 draws, both paths, both slices) found all 256 pixels correct, so Metal 4 captures argument-table bindings per draw and the two paths do the same work.
+
+**For wine-lab:** the Metal calls themselves cost about 0.14 µs per draw under Rosetta. PEAK's D3D12 replay, measured on 2026-10-09, cost about 2.4 µs per draw. So the Metal API is roughly 6% of replay cost. Even a free Metal 4 couldn't remove most of the CPU limit, which sits in the translation layer's own work. A D3D12 port's CPU cost and frame rate on Metal 4 remain unmeasured.
 
 ## Fencepost coexistence
 
