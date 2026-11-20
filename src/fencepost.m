@@ -65,6 +65,11 @@
 enum { FP_RD = 1, FP_WR = 2, FP_MAYBE = 4 };    /* FP_MAYBE: declared read+write, may not write */
 enum { FPK_RENDER = 1, FPK_COMPUTE, FPK_BLIT, FPK_SIGNAL };
 static const char *const kind_name[] = { "?", "render", "compute", "blit", "event signal" };
+enum { FP4_VERTEX, FP4_FRAGMENT, FP4_TILE, FP4_OBJECT, FP4_MESH,
+       FP4_DISPATCH, FP4_BLIT, FP4_ACCEL, FP4_ML, FP4_RESOURCE_STATE, FP4_STAGE_COUNT };
+#define FP4_STAGE(i) (1u << (i))
+#define FP4_ALL (FP4_STAGE(FP4_STAGE_COUNT) - 1)
+enum { FP4_TABLES = FP4_DISPATCH + 1 };
 enum { VIA_ATT_LOAD, VIA_ATT, VIA_RESOLVE, VIA_USE, VIA_BIND, VIA_BLIT_SRC, VIA_BLIT_DST,
        VIA_FILL, VIA_MIPGEN, VIA_INDEX, VIA_INDIRECT, VIA_VISIBILITY, VIA_SYNC };
 static const char *const via_name[] = { "attachment load", "attachment", "MSAA resolve", "useResource",
@@ -85,6 +90,9 @@ typedef struct {
     uint64_t a0, a1;        /* texture: mip levels [a0,a1); buffer: bytes [a0,a1) */
     uint32_t s0, s1;        /* texture: slices [s0,s1) */
     uint8_t is_tex, rw, sf, sl, via;   /* sf/sl: first and last stage the access happens in */
+    uint16_t mtl4_stage;
+    uint32_t first_epoch, last_epoch;
+    uint64_t gpu_address;
 } fp_acc;
 
 typedef struct { uint64_t src; uint8_t after, before; } fp_edge;
@@ -112,6 +120,9 @@ typedef struct fp_node {
     int bar_idx;
     uint64_t frame, queue_seq, chain_prev;   /* chain_prev: earlier node on the longest ordered chain */
     uint32_t depth;                 /* encoders on that chain within the frame, this one included */
+    uint32_t mtl4_epoch, mtl4_work;
+    id mtl4_tables[FP4_TABLES];
+    uint64_t mtl4_versions[FP4_TABLES];
     fp_bits anc[2];                 /* what is ordered before this node's vertex / fragment work */
 } fp_node;
 
@@ -120,7 +131,7 @@ typedef struct {
     uint64_t uid, enq, commit_tick;
     void *cb;
     struct fp_queue *q;
-    int state, nenc, mtl4;
+    int state, nenc, mtl4, mtl4_resident;
     fp_item *it; int nit, cit;
     char label[48];
     struct fp_trace_cb *trace;
@@ -136,6 +147,8 @@ typedef struct fp_queue {
     fp_evwait *mtl4_waits;
     int mtl4_nwaits, mtl4_cwaits;
     struct fp_trace_cb *mtl4_last_trace;
+    void **mtl4_residency;
+    int mtl4_nresidency, mtl4_cresidency;
     fp_queue_signal *mtl4_signals;
     int mtl4_sig_first, mtl4_nsignals, mtl4_csignals;
 } fp_queue;
@@ -162,6 +175,7 @@ static uint64_t *g_pend; static int g_npend, g_cpend;
 static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
 static long g_st[ST_COUNT];
 static long g_mtl4_ml_encoders, g_mtl4_gpu_errors;
+static long g_mtl4_residency_only, g_mtl4_accel_builds;
 static atomic_long g_fp4_address_misses, g_fp4_id_misses;
 #ifdef FENCEPOST_TEST_HOOKS
 static unsigned g_mtl4_test_error_commit;
@@ -227,6 +241,11 @@ static fp_node *node_new(int kind)   /* lock held */
 {
     uint64_t uid = ++g_uid;
     fp_node *n = &g_pool[uid % FP_POOL];
+    if (n->mtl4)
+        for (int i = 0; i < FP4_TABLES; i++) [n->mtl4_tables[i] release];
+    memset(n->mtl4_tables, 0, sizeof n->mtl4_tables);
+    memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
+    n->mtl4_epoch = 1; n->mtl4_work = 0;
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
@@ -1666,7 +1685,7 @@ typedef struct {
 
 typedef struct {
     long stats[ST_COUNT];
-    long mtl4_gpu_errors, mtl4_address_misses, mtl4_id_misses;
+    long mtl4_gpu_errors, mtl4_address_misses, mtl4_id_misses, mtl4_residency_only, mtl4_accel_builds;
     uint64_t pool_exhausted, suppressed, evictions, cap_evictions, alloc_dropped;
     uint64_t origin;
     int stopped, sampling_supported;
@@ -1680,6 +1699,8 @@ static fp_trace_summary trace_summary_state(void)
         .mtl4_gpu_errors = g_mtl4_gpu_errors,
         .mtl4_address_misses = atomic_load_explicit(&g_fp4_address_misses, memory_order_relaxed),
         .mtl4_id_misses = atomic_load_explicit(&g_fp4_id_misses, memory_order_relaxed),
+        .mtl4_residency_only = g_mtl4_residency_only,
+        .mtl4_accel_builds = __atomic_load_n(&g_mtl4_accel_builds, __ATOMIC_RELAXED),
         .suppressed = g_suppressed, .evictions = g_ring_evictions, .cap_evictions = g_ring_cap_evictions,
         .alloc_dropped = g_trace_alloc_dropped
     };
@@ -1708,6 +1729,10 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
     if (state->mtl4_address_misses || state->mtl4_id_misses)
         fprintf(f, ",\"mtl4_address_misses\":%ld,\"mtl4_resource_id_misses\":%ld",
                 state->mtl4_address_misses, state->mtl4_id_misses);
+    if (state->mtl4_residency_only)
+        fprintf(f, ",\"mtl4_residency_only_encoders\":%ld", state->mtl4_residency_only);
+    if (state->mtl4_accel_builds)
+        fprintf(f, ",\"mtl4_acceleration_structure_builds\":%ld", state->mtl4_accel_builds);
     static const char *const types[] = { "race", "possible", "order", "partial" };
     for (int i = 0; i < 4; i++)
         fprintf(f, ",\"%s_marker_hits\":%llu,\"%s_markers\":%llu", types[i], TRACE_U64(totals.hits[i]),
@@ -2188,6 +2213,10 @@ static void summary(int final)
     long id_misses = atomic_load_explicit(&g_fp4_id_misses, memory_order_relaxed);
     if (address_misses || id_misses)
         fp_log("fencepost:   Metal 4 unknown bindings: %ld GPU addresses, %ld resource IDs\n", address_misses, id_misses);
+    if (g_mtl4_residency_only)
+        fp_log("fencepost:   Metal 4 encoders with residency sets and no visible accesses: %ld\n", g_mtl4_residency_only);
+    long accel_builds = __atomic_load_n(&g_mtl4_accel_builds, __ATOMIC_RELAXED);
+    if (accel_builds) fp_log("fencepost:   Metal 4 acceleration-structure builds: %ld\n", accel_builds);
     fp_log("fencepost:   cost: %.2f s analysing at commit; %ld resources with live history%s\n",
            g_st[ST_ANALYSIS_NS] / 1e9, g_st[ST_OBJS], g_st[ST_OBJ_DROPS] ? " (TABLE FULL: some accesses not checked)" : "");
     frame_line();
@@ -2588,6 +2617,7 @@ static void phase1(fp_cb *c)
         } else {
             n = node_get(it->uid);
             if (!n) continue;
+            if (c->mtl4 && !n->nacc && (c->mtl4_resident || q->mtl4_nresidency)) g_mtl4_residency_only++;
             for (int k = 0; k < n->nfw; k++) {
                 int s = fence_slot(n->fw[k].f, 0);
                 n->fw[k].src = s >= 0 ? g_fence[s].uid : 0;
@@ -2679,19 +2709,22 @@ static fp_node *cur_node(id enc)
     return n;
 }
 
-static void push_acc(fp_node *n, const fp_acc *a)
+static int push_acc(fp_node *n, const fp_acc *a)
 {
     for (int i = n->nacc - 1; i >= 0 && i >= n->nacc - 32; i--) {
         fp_acc *p = &n->acc[i];
-        if (p->store == a->store && p->a0 == a->a0 && p->a1 == a->a1 && p->s0 == a->s0 && p->s1 == a->s1 && p->via == a->via) {
+        if (p->store == a->store && p->a0 == a->a0 && p->a1 == a->a1 && p->s0 == a->s0 && p->s1 == a->s1 &&
+            p->via == a->via && p->mtl4_stage == a->mtl4_stage && (!a->mtl4_stage || p->rw == a->rw)) {
             p->rw |= a->rw;
             if (a->sf < p->sf) p->sf = a->sf;
             if (a->sl > p->sl) p->sl = a->sl;
-            return;
+            if (a->last_epoch > p->last_epoch) p->last_epoch = a->last_epoch;
+            return i;
         }
     }
     PUSH(n->acc, n->nacc, n->cacc, *a);
     __atomic_fetch_add(&g_st[ST_ACCESSES], 1, __ATOMIC_RELAXED);
+    return n->nacc - 1;
 }
 
 static struct { Class c; int k; } g_ck[64]; static atomic_int g_nck;
@@ -2740,6 +2773,7 @@ typedef struct {
 static fp4_resource_index g_fp4_addresses, g_fp4_ids = { .is_id = 1 };
 static pthread_mutex_t g_fp4_resource_lock = PTHREAD_MUTEX_INITIALIZER;
 static uintptr_t g_fp4_store_id;
+static atomic_uint_fast64_t g_fp4_resource_generation;
 static char g_fp4_resource_key;
 
 static uint64_t fp4_index_key(const fp4_resource_index *index, const FP4ResourceOwner *owner)
@@ -2781,6 +2815,7 @@ static void fp4_index_insert(fp4_resource_index *index, FP4ResourceOwner *owner)
     }
     index->items[low] = owner;
     owner->indexed = 1;
+    atomic_fetch_add_explicit(&g_fp4_resource_generation, 1, memory_order_relaxed);
 }
 
 @implementation FP4ResourceOwner
@@ -2792,6 +2827,7 @@ static void fp4_index_insert(fp4_resource_index *index, FP4ResourceOwner *owner)
         int i = fp4_index_lower(index, device, fp4_index_key(index, self));
         if (i < index->n && index->items[i] == self) {
             index->n--;
+            atomic_fetch_add_explicit(&g_fp4_resource_generation, 1, memory_order_relaxed);
             memmove(index->items + i, index->items + i + 1, (size_t)(index->n - i) * sizeof *index->items);
         }
         pthread_mutex_unlock(&g_fp4_resource_lock);
@@ -2846,6 +2882,7 @@ static fp4_resource fp4_texture(id<MTLTexture> t)
     info->slices = tex_slices(t);
     info->shader_write = (t.usage & MTLTextureUsageShaderWrite) != 0;
     if ([t respondsToSelector:@selector(gpuResourceID)]) owner->resource_id = t.gpuResourceID._impl;
+    info->address = owner->resource_id;
 
     id<MTLTexture> parent = t;
     while (parent.parentTexture) {
@@ -2865,7 +2902,7 @@ static fp4_resource fp4_texture(id<MTLTexture> t)
     return fp4_install_resource(t, owner, 0);
 }
 
-static __attribute__((unused)) fp4_resource fp4_lookup(uintptr_t device, uint64_t key, int by_id)
+static fp4_resource fp4_lookup(uintptr_t device, uint64_t key, int by_id)
 {
     if (!key) return (fp4_resource){0};
     pthread_mutex_lock(&g_fp4_resource_lock);
@@ -2883,14 +2920,148 @@ static __attribute__((unused)) fp4_resource fp4_lookup(uintptr_t device, uint64_
     return info;
 }
 
+static int fp4_record_access(fp_node *n, fp4_resource r, uint64_t off, uint64_t end, uint32_t slice, uint32_t slices,
+                             int rw, int stage, int via)
+{
+    if (!r.store) return -1;
+    fp_acc a = {
+        .store = r.store, .a0 = off, .a1 = end, .s0 = slice, .s1 = slice + slices,
+        .is_tex = r.texture, .rw = rw, .via = via, .mtl4_stage = FP4_STAGE(stage),
+        .first_epoch = n->mtl4_epoch, .last_epoch = n->mtl4_epoch, .gpu_address = r.address
+    };
+    if (r.texture) {
+        a.a0 += r.level; a.a1 += r.level; a.s0 += r.slice; a.s1 += r.slice;
+    } else {
+        if (r.levels) { a.a0 = r.offset; a.a1 = UINT64_MAX; } /* buffer-backed texture */
+        a.a1 = MIN(a.a1, r.end - r.address);
+    }
+    if (a.a0 >= a.a1) return -1;
+    n->mtl4_work |= a.mtl4_stage;
+    return push_acc(n, &a);
+}
+
+typedef struct {
+    uint64_t value;
+    int by_id;
+    struct { uint64_t value, generation; int by_id; fp4_resource resource; } cache[2];
+} fp4_arg_slot;
+
+@interface FP4ArgumentState : NSObject {
+@public
+    pthread_mutex_t lock;
+    atomic_uint_fast64_t version;
+    uintptr_t device;
+    NSUInteger buffers, textures;
+    fp4_arg_slot *slots;
+}
+@end
+
+@implementation FP4ArgumentState
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        pthread_mutex_init(&lock, NULL);
+        atomic_init(&version, 1);
+    }
+    return self;
+}
+- (void)dealloc
+{
+    pthread_mutex_destroy(&lock);
+    free(slots);
+    [super dealloc];
+}
+@end
+
+static char g_fp4_argument_key;
+
+static void fp4_set_slot(id table, NSUInteger index, int texture, uint64_t value, int by_id)
+{
+    FP4ArgumentState *state = objc_getAssociatedObject(table, &g_fp4_argument_key);
+    if (!state || index >= (texture ? state->textures : state->buffers)) return;
+    pthread_mutex_lock(&state->lock);
+    fp4_arg_slot *slot = &state->slots[index + (texture ? state->buffers : 0)];
+    if (slot->value != value || slot->by_id != by_id) {
+        slot->value = value;
+        slot->by_id = by_id;
+        atomic_fetch_add_explicit(&state->version, 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&state->lock);
+}
+
+static fp4_resource fp4_resolve_slot(FP4ArgumentState *state, fp4_arg_slot *slot)
+{
+    uint64_t generation = atomic_load_explicit(&g_fp4_resource_generation, memory_order_relaxed);
+    for (int i = 0; i < 2; i++)
+        if (slot->cache[i].value == slot->value && slot->cache[i].by_id == slot->by_id &&
+            slot->cache[i].generation == generation)
+            return slot->cache[i].resource;
+    fp4_resource resource = fp4_lookup(state->device, slot->value, slot->by_id);
+    slot->cache[1] = slot->cache[0];
+    slot->cache[0].value = slot->value;
+    slot->cache[0].by_id = slot->by_id;
+    slot->cache[0].generation = generation;
+    slot->cache[0].resource = resource;
+    return resource;
+}
+
+static void fp4_sample_table(fp_node *n, int stage)
+{
+    FP4ArgumentState *state = n->mtl4_tables[stage];
+    if (!state || n->mtl4_versions[stage] == atomic_load_explicit(&state->version, memory_order_acquire)) return;
+    pthread_mutex_lock(&state->lock);
+    n->mtl4_versions[stage] = atomic_load_explicit(&state->version, memory_order_relaxed);
+    for (NSUInteger i = 0; i < state->buffers + state->textures; i++) {
+        fp4_arg_slot *slot = &state->slots[i];
+        if (!slot->value) continue;
+        fp4_resource r = fp4_resolve_slot(state, slot);
+        if (!r.store) continue;
+        int rw = FP_RD;
+        if (g_bind_maywrite && (i < state->buffers || r.shader_write)) rw |= FP_MAYBE;
+        uint64_t off = slot->by_id ? 0 : slot->value - r.address;
+        fp4_record_access(n, r, off, r.texture ? r.levels : UINT64_MAX, 0, r.slices, rw, stage, VIA_BIND);
+    }
+    pthread_mutex_unlock(&state->lock);
+}
+
+static void fp4_capture_tables(id encoder, unsigned stages)
+{
+    fp_node *n = cur_node(encoder);
+    if (!n || !n->mtl4) return;
+    n->mtl4_work |= stages;
+    while (stages) {
+        int stage = __builtin_ctz(stages);
+        stages &= stages - 1;
+        fp4_sample_table(n, stage);
+    }
+}
+
+static void fp4_bind_table(id encoder, id table, unsigned stages)
+{
+    fp_node *n = cur_node(encoder);
+    if (!n || !n->mtl4) return;
+    FP4ArgumentState *state = objc_getAssociatedObject(table, &g_fp4_argument_key);
+    while (stages) {
+        int stage = __builtin_ctz(stages);
+        stages &= stages - 1;
+        if (n->mtl4_tables[stage] == state) continue;
+        [n->mtl4_tables[stage] release];
+        n->mtl4_tables[stage] = [state retain];
+        n->mtl4_versions[stage] = 0;
+    }
+}
+
 static int acc_buf(fp_node *n, id<MTLBuffer> b, uint64_t off, uint64_t end, int rw, int sf, int sl, int via)
 {
     if (!b || !n) return -1;
+    if (n->mtl4)
+        return fp4_record_access(n, fp4_buffer(b), off, end, 0, 0, rw, FP4_BLIT, via);
     if (b.hazardTrackingMode != MTLHazardTrackingModeUntracked) { __atomic_fetch_add(&g_st[ST_TRACKED], 1, __ATOMIC_RELAXED); return -1; }
     uint64_t len = b.length;
     if (end > len) end = len;
     if (off >= end) return -1;
-    fp_acc a = { (void *)b, off, end, 0, 0, 0, (uint8_t)rw, (uint8_t)sf, (uint8_t)sl, (uint8_t)via };
+    fp_acc a = { (void *)b, off, end, 0, 0, 0, (uint8_t)rw, (uint8_t)sf, (uint8_t)sl, (uint8_t)via, 0, 0, 0, 0 };
     push_acc(n, &a);
     return n->nacc - 1;
 }
@@ -2900,6 +3071,10 @@ static int acc_tex(fp_node *n, id<MTLTexture> t, uint64_t level, uint64_t nlev, 
                    int rw, int sf, int sl, int via)
 {
     if (!t || !n) return -1;
+    if (n->mtl4) {
+        int stage = n->kind == FPK_RENDER ? FP4_FRAGMENT : FP4_BLIT;
+        return fp4_record_access(n, fp4_texture(t), level, level + MAX(1, nlev), slice, MAX(1, nsl), rw, stage, via);
+    }
     while (t.parentTexture) {
         level += t.parentRelativeLevel;
         slice += (uint32_t)t.parentRelativeSlice;
@@ -2908,7 +3083,7 @@ static int acc_tex(fp_node *n, id<MTLTexture> t, uint64_t level, uint64_t nlev, 
     if (t.buffer) return acc_buf(n, t.buffer, t.bufferOffset, UINT64_MAX, rw, sf, sl, via);
     if (t.hazardTrackingMode != MTLHazardTrackingModeUntracked) { __atomic_fetch_add(&g_st[ST_TRACKED], 1, __ATOMIC_RELAXED); return -1; }
     fp_acc a = { (void *)t, level, level + (nlev ? nlev : 1), slice, slice + (nsl ? nsl : 1), 1,
-                 (uint8_t)rw, (uint8_t)sf, (uint8_t)sl, (uint8_t)via };
+                 (uint8_t)rw, (uint8_t)sf, (uint8_t)sl, (uint8_t)via, 0, 0, 0, 0 };
     push_acc(n, &a);
     return n->nacc - 1;
 }
@@ -2982,6 +3157,13 @@ enum {
     H_4_NEW_TEXTURE, H_4_NEW_IOSURFACE, H_4_SHARED_TEXTURE, H_4_SHARED_HANDLE,
     H_4_HEAP_BUFFER_OFFSET, H_4_HEAP_TEXTURE_OFFSET, H_4_BUFFER_TEXTURE,
     H_4_VIEW_FORMAT, H_4_VIEW_RANGE, H_4_VIEW_SWIZZLE, H_4_VIEW_DESC,
+    H_4_ARGUMENT_TABLE, H_4_ADDRESS, H_4_STRIDE, H_4_RESOURCE,
+    H_4_TEXTURE, H_4_BIND_COMPUTE, H_4_BIND_RENDER, H_4_ACCEL_BUILD,
+    H_4_DRAW, H_4_DRAW_I, H_4_DRAW_B, H_4_DRAW_IDX,
+    H_4_DRAW_IDX_I, H_4_DRAW_IDX_B, H_4_DRAW_IND, H_4_DRAW_IDX_IND,
+    H_4_DRAW_MESH_GROUPS, H_4_DRAW_MESH, H_4_DRAW_MESH_IND, H_4_DRAW_TILE,
+    H_4_DISPATCH, H_4_DISPATCH_GROUPS, H_4_DISPATCH_IND, H_4_DISPATCH_GROUPS_IND,
+    H_4_RES_ADD, H_4_RES_ADDS, H_4_RES_REMOVE, H_4_RES_REMOVES, H_4_RES_USE, H_4_RES_USES,
     H_COUNT
 };
 
@@ -3022,7 +3204,8 @@ static void hook_cb(Class cls);
 static void hook_encoder(Class cls, int kind);
 static void hook_event(Class cls);
 static void hook_mtl4_cb(Class cls);
-static void hook_mtl4_encoder(Class cls);
+static void hook_mtl4_encoder(Class cls, int kind);
+static void hook_mtl4_argument(Class cls);
 static void hook_mtl4_queue(Class cls);
 static void hook_mtl4_heap(Class cls);
 static void hook_mtl4_buffer(Class cls);
@@ -3204,7 +3387,7 @@ static fp_cb *cb_record_new(id cb, fp_queue *q, int mtl4)   /* g_lock held */
 {
     uint64_t uid = ++g_cbuid;
     fp_cb *c = &g_cbs[uid % FP_CBPOOL];
-    c->uid = uid; c->cb = (void *)cb; c->q = q; c->state = 1; c->nenc = 0; c->nit = 0; c->mtl4 = mtl4;
+    c->uid = uid; c->cb = (void *)cb; c->q = q; c->state = 1; c->nenc = 0; c->nit = 0; c->mtl4 = mtl4; c->mtl4_resident = 0;
     c->enq = 0; c->commit_tick = 0; c->label[0] = 0;
     c->trace = g_trace_enabled ? trace_cb_new(cb, uid, q ? q->idx : -1, mtl4) : NULL;
     unsigned slot = FP_OPENCB;
@@ -3512,7 +3695,7 @@ static id h_q_cbd(id self, SEL _cmd, id d)
 static fp_node *on_encoder_kind(id cb, id enc, int kind, fp_trace_encoder *trace, int mtl4)
 {
     if (!enc) return NULL;
-    if (mtl4) hook_mtl4_encoder(object_getClass(enc));
+    if (mtl4) hook_mtl4_encoder(object_getClass(enc), kind);
     else hook_encoder(object_getClass(enc), kind);
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)cb);
@@ -3760,13 +3943,25 @@ static void h_mtl4_end(id self, SEL _cmd)
     pthread_mutex_unlock(&g_lock);
 }
 
+API_AVAILABLE(macos(26.0))
+static void fp4_render_attachments(fp_node *n, MTL4RenderPassDescriptor *desc)
+{
+    if (!n || !desc) return;
+    NSUInteger layers = desc.renderTargetArrayLength;
+    for (int i = 0; i < 8; i++) att(n, i, desc.colorAttachments[i], layers);
+    att(n, 8, desc.depthAttachment, layers);
+    att(n, 9, desc.stencilAttachment, layers);
+}
+
 static id h_mtl4_render(id self, SEL _cmd, id desc)
 {
     ENTER;
     fp_trace_encoder *trace = TRACE_ENCODER();
     id enc = ORIG(H_4_RENDER, id (*)(id, SEL, id))(self, _cmd, desc);
     LEAVE;
-    if (OUTER) on_encoder_kind(self, enc, FPK_RENDER, trace, 1);
+    if (OUTER) {
+        if (@available(macOS 26.0, *)) fp4_render_attachments(on_encoder_kind(self, enc, FPK_RENDER, trace, 1), desc);
+    }
     return enc;
 }
 
@@ -3776,7 +3971,9 @@ static id h_mtl4_render_opts(id self, SEL _cmd, id desc, NSUInteger options)
     fp_trace_encoder *trace = TRACE_ENCODER();
     id enc = ORIG(H_4_RENDER_OPTS, id (*)(id, SEL, id, NSUInteger))(self, _cmd, desc, options);
     LEAVE;
-    if (OUTER) on_encoder_kind(self, enc, FPK_RENDER, trace, 1);
+    if (OUTER) {
+        if (@available(macOS 26.0, *)) fp4_render_attachments(on_encoder_kind(self, enc, FPK_RENDER, trace, 1), desc);
+    }
     return enc;
 }
 
@@ -3800,6 +3997,274 @@ static id h_mtl4_ml(id self, SEL _cmd)
     }
     return enc;
 }
+
+API_AVAILABLE(macos(26.0))
+static id h_mtl4_argument_table(id self, SEL _cmd, MTL4ArgumentTableDescriptor *desc, NSError **error)
+{
+    ENTER;
+    id<MTL4ArgumentTable> table = ORIG(H_4_ARGUMENT_TABLE, id (*)(id, SEL, id, NSError **))(self, _cmd, desc, error);
+    LEAVE;
+    if (OUTER && table) {
+        FP4ArgumentState *state = [[FP4ArgumentState alloc] init];
+        state->device = (uintptr_t)table.device;
+        state->buffers = desc.maxBufferBindCount;
+        state->textures = desc.maxTextureBindCount;
+        state->slots = calloc(state->buffers + state->textures, sizeof *state->slots);
+        if (state->slots) {
+            objc_setAssociatedObject(table, &g_fp4_argument_key, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            hook_mtl4_argument(object_getClass(table));
+        }
+        [state release];
+    }
+    return table;
+}
+
+static void h_mtl4_address(id self, SEL _cmd, uint64_t address, NSUInteger index)
+{
+    ENTER;
+    ORIG(H_4_ADDRESS, void (*)(id, SEL, uint64_t, NSUInteger))(self, _cmd, address, index);
+    LEAVE;
+    if (OUTER) fp4_set_slot(self, index, 0, address, 0);
+}
+
+static void h_mtl4_stride(id self, SEL _cmd, uint64_t address, NSUInteger stride, NSUInteger index)
+{
+    ENTER;
+    ORIG(H_4_STRIDE, void (*)(id, SEL, uint64_t, NSUInteger, NSUInteger))(self, _cmd, address, stride, index);
+    LEAVE;
+    if (OUTER) fp4_set_slot(self, index, 0, address, 0);
+}
+
+static void h_mtl4_resource(id self, SEL _cmd, MTLResourceID resource, NSUInteger index)
+{
+    ENTER;
+    ORIG(H_4_RESOURCE, void (*)(id, SEL, MTLResourceID, NSUInteger))(self, _cmd, resource, index);
+    LEAVE;
+    if (OUTER) fp4_set_slot(self, index, 0, resource._impl, 1);
+}
+
+static void h_mtl4_texture(id self, SEL _cmd, MTLResourceID resource, NSUInteger index)
+{
+    ENTER;
+    ORIG(H_4_TEXTURE, void (*)(id, SEL, MTLResourceID, NSUInteger))(self, _cmd, resource, index);
+    LEAVE;
+    if (OUTER) fp4_set_slot(self, index, 1, resource._impl, 1);
+}
+
+static void h_mtl4_bind_compute(id self, SEL _cmd, id table)
+{
+    ENTER; ORIG(H_4_BIND_COMPUTE, void (*)(id, SEL, id))(self, _cmd, table); LEAVE;
+    if (OUTER) fp4_bind_table(self, table, FP4_STAGE(FP4_DISPATCH));
+}
+
+static void h_mtl4_bind_render(id self, SEL _cmd, id table, NSUInteger stages)
+{
+    ENTER; ORIG(H_4_BIND_RENDER, void (*)(id, SEL, id, NSUInteger))(self, _cmd, table, stages); LEAVE;
+    if (OUTER) fp4_bind_table(self, table, (unsigned)stages & (FP4_STAGE(FP4_MESH + 1) - 1));
+}
+
+static void fp4_index_access(id enc, uint64_t address, NSUInteger length)
+{
+    fp_node *n = cur_node(enc);
+    if (!n || !n->mtl4 || !address || !length) return;
+    /* The encoder's device is the same one used to create its command buffer. */
+    fp4_resource resource = fp4_lookup((uintptr_t)[enc device], address, 0);
+    if (!resource.store) return;
+    uint64_t offset = address - resource.address;
+    fp4_record_access(n, resource, offset, offset + MIN(length, UINT64_MAX - offset),
+                      0, 0, FP_RD, FP4_VERTEX, VIA_INDEX);
+}
+
+API_AVAILABLE(macos(26.0))
+static void h_mtl4_accel_build(id self, SEL _cmd, id accel, id descriptor, MTL4BufferRange scratch)
+{
+    ENTER;
+    ORIG(H_4_ACCEL_BUILD, void (*)(id, SEL, id, id, MTL4BufferRange))(self, _cmd, accel, descriptor, scratch);
+    LEAVE;
+    if (OUTER) {
+        __atomic_fetch_add(&g_mtl4_accel_builds, 1, __ATOMIC_RELAXED);
+        fp_node *n = cur_node(self);
+        if (n && n->mtl4) n->mtl4_work |= FP4_STAGE(FP4_ACCEL);
+    }
+}
+
+static void h_mtl4_draw(id self, SEL _cmd, NSUInteger primitive, NSUInteger start, NSUInteger count)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    ORIG(H_4_DRAW, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count);
+    LEAVE;
+}
+
+static void h_mtl4_draw_i(id self, SEL _cmd, NSUInteger primitive, NSUInteger start, NSUInteger count, NSUInteger instances)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    ORIG(H_4_DRAW_I, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count, instances);
+    LEAVE;
+}
+
+static void h_mtl4_draw_b(id self, SEL _cmd, NSUInteger primitive, NSUInteger start, NSUInteger count, NSUInteger instances, NSUInteger base)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    ORIG(H_4_DRAW_B, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count, instances, base);
+    LEAVE;
+}
+
+static void h_mtl4_draw_idx(id self, SEL _cmd, NSUInteger primitive, NSUInteger count, NSUInteger index_type, uint64_t index_address, NSUInteger index_bytes)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    if (OUTER) fp4_index_access(self, index_address, index_bytes);
+    ORIG(H_4_DRAW_IDX, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes);
+    LEAVE;
+}
+
+static void h_mtl4_draw_idx_i(id self, SEL _cmd, NSUInteger primitive, NSUInteger count, NSUInteger index_type, uint64_t index_address, NSUInteger index_bytes, NSUInteger instances)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    if (OUTER) fp4_index_access(self, index_address, index_bytes);
+    ORIG(H_4_DRAW_IDX_I, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes, instances);
+    LEAVE;
+}
+
+static void h_mtl4_draw_idx_b(id self, SEL _cmd, NSUInteger primitive, NSUInteger count, NSUInteger index_type, uint64_t index_address, NSUInteger index_bytes, NSUInteger instances, NSInteger base_vertex, NSUInteger base_instance)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    if (OUTER) fp4_index_access(self, index_address, index_bytes);
+    ORIG(H_4_DRAW_IDX_B, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger, NSUInteger, NSInteger, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes, instances, base_vertex, base_instance);
+    LEAVE;
+}
+
+static void h_mtl4_draw_ind(id self, SEL _cmd, NSUInteger primitive, uint64_t indirect)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    ORIG(H_4_DRAW_IND, void (*)(id, SEL, NSUInteger, uint64_t))(self, _cmd, primitive, indirect);
+    LEAVE;
+}
+
+static void h_mtl4_draw_idx_ind(id self, SEL _cmd, NSUInteger primitive, NSUInteger index_type, uint64_t index_address, NSUInteger index_bytes, uint64_t indirect)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    if (OUTER) fp4_index_access(self, index_address, index_bytes);
+    ORIG(H_4_DRAW_IDX_IND, void (*)(id, SEL, NSUInteger, NSUInteger, uint64_t, NSUInteger, uint64_t))(self, _cmd, primitive, index_type, index_address, index_bytes, indirect);
+    LEAVE;
+}
+
+static void h_mtl4_draw_mesh_groups(id self, SEL _cmd, MTLSize grid, MTLSize object, MTLSize mesh)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, (FP4_STAGE(FP4_OBJECT) | FP4_STAGE(FP4_MESH) | FP4_STAGE(FP4_FRAGMENT)));
+    ORIG(H_4_DRAW_MESH_GROUPS, void (*)(id, SEL, MTLSize, MTLSize, MTLSize))(self, _cmd, grid, object, mesh);
+    LEAVE;
+}
+
+static void h_mtl4_draw_mesh(id self, SEL _cmd, MTLSize grid, MTLSize object, MTLSize mesh)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, (FP4_STAGE(FP4_OBJECT) | FP4_STAGE(FP4_MESH) | FP4_STAGE(FP4_FRAGMENT)));
+    ORIG(H_4_DRAW_MESH, void (*)(id, SEL, MTLSize, MTLSize, MTLSize))(self, _cmd, grid, object, mesh);
+    LEAVE;
+}
+
+static void h_mtl4_draw_mesh_ind(id self, SEL _cmd, uint64_t indirect, MTLSize object, MTLSize mesh)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, (FP4_STAGE(FP4_OBJECT) | FP4_STAGE(FP4_MESH) | FP4_STAGE(FP4_FRAGMENT)));
+    ORIG(H_4_DRAW_MESH_IND, void (*)(id, SEL, uint64_t, MTLSize, MTLSize))(self, _cmd, indirect, object, mesh);
+    LEAVE;
+}
+
+static void h_mtl4_draw_tile(id self, SEL _cmd, MTLSize threads)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_TILE));
+    ORIG(H_4_DRAW_TILE, void (*)(id, SEL, MTLSize))(self, _cmd, threads);
+    LEAVE;
+}
+
+static void h_mtl4_dispatch(id self, SEL _cmd, MTLSize grid, MTLSize threads)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
+    ORIG(H_4_DISPATCH, void (*)(id, SEL, MTLSize, MTLSize))(self, _cmd, grid, threads);
+    LEAVE;
+}
+
+static void h_mtl4_dispatch_groups(id self, SEL _cmd, MTLSize grid, MTLSize threads)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
+    ORIG(H_4_DISPATCH_GROUPS, void (*)(id, SEL, MTLSize, MTLSize))(self, _cmd, grid, threads);
+    LEAVE;
+}
+
+static void h_mtl4_dispatch_ind(id self, SEL _cmd, uint64_t indirect)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
+    ORIG(H_4_DISPATCH_IND, void (*)(id, SEL, uint64_t))(self, _cmd, indirect);
+    LEAVE;
+}
+
+static void h_mtl4_dispatch_groups_ind(id self, SEL _cmd, uint64_t indirect, MTLSize threads)
+{
+    ENTER;
+    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
+    ORIG(H_4_DISPATCH_GROUPS_IND, void (*)(id, SEL, uint64_t, MTLSize))(self, _cmd, indirect, threads);
+    LEAVE;
+}
+
+API_AVAILABLE(macos(26.0))
+static void mtl4_residency(id self, const id *sets, NSUInteger count, int add, int is_cb)
+{
+    for (NSUInteger at = 0; at < count; at++) {
+        void *set = (void *)sets[at];
+        if (add && ![(id<MTLResidencySet>)sets[at] allocationCount]) continue;
+        pthread_mutex_lock(&g_lock);
+        if (is_cb) {
+            fp_cb *c = cb_find_open((void *)self);
+            if (c && c->mtl4) c->mtl4_resident = 1;
+        } else {
+            fp_queue *q = queue_get_kind((void *)self, 1);
+            if (q) {
+                int i = 0;
+                while (i < q->mtl4_nresidency && q->mtl4_residency[i] != set) i++;
+                if (add && i == q->mtl4_nresidency)
+                    PUSH(q->mtl4_residency, q->mtl4_nresidency, q->mtl4_cresidency, set);
+                else if (!add && i < q->mtl4_nresidency)
+                    q->mtl4_residency[i] = q->mtl4_residency[--q->mtl4_nresidency];
+            }
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
+}
+
+#define FP4_RES_SINGLE(fn, hook_id, add, cb) \
+    API_AVAILABLE(macos(26.0)) \
+    static void fn(id self, SEL _cmd, id set) { \
+        ENTER; ORIG(hook_id, void (*)(id, SEL, id))(self, _cmd, set); LEAVE; \
+        if (OUTER) mtl4_residency(self, &set, 1, add, cb); \
+    }
+#define FP4_RES_ARRAY(fn, hook_id, add, cb) \
+    API_AVAILABLE(macos(26.0)) \
+    static void fn(id self, SEL _cmd, const id *sets, NSUInteger count) { \
+        ENTER; ORIG(hook_id, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, sets, count); LEAVE; \
+        if (OUTER) mtl4_residency(self, sets, count, add, cb); \
+    }
+FP4_RES_SINGLE(h_mtl4_res_add, H_4_RES_ADD, 1, 0)
+FP4_RES_ARRAY(h_mtl4_res_adds, H_4_RES_ADDS, 1, 0)
+FP4_RES_SINGLE(h_mtl4_res_remove, H_4_RES_REMOVE, 0, 0)
+FP4_RES_ARRAY(h_mtl4_res_removes, H_4_RES_REMOVES, 0, 0)
+FP4_RES_SINGLE(h_mtl4_res_use, H_4_RES_USE, 1, 1)
+FP4_RES_ARRAY(h_mtl4_res_uses, H_4_RES_USES, 1, 1)
+#undef FP4_RES_SINGLE
+#undef FP4_RES_ARRAY
 
 static void cb_item(id cb, int type, id ev, uint64_t val)
 {
@@ -4336,6 +4801,12 @@ static void h_end(id self, SEL _cmd)
     fp_node *n = cur_node(self);
     if (!n) return;
     NSString *l = [self label];
+    if (n->mtl4) {
+        for (int i = 0; i < FP4_TABLES; i++) {
+            [n->mtl4_tables[i] release];
+            n->mtl4_tables[i] = nil;
+        }
+    }
     pthread_mutex_lock(&g_lock);
     if (n->mtl4) snprintf(n->label, sizeof n->label, "MTL4 %s", l.length ? l.UTF8String : kind_name[n->kind]);
     else if (l) snprintf(n->label, sizeof n->label, "%s", l.UTF8String);
@@ -4683,10 +5154,11 @@ static const hook_def device_hooks[] = {
     HD(H_DEV_NEWSEV, "newSharedEvent", h_dev_newsev),
     HD(H_DEV_NEWEV, "newEvent", h_dev_newev),
 };
-static const hook_def mtl4_device_hooks[] = {
+static const hook_def mtl4_device_hooks[] API_AVAILABLE(macos(26.0)) = {
     HD(H_4_DEV_Q, "newMTL4CommandQueue", h_mtl4_dev_q),
     HD(H_4_DEV_Q_DESC, "newMTL4CommandQueueWithDescriptor:error:", h_mtl4_dev_q_desc),
     HD(H_4_DEV_CB, "newCommandBuffer", h_mtl4_dev_cb),
+    HD(H_4_ARGUMENT_TABLE, "newArgumentTableWithDescriptor:error:", h_mtl4_argument_table),
     HD(H_4_NEW_HEAP, "newHeapWithDescriptor:", h_mtl4_new_heap),
     HD(H_4_NEW_BUFFER, "newBufferWithLength:options:", h_mtl4_new_buffer),
     HD(H_4_NEW_BYTES, "newBufferWithBytes:length:options:", h_mtl4_new_bytes),
@@ -4712,7 +5184,7 @@ static const hook_def mtl4_texture_hooks[] = {
     HD(H_4_VIEW_SWIZZLE, "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:", h_mtl4_view_swizzle),
     HD(H_4_VIEW_DESC, "newTextureViewWithDescriptor:", h_mtl4_view_desc),
 };
-static const hook_def mtl4_cb_hooks[] = {
+static const hook_def mtl4_cb_hooks[] API_AVAILABLE(macos(26.0)) = {
     HD(H_4_BEGIN, "beginCommandBufferWithAllocator:", h_mtl4_begin),
     HD(H_4_BEGIN_OPTS, "beginCommandBufferWithAllocator:options:", h_mtl4_begin_opts),
     HD(H_4_END, "endCommandBuffer", h_mtl4_end),
@@ -4720,17 +5192,64 @@ static const hook_def mtl4_cb_hooks[] = {
     HD(H_4_RENDER_OPTS, "renderCommandEncoderWithDescriptor:options:", h_mtl4_render_opts),
     HD(H_4_COMPUTE, "computeCommandEncoder", h_mtl4_compute),
     HD(H_4_ML, "machineLearningCommandEncoder", h_mtl4_ml),
+    HD(H_4_RES_USE, "useResidencySet:", h_mtl4_res_use),
+    HD(H_4_RES_USES, "useResidencySets:count:", h_mtl4_res_uses),
 };
-static const hook_def mtl4_encoder_hooks[] = {
+static const hook_def mtl4_argument_hooks[] = {
+    HD(H_4_ADDRESS, "setAddress:atIndex:", h_mtl4_address),
+    HD(H_4_STRIDE, "setAddress:attributeStride:atIndex:", h_mtl4_stride),
+    HD(H_4_RESOURCE, "setResource:atBufferIndex:", h_mtl4_resource),
+    HD(H_4_TEXTURE, "setTexture:atIndex:", h_mtl4_texture),
+};
+static const hook_def mtl4_render_hooks[] = {
     HD(H_END, "endEncoding", h_end),
+    HD(H_R_CSA, "setColorStoreAction:atIndex:", h_r_csa),
+    HD(H_R_DSA, "setDepthStoreAction:", h_r_dsa),
+    HD(H_R_SSA, "setStencilStoreAction:", h_r_ssa),
+    HD(H_4_BIND_RENDER, "setArgumentTable:atStages:", h_mtl4_bind_render),
+    HD(H_4_DRAW, "drawPrimitives:vertexStart:vertexCount:", h_mtl4_draw),
+    HD(H_4_DRAW_I, "drawPrimitives:vertexStart:vertexCount:instanceCount:", h_mtl4_draw_i),
+    HD(H_4_DRAW_B, "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:", h_mtl4_draw_b),
+    HD(H_4_DRAW_IDX, "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferLength:", h_mtl4_draw_idx),
+    HD(H_4_DRAW_IDX_I, "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferLength:instanceCount:", h_mtl4_draw_idx_i),
+    HD(H_4_DRAW_IDX_B, "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferLength:instanceCount:baseVertex:baseInstance:", h_mtl4_draw_idx_b),
+    HD(H_4_DRAW_IND, "drawPrimitives:indirectBuffer:", h_mtl4_draw_ind),
+    HD(H_4_DRAW_IDX_IND, "drawIndexedPrimitives:indexType:indexBuffer:indexBufferLength:indirectBuffer:", h_mtl4_draw_idx_ind),
+    HD(H_4_DRAW_MESH_GROUPS, "drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:", h_mtl4_draw_mesh_groups),
+    HD(H_4_DRAW_MESH, "drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:", h_mtl4_draw_mesh),
+    HD(H_4_DRAW_MESH_IND, "drawMeshThreadgroupsWithIndirectBuffer:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:", h_mtl4_draw_mesh_ind),
+    HD(H_4_DRAW_TILE, "dispatchThreadsPerTile:", h_mtl4_draw_tile),
 };
-static const hook_def mtl4_queue_hooks[] = {
+static const hook_def mtl4_compute_hooks[] API_AVAILABLE(macos(26.0)) = {
+    HD(H_END, "endEncoding", h_end),
+    HD(H_4_BIND_COMPUTE, "setArgumentTable:", h_mtl4_bind_compute),
+    HD(H_4_ACCEL_BUILD, "buildAccelerationStructure:descriptor:scratchBuffer:", h_mtl4_accel_build),
+    HD(H_4_DISPATCH, "dispatchThreads:threadsPerThreadgroup:", h_mtl4_dispatch),
+    HD(H_4_DISPATCH_GROUPS, "dispatchThreadgroups:threadsPerThreadgroup:", h_mtl4_dispatch_groups),
+    HD(H_4_DISPATCH_IND, "dispatchThreadsWithIndirectBuffer:", h_mtl4_dispatch_ind),
+    HD(H_4_DISPATCH_GROUPS_IND, "dispatchThreadgroupsWithIndirectBuffer:threadsPerThreadgroup:", h_mtl4_dispatch_groups_ind),
+    HD(H_B_BB, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:", h_b_bb),
+    HD(H_B_BT, "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:", h_b_bt),
+    HD(H_B_BT_O, "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:options:", h_b_bt_o),
+    HD(H_B_TB, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:", h_b_tb),
+    HD(H_B_TB_O, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:options:", h_b_tb_o),
+    HD(H_B_TT, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:", h_b_tt),
+    HD(H_B_TT_N, "copyFromTexture:sourceSlice:sourceLevel:toTexture:destinationSlice:destinationLevel:sliceCount:levelCount:", h_b_tt_n),
+    HD(H_B_TT_ALL, "copyFromTexture:toTexture:", h_b_tt_all),
+    HD(H_B_FILL, "fillBuffer:range:value:", h_b_fill),
+    HD(H_B_MIP, "generateMipmapsForTexture:", h_b_mip),
+};
+static const hook_def mtl4_queue_hooks[] API_AVAILABLE(macos(26.0)) = {
     HD(H_4_COMMIT, "commit:count:", h_mtl4_commit),
     HD(H_4_COMMIT_OPTS, "commit:count:options:", h_mtl4_commit_opts),
     HD(H_4_SIGNAL, "signalEvent:value:", h_mtl4_signal),
     HD(H_4_WAIT, "waitForEvent:value:", h_mtl4_wait),
     HD(H_4_DRAWABLE_SIGNAL, "signalDrawable:", h_mtl4_drawable_signal),
     HD(H_4_DRAWABLE_WAIT, "waitForDrawable:", h_mtl4_drawable_wait),
+    HD(H_4_RES_ADD, "addResidencySet:", h_mtl4_res_add),
+    HD(H_4_RES_ADDS, "addResidencySets:count:", h_mtl4_res_adds),
+    HD(H_4_RES_REMOVE, "removeResidencySet:", h_mtl4_res_remove),
+    HD(H_4_RES_REMOVES, "removeResidencySets:count:", h_mtl4_res_removes),
 };
 static const hook_def queue_hooks[] = {
     HD(H_Q_CB, "commandBuffer", h_q_cb),
@@ -4841,9 +5360,20 @@ static void hook_device(Class cls)
 static void hook_queue(Class cls) { install(cls, 101, queue_hooks, N(queue_hooks)); }
 static void hook_cb(Class cls) { install(cls, 102, cb_hooks, N(cb_hooks)); }
 static void hook_event(Class cls) { install(cls, 103, event_hooks, N(event_hooks)); }
-static void hook_mtl4_cb(Class cls) { install(cls, 105, mtl4_cb_hooks, N(mtl4_cb_hooks)); }
-static void hook_mtl4_encoder(Class cls) { install(cls, 106, mtl4_encoder_hooks, N(mtl4_encoder_hooks)); }
-static void hook_mtl4_queue(Class cls) { install(cls, 107, mtl4_queue_hooks, N(mtl4_queue_hooks)); }
+static void hook_mtl4_cb(Class cls)
+{
+    if (@available(macOS 26.0, *)) install(cls, 105, mtl4_cb_hooks, N(mtl4_cb_hooks));
+}
+static void hook_mtl4_encoder(Class cls, int kind)
+{
+    if (kind == FPK_RENDER) install(cls, 106, mtl4_render_hooks, N(mtl4_render_hooks));
+    else if (@available(macOS 26.0, *)) install(cls, 112, mtl4_compute_hooks, N(mtl4_compute_hooks));
+}
+static void hook_mtl4_argument(Class cls) { install(cls, 111, mtl4_argument_hooks, N(mtl4_argument_hooks)); }
+static void hook_mtl4_queue(Class cls)
+{
+    if (@available(macOS 26.0, *)) install(cls, 107, mtl4_queue_hooks, N(mtl4_queue_hooks));
+}
 static void hook_mtl4_heap(Class cls) { install(cls, 108, mtl4_heap_hooks, N(mtl4_heap_hooks)); }
 static void hook_mtl4_buffer(Class cls) { install(cls, 109, mtl4_buffer_hooks, N(mtl4_buffer_hooks)); }
 static void hook_mtl4_texture(Class cls) { install(cls, 110, mtl4_texture_hooks, N(mtl4_texture_hooks)); }
