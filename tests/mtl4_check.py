@@ -86,6 +86,15 @@ def run(arch, directory):
     assert len(arrows) == 2
     print("same-event wait: 2 producer arrows, 0 timeouts, 0 uncertain", flush=True)
 
+    path = directory / "many-waits.json"
+    subprocess.run(command(arch, dict(injection, FENCEPOST_TRACE=path), "--many-waits"),
+                   env=env, check=True, timeout=20)
+    subprocess.run([sys.executable, "-I", ROOT / "tests/trace_check.py", path], check=True)
+    events = json.loads(path.read_text())
+    render = [e["args"]["event_waits"] for e in events if e.get("cat") == "render"]
+    assert [[w["value"] for w in waits] for waits in render] == [list(range(1, 41))] * 2
+    print("40 queue waits retained for each render encoder", flush=True)
+
     trigger_file = directory / "mtl4.trigger"
     prefix = directory / "ring"
     knobs = dict(injection, FENCEPOST_TRACE=prefix, FENCEPOST_RING=3, FENCEPOST_RING_AFTER=2,

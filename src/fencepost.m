@@ -132,8 +132,8 @@ typedef struct fp_queue {
     uint64_t recent[FP_QRECENT]; uint64_t nrecent;
     uint64_t bar_mark, bar_cb; int bar_idx;   /* the last declared barrier */
     uint64_t *held; int nheld, cheld;
-    fp_evwait mtl4_waits[32];
-    int mtl4_nwaits;
+    fp_evwait *mtl4_waits;
+    int mtl4_nwaits, mtl4_cwaits;
     struct fp_trace_cb *mtl4_last_trace;
     uint64_t mtl4_signal_limit, mtl4_signals_done;
 } fp_queue;
@@ -2542,10 +2542,6 @@ static void phase1(fp_cb *c)
     fp_evwait active[32]; int nactive = 0;
     fp_queue *q = c->q;
     fp_trace_cb *trace = g_trace_enabled ? c->trace : NULL;
-    if (c->mtl4) {
-        nactive = q->mtl4_nwaits;
-        memcpy(active, q->mtl4_waits, (size_t)nactive * sizeof *active);
-    }
     if (trace && !c->mtl4) {
         trace->span.frame = g_frame_cur;  /* fallback for an encoderless CB */
         if (trace_frame_selected(g_frame_cur) && !g_trace_stopped) trace->selected = 1;
@@ -2585,7 +2581,9 @@ static void phase1(fp_cb *c)
                 if (s >= 0) { g_fence[s].uid = n->uid; g_fence[s].after = n->fu[k].st; }
             }
         }
-        phase_node(q, n, c->commit_tick, trace, active, nactive);
+        const fp_evwait *waits = c->mtl4 ? q->mtl4_waits : active;
+        int nwaits = c->mtl4 ? q->mtl4_nwaits : nactive;
+        phase_node(q, n, c->commit_tick, trace, waits, nwaits);
     }
     if (trace && !c->mtl4) {
         if (g_ring && trace->selected) {
@@ -3921,8 +3919,9 @@ static void mtl4_record_event(id queue, fp_item item)
         q->mtl4_signal_limit = q->nrecent;
         trace_mtl4_signal(q, n->uid, item.val);
         process_pending(0);
-    } else if (q && q->mtl4_nwaits < 32) {
-        q->mtl4_waits[q->mtl4_nwaits++] = (fp_evwait){ item.ev, item.val, 0 };
+    } else if (q) {
+        fp_evwait wait = { item.ev, item.val, 0 };
+        PUSH(q->mtl4_waits, q->mtl4_nwaits, q->mtl4_cwaits, wait);
     }
     pthread_mutex_unlock(&g_lock);
 }
