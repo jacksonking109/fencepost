@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import select
+from statistics import median
 import subprocess
 import sys
 import tempfile
@@ -60,9 +61,30 @@ def check_trace(path, frames, *, dump=False):
     print(f"{len(frames)} frames, {len(commits)} real GPU commit spans, {len(frames) * 2} event flows", flush=True)
 
 
+def clean_env():
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith("FENCEPOST_") and k not in ("DYLD_INSERT_LIBRARIES", "MTL_CAPTURE_ENABLED")}
+
+
+def check_threads(arch):
+    env = clean_env()
+    result = "threaded commits=512 checksum=522240 producer_feedback=256 consumer_feedback=256 errors=0"
+    timing = {False: [], True: []}
+    prefix = "threaded wall time "
+    for i in range(5):
+        for injected in ((False, True) if i % 2 == 0 else (True, False)):
+            knobs = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost.dylib"} if injected else {}
+            output = subprocess.check_output(command(arch, knobs, "--threads"), env=env, text=True, timeout=20)
+            observed, wall = output.splitlines()
+            assert observed == result and wall.startswith(prefix) and wall.endswith(" ms"), output
+            timing[injected].append(float(wall[len(prefix):-3]))
+    print(f"{arch}: {result} (5 runs each)")
+    print(f"{arch}: median threaded wall time {median(timing[False]):.3f} ms without, "
+          f"{median(timing[True]):.3f} ms with fencepost")
+
+
 def run(arch, directory):
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("FENCEPOST_") and k not in ("DYLD_INSERT_LIBRARIES", "MTL_CAPTURE_ENABLED")}
+    env = clean_env()
     injection = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost.dylib"}
     for mode in ("api", "drawable"):
         flags = ("--drawable",) if mode == "drawable" else ()
@@ -124,7 +146,11 @@ def run(arch, directory):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("arch", choices=["arm64", "x86_64"])
+    parser.add_argument("--threads", action="store_true", help="compare five threaded runs with and without injection")
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-") as directory:
-        run(args.arch, Path(directory))
-    print(f"{args.arch}: Metal 4 API, drawable and CLI ring checks passed")
+    if args.threads:
+        check_threads(args.arch)
+    else:
+        with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-") as directory:
+            run(args.arch, Path(directory))
+        print(f"{args.arch}: Metal 4 API, drawable and CLI ring checks passed")

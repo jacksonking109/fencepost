@@ -1,8 +1,10 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>
+#include <stdatomic.h>
 
-enum { FrameCount = 60, WarmupCount = 5, SampleCount = FrameCount - WarmupCount };
+enum { FrameCount = 60, WarmupCount = 5, SampleCount = FrameCount - WarmupCount,
+       CommitCount = 1024, CommitWarmup = 64, CommitSlots = 8 };
 
 static NSString *const shader = @"#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -70,18 +72,18 @@ static BOOL runMetal3(id<MTLDevice> device, id<MTLRenderPipelineState> pipeline,
 API_AVAILABLE(macos(26.0))
 static BOOL runMetal4(id<MTLDevice> device, id<MTLRenderPipelineState> pipeline,
                       id<MTLBuffer> vertexBuffer, NSArray<id<MTLTexture>> *textures,
-                      id<MTLTexture> target, NSUInteger draws, uint64_t ticks[SampleCount])
+                      NSArray<id<MTLTexture>> *targets, NSUInteger draws, BOOL commit_heavy,
+                      uint64_t *ticks)
 {
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
-    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
     id<MTL4CommandBuffer> commands = [device newCommandBuffer];
-    if (!queue || !allocator || !commands) return failure(@"Metal 4 command setup failed", nil);
+    if (!queue || !commands) return failure(@"Metal 4 command setup failed", nil);
 
     NSError *error = nil;
     id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
     if (!residency) return failure(@"residency set creation failed", error);
     [residency addAllocation:vertexBuffer];
-    [residency addAllocation:target];
+    for (id<MTLTexture> target in targets) [residency addAllocation:target];
     for (id<MTLTexture> texture in textures) [residency addAllocation:texture];
     [residency commit];
     [queue addResidencySet:residency];
@@ -94,21 +96,44 @@ static BOOL runMetal4(id<MTLDevice> device, id<MTLRenderPipelineState> pipeline,
     MTLGPUAddress address = vertexBuffer.gpuAddress;
     MTLResourceID bindings[] = {textures[0].gpuResourceID, textures[1].gpuResourceID};
 
-    MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];
-    configureAttachment(pass.colorAttachments[0], target);
-    dispatch_semaphore_t completion = dispatch_semaphore_create(0);
-    __block NSError *gpuError = nil;
+    NSUInteger slots = targets.count;
+    id<MTL4CommandAllocator> allocators[CommitSlots];
+    MTL4RenderPassDescriptor *passes[CommitSlots];
+    dispatch_semaphore_t retired[CommitSlots];
+    for (NSUInteger slot = 0; slot < slots; slot++) {
+        allocators[slot] = [device newCommandAllocator];
+        if (!allocators[slot]) return failure(@"Metal 4 command allocator creation failed", nil);
+        passes[slot] = [MTL4RenderPassDescriptor new];
+        configureAttachment(passes[slot].colorAttachments[0], targets[slot]);
+        retired[slot] = dispatch_semaphore_create(0);
+    }
 
-    for (int frame = 0; frame < FrameCount; ++frame) @autoreleasepool {
-        // Register fresh feedback outside the timed section. Reusing options can lose a callback.
+    __block atomic_int gpu_errors = 0;
+    NSUInteger commits = commit_heavy ? CommitCount : FrameCount;
+    NSUInteger warmup = commit_heavy ? CommitWarmup : WarmupCount;
+    for (NSUInteger i = 0; i < commits; i++) @autoreleasepool {
+        NSUInteger slot = i % slots;
+        id<MTL4CommandAllocator> allocator = allocators[slot];
+        dispatch_semaphore_t completion = retired[slot];
+        // Every in-flight slot has its own allocator and render target.
+        if (i >= slots) {
+            if (dispatch_semaphore_wait(completion, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
+                return failure(@"timed out waiting for Metal 4 commit feedback", nil);
+            if (atomic_load(&gpu_errors)) return NO;
+            [allocator reset];
+        }
+        uint64_t start = mach_absolute_time();
         MTL4CommitOptions *commit = [MTL4CommitOptions new];
         [commit addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-            gpuError = feedback.error;
+            if (feedback.error) {
+                failure(@"Metal 4 render failed", feedback.error);
+                atomic_fetch_add(&gpu_errors, 1);
+            }
             dispatch_semaphore_signal(completion);
         }];
-        uint64_t start = mach_absolute_time();
+        if (!commit_heavy) start = mach_absolute_time();  // Keep the existing per-draw measurement.
         [commands beginCommandBufferWithAllocator:allocator];
-        id<MTL4RenderCommandEncoder> render = [commands renderCommandEncoderWithDescriptor:pass];
+        id<MTL4RenderCommandEncoder> render = [commands renderCommandEncoderWithDescriptor:passes[slot]];
         if (!render) return failure(@"Metal 4 encoder creation failed", nil);
         [render setRenderPipelineState:pipeline];
         [render setViewport:viewport];
@@ -123,13 +148,12 @@ static BOOL runMetal4(id<MTLDevice> device, id<MTLRenderPipelineState> pipeline,
         [commands endCommandBuffer];
         [queue commit:&commands count:1 options:commit];
         uint64_t elapsed = mach_absolute_time() - start;
-        if (dispatch_semaphore_wait(completion, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
-            return failure(@"timed out waiting for Metal 4 commit feedback", nil);
-        if (gpuError) return failure(@"Metal 4 render failed", gpuError);
-        [allocator reset];
-        if (frame >= WarmupCount) ticks[frame - WarmupCount] = elapsed;
+        if (i >= warmup) ticks[i - warmup] = elapsed;
     }
-    return YES;
+    for (NSUInteger slot = 0; slot < slots; slot++)
+        if (dispatch_semaphore_wait(retired[slot], dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
+            return failure(@"timed out draining Metal 4 commit feedback", nil);
+    return atomic_load(&gpu_errors) == 0;
 }
 
 static int compareTicks(const void *a, const void *b)
@@ -138,7 +162,7 @@ static int compareTicks(const void *a, const void *b)
     return (first > second) - (first < second);
 }
 
-static int benchmark(BOOL metal4, NSUInteger draws)
+static int benchmark(BOOL metal4, BOOL commit_heavy, NSUInteger draws)
 {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) {
@@ -172,11 +196,18 @@ static int benchmark(BOOL metal4, NSUInteger draws)
     memcpy(vertexData[1], vertices, sizeof(vertices));
     __attribute__((objc_precise_lifetime)) id<MTLBuffer> vertexBuffer =
         [device newBufferWithBytes:vertexData length:sizeof(vertexData) options:MTLResourceStorageModeShared];
+    NSUInteger size = commit_heavy ? 16 : 256;
     MTLTextureDescriptor *targetDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-        width:256 height:256 mipmapped:NO];
+        width:size height:size mipmapped:NO];
     targetDesc.storageMode = MTLStorageModeShared;
     targetDesc.usage = MTLTextureUsageRenderTarget;
-    id<MTLTexture> target = [device newTextureWithDescriptor:targetDesc];
+    NSMutableArray<id<MTLTexture>> *targets = [NSMutableArray new];
+    NSUInteger slots = commit_heavy ? CommitSlots : 1;
+    for (NSUInteger slot = 0; slot < slots; slot++) {
+        id<MTLTexture> target = [device newTextureWithDescriptor:targetDesc];
+        if (!target) { failure(@"render target allocation failed", nil); return 1; }
+        [targets addObject:target];
+    }
 
     MTLTextureDescriptor *sourceDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
         width:1 height:1 mipmapped:NO];
@@ -184,24 +215,25 @@ static int benchmark(BOOL metal4, NSUInteger draws)
     sourceDesc.usage = MTLTextureUsageShaderRead;
     __attribute__((objc_precise_lifetime)) id<MTLTexture> first = [device newTextureWithDescriptor:sourceDesc];
     __attribute__((objc_precise_lifetime)) id<MTLTexture> second = [device newTextureWithDescriptor:sourceDesc];
-    if (!vertexBuffer || !target || !first || !second) { failure(@"resource allocation failed", nil); return 1; }
+    if (!vertexBuffer || !first || !second) { failure(@"resource allocation failed", nil); return 1; }
     MTLRegion pixelRegion = MTLRegionMake2D(0, 0, 1, 1);
     [first replaceRegion:pixelRegion mipmapLevel:0 withBytes:colors[0] bytesPerRow:sizeof(colors[0])];
     [second replaceRegion:pixelRegion mipmapLevel:0 withBytes:colors[1] bytesPerRow:sizeof(colors[1])];
     NSArray<id<MTLTexture>> *textures = @[first, second];
 
-    uint64_t ticks[SampleCount];
+    uint64_t ticks[CommitCount - CommitWarmup];
     BOOL complete;
     if (metal4) {
-        if (@available(macOS 26.0, *)) complete = runMetal4(device, pipeline, vertexBuffer, textures, target, draws, ticks);
+        if (@available(macOS 26.0, *))
+            complete = runMetal4(device, pipeline, vertexBuffer, textures, targets, draws, commit_heavy, ticks);
         else return 1;
     } else {
-        complete = runMetal3(device, pipeline, vertexBuffer, textures, target, draws, ticks);
+        complete = runMetal3(device, pipeline, vertexBuffer, textures, targets[0], draws, ticks);
     }
     if (!complete) return 1;
 
     uint8_t pixel[4];
-    [target getBytes:pixel bytesPerRow:sizeof(pixel) fromRegion:pixelRegion mipmapLevel:0];
+    [targets[0] getBytes:pixel bytesPerRow:sizeof(pixel) fromRegion:pixelRegion mipmapLevel:0];
     printf("pixel: %u,%u,%u,%u\n", pixel[0], pixel[1], pixel[2], pixel[3]);
     if (memcmp(pixel, colors[(draws - 1) % 2], sizeof(pixel)) != 0) {
         failure(@"rendered pixel differs from the final draw color", nil);
@@ -210,31 +242,38 @@ static int benchmark(BOOL metal4, NSUInteger draws)
 
     mach_timebase_info_data_t timebase;
     mach_timebase_info(&timebase);
-    double microsecondsPerTickPerDraw = (double)timebase.numer / timebase.denom / 1000 / draws;
-    qsort(ticks, SampleCount, sizeof(ticks[0]), compareTicks);
-    printf("%s: %lu draws/frame, %d frames (%d warmup), median %.6f p90 %.6f CPU us/draw\n",
-           metal4 ? "metal4" : "metal3", (unsigned long)draws, FrameCount, WarmupCount,
-           ticks[SampleCount / 2] * microsecondsPerTickPerDraw,
-           ticks[(SampleCount * 9 + 9) / 10 - 1] * microsecondsPerTickPerDraw);
+    int samples = commit_heavy ? CommitCount - CommitWarmup : SampleCount;
+    double microsecondsPerTick = (double)timebase.numer / timebase.denom / 1000;
+    qsort(ticks, (size_t)samples, sizeof(ticks[0]), compareTicks);
+    double median = ticks[samples / 2] * microsecondsPerTick;
+    double p90 = ticks[(samples * 9 + 9) / 10 - 1] * microsecondsPerTick;
+    if (commit_heavy)
+        printf("metal4-commit: %lu draws/commit, %d commits (%d warmup), %d slots, median %.6f p90 %.6f CPU us/commit\n",
+               (unsigned long)draws, CommitCount, CommitWarmup, CommitSlots, median, p90);
+    else
+        printf("%s: %lu draws/frame, %d frames (%d warmup), median %.6f p90 %.6f CPU us/draw\n",
+               metal4 ? "metal4" : "metal3", (unsigned long)draws, FrameCount, WarmupCount, median / draws, p90 / draws);
     return 0;
 }
 
 int main(int argc, const char *argv[])
 {
     @autoreleasepool {
-        if (argc < 2 || argc > 3 || (strcmp(argv[1], "metal3") && strcmp(argv[1], "metal4"))) {
-            fprintf(stderr, "usage: mtl4bench {metal3|metal4} [draws-per-frame]\n");
+        BOOL commit_heavy = argc >= 2 && strcmp(argv[1], "metal4-commit") == 0;
+        if (argc < 2 || argc > 3 || (!commit_heavy && strcmp(argv[1], "metal3") && strcmp(argv[1], "metal4"))) {
+            fprintf(stderr, "usage: mtl4bench {metal3|metal4} [draws-per-frame] | metal4-commit [draws-per-commit]\n");
             return 2;
         }
-        unsigned long draws = 10000;
+        unsigned long draws = commit_heavy ? 4 : 10000;
         if (argc == 3) {
             char *end;
             draws = strtoul(argv[2], &end, 10);
-            if (*end || draws == 0 || draws > 100000) {
-                fprintf(stderr, "draws-per-frame must be an integer from 1 to 100000\n");
+            unsigned long max_draws = commit_heavy ? 10 : 100000;
+            if (*end || draws == 0 || draws > max_draws) {
+                fprintf(stderr, "draws must be an integer from 1 to %lu\n", max_draws);
                 return 2;
             }
         }
-        return benchmark(strcmp(argv[1], "metal4") == 0, draws);
+        return benchmark(commit_heavy || strcmp(argv[1], "metal4") == 0, commit_heavy, draws);
     }
 }
