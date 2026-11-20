@@ -3337,6 +3337,11 @@ static id h_cb_benc_d(id self, SEL _cmd, id d)
 static void on_mtl4_queue(id queue)
 {
     if (!queue) return;
+    /* A Metal 4 buffer has no queue during encoding. The Metal 3 capture
+     * path starts on the intended queue before a command buffer is opened. */
+    static atomic_int capture_warned;
+    if (g_capture_prefix && !atomic_exchange(&capture_warned, 1))
+        fp_log("fencepost: capture not yet supported for Metal 4\n");
     const char *label = [[queue label] UTF8String];
     pthread_mutex_lock(&g_lock);
     fp_queue *q = queue_get_kind((void *)queue, 1);
@@ -3679,6 +3684,10 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
     for (NSUInteger i = 0; i < submission->ncbs; i++) cb_mark_done(submission->cbs[i]);
     fp_trace_cb *trace = submission->trace;
     if (trace) {
+        if (error && g_ring && g_ring_gpuerr) @autoreleasepool {
+            trace->error_time = trace_clock();
+            trace->gpu_error = strdup(error.localizedDescription.UTF8String ?: "Metal 4 commit error");
+        }
         if (!error && start > 0 && end >= start && end <= (double)trace_clock() / 1e9 + 1) {
             trace->gpu_start = (uint64_t)(start * 1e9);
             trace->gpu_end = (uint64_t)(end * 1e9);
