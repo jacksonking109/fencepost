@@ -9,13 +9,13 @@
 
 enum gate_case {
     GATE_NONE, GATE_RACE, GATE_REENTRANT, GATE_REENTRANT_RECORDING, GATE_TIMEOUT, GATE_FAILED,
-    GATE_TEARDOWN, GATE_TEARDOWN_FILE, GATE_FEEDBACK
+    GATE_ALLOC_FAILED, GATE_TEARDOWN, GATE_TEARDOWN_FILE, GATE_FEEDBACK
 };
 static struct {
     enum gate_case mode;
     dispatch_semaphore_t enter_end, end_tracked, release_end;
     id nested_end;
-    BOOL replay_pending, replayed, throw_commit, failed_end, requested;
+    BOOL replay_pending, replayed, throw_commit, failed_end, fail_alloc, requested;
     void (*capture)(const char *);
 } gate;
 
@@ -33,6 +33,10 @@ static BOOL reentrant_end(void)
 
 static int gate_hook(const char *phase)
 {
+    if (gate.mode == GATE_ALLOC_FAILED && gate.fail_alloc && !strcmp(phase, "mtl4-capture-owners-allocation")) {
+        gate.fail_alloc = NO;
+        return 1;
+    }
     if (gate.mode == GATE_TIMEOUT && !strcmp(phase, "start-reserved")) {
         dispatch_semaphore_signal(gate.enter_end);
         phase_wait(gate.end_tracked);
@@ -200,6 +204,10 @@ static int run_gate(id<MTLDevice> device, void (*frame)(id), void (*capture)(con
         });
     } else if (reentrant_end()) {
         gate.nested_end = held.cb;
+    } else if (gate.mode == GATE_ALLOC_FAILED) {
+        [held.cb endCommandBuffer];
+        gate.fail_alloc = YES;
+        if (!mtl4_submit(held) || gate.fail_alloc) return 3;
     } else {
         [held.cb endCommandBuffer];
         gate.throw_commit = YES;
@@ -212,6 +220,7 @@ static int run_gate(id<MTLDevice> device, void (*frame)(id), void (*capture)(con
     }
     capture("API Request");
     if (!mtl4_encode(main, 2, frame) || manager.isCapturing || !mtl4_submit(main)) return 3;
+    if (gate.mode == GATE_ALLOC_FAILED) return 0;
     if (worker) {
         if (gate.release_end) dispatch_semaphore_signal(gate.release_end);
         if (dispatch_group_wait(worker, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC))) return 3;
@@ -250,7 +259,8 @@ static int run_mixed_metal3(id<MTLDevice> device, void (*frame)(id), void (*capt
 API_AVAILABLE(macos(26.0))
 static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), void (*capture)(const char *))
 {
-    if (gate.mode == GATE_RACE || reentrant_end() || gate.mode == GATE_TIMEOUT || gate.mode == GATE_FAILED)
+    if (gate.mode == GATE_RACE || reentrant_end() || gate.mode == GATE_TIMEOUT ||
+        gate.mode == GATE_FAILED || gate.mode == GATE_ALLOC_FAILED)
         return run_gate(device, frame, capture);
     if (!strcmp(mode, "mtl4-mixed-metal3")) return run_mixed_metal3(device, frame, capture);
     BOOL discard = !strcmp(mode, "mtl4-discard");
@@ -361,6 +371,7 @@ int main(int argc, char **argv)
         if (!strcmp(mode, "mtl4-reentrant-recording-end")) gate.mode = GATE_REENTRANT_RECORDING;
         if (!strcmp(mode, "mtl4-end-start-timeout")) gate.mode = GATE_TIMEOUT;
         if (!strcmp(mode, "mtl4-failed-commit")) gate.mode = GATE_FAILED;
+        if (!strcmp(mode, "mtl4-failed-owner-allocation")) gate.mode = GATE_ALLOC_FAILED;
         if (!strcmp(mode, "mtl4-feedback-fallback")) gate.mode = GATE_FEEDBACK;
         if (!strcmp(mode, "teardown-api")) gate.mode = GATE_TEARDOWN;
         if (!strcmp(mode, "teardown-file")) gate.mode = GATE_TEARDOWN_FILE;

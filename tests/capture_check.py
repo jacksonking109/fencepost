@@ -125,6 +125,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     if mode == "mtl4-end-start-timeout":
         assert log.splitlines().count(
             "fencepost: capture refused: Metal 4 command buffer tracking lost during capture start") == 1, log
+    if mode in {"mtl4-end-start-timeout", "mtl4-failed-owner-allocation"}:
         assert log.splitlines().count(
             "fencepost: capture refused: Metal 4 command buffer tracking unavailable") == 1, log
     if reason is None:
@@ -259,6 +260,9 @@ def main():
                         "timed out waiting to end a Metal 4 command buffer during capture start"}),
                     ("mtl4-failed-commit", "Metal 4 commit exception holds the gate until successful retry", dict(gate,
                         message="fencepost: Metal 4 capture gate recovered after failed commit")),
+                    ("mtl4-failed-owner-allocation", "Metal 4 tracking allocation failure disables capture and still submits", {
+                        "hooks": True, "message": "fencepost: Metal 4 capture disabled for this process: "
+                        "could not allocate Metal 4 capture submission tracking"}),
                     ("mtl4-blocked", "Metal 4 gives up after three blocked frame starts", {
                         "message": "fencepost: capture refused: Metal 4 command buffers still awaiting submission after 3 frame starts"}),
                     ("mtl4-mixed", "mixed process starts at Metal 4 begin", api),

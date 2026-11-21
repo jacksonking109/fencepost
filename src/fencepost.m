@@ -6751,12 +6751,14 @@ static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, u
     /* A caller that catches the interruption cannot submit a deferred end
      * while Metal is still inside startCapture. */
     if (tl_capture_start && tl_capture_start->refusal) capture_interrupt_start(tl_capture_start->refusal);
-    if (!g_capture_available || !buffers || !count) return 0;
+    if (!buffers || !count) return 0;
     pthread_mutex_lock(&g_lock);
     int tracked = outer;
     if (g_capture_mtl4_ended) {
-        submit->owners = calloc(MIN(count, g_capture_mtl4_ended), sizeof *submit->owners);
-        /* Allocation failure leaves all ended identities registered. */
+        if (!CAPTURE_TEST("mtl4-capture-owners-allocation"))
+            submit->owners = calloc(MIN(count, g_capture_mtl4_ended), sizeof *submit->owners);
+        /* Without the owners we cannot roll back a failed native commit. */
+        if (!submit->owners) capture_mtl4_mark_untracked("could not allocate Metal 4 capture submission tracking");
         for (NSUInteger i = 0; submit->owners && i < count; i++) {
             FPCaptureBufferOwner *owner = objc_getAssociatedObject(buffers[i], &g_capture_buffer_key);
             if (!owner || !atomic_exchange_explicit(&owner->ended, 0, memory_order_relaxed)) continue;
@@ -6873,12 +6875,13 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
 static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count)
 {
     ENTER;
+    const int capture = g_capture_available;
     uint64_t generation = 0;
     fp_capture_submit submit = {0};
     int tracked = 0, returned = 0;
     id opts = nil;
     @try {
-        tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit);
+        if (capture) tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit);
         if (OUTER) (void)CAPTURE_TEST("mtl4-commit");
         if (OUTER) {
             if (@available(macOS 26.0, *)) {
@@ -6896,7 +6899,7 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
     } @finally {
         if (!opts || !returned) capture_feedback_missing(generation);
         [opts release];
-        capture_mtl4_submit_done(&submit, tracked, returned);
+        if (capture) capture_mtl4_submit_done(&submit, tracked, returned);
         LEAVE;
     }
     if (opts) maybe_summary();
@@ -6905,12 +6908,13 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
 static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger count, id options)
 {
     ENTER;
+    const int capture = g_capture_available;
     uint64_t generation = 0;
     fp_capture_submit submit = {0};
     int tracked = 0, returned = 0;
     id opts = nil;
     @try {
-        tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit);
+        if (capture) tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit);
         if (OUTER) (void)CAPTURE_TEST("mtl4-commit");
         if (OUTER && (options || generation)) {
             if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options, generation, tracked);
@@ -6921,7 +6925,7 @@ static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger 
     } @finally {
         if (!opts || !returned) capture_feedback_missing(generation);
         [opts release];
-        capture_mtl4_submit_done(&submit, tracked, returned);
+        if (capture) capture_mtl4_submit_done(&submit, tracked, returned);
         LEAVE;
     }
     if (opts) maybe_summary();
