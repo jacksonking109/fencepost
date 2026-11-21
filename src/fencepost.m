@@ -161,7 +161,6 @@ typedef struct fp_node {
     id mtl4_pipeline;               /* FP4PipelineTable of the bound pipeline, nil = access unknown */
     void *mtl4_pipeline_object;     /* the bound pipeline itself, compared only */
     uint32_t mtl4_pipeline_serial;
-    fp_bits anc[2];                 /* ordered before vertex / fragment work; logically empty when ned == 0 */
 } fp_node;
 
 typedef struct { uint8_t type; uint64_t uid; void *ev; uint64_t val; } fp_item;   /* 0 encoder, 1 signal, 2 wait, 3 barrier, 4 frame end */
@@ -208,6 +207,9 @@ typedef struct {
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_mtl4_options_lock = PTHREAD_MUTEX_INITIALIZER;
 static fp_node g_pool[FP_POOL];
+/* Keep cold ancestry off the encoder records. A node with no edges has no bits
+ * and never touches this storage. The bitsets and nodes share the same slots. */
+static fp_bits g_ancestors[FP_POOL][2];
 static fp_cb g_cbs[FP_CBPOOL];
 static fp_queue g_q[FP_MAXQ]; static int g_nq;
 static struct { void *cb; uint64_t uid; } g_opencb[FP_OPENCB];
@@ -380,6 +382,11 @@ static void fp_log_finish(void)
 {
     fp_log_flush(g_log_final);
     free(g_log_final);
+}
+
+static fp_bits *node_ancestors(const fp_node *n)
+{
+    return g_ancestors[n->uid % FP_POOL];
 }
 
 static fp_node *node_get(uint64_t uid)
@@ -3013,7 +3020,7 @@ static int ordered(const fp_ent *e, fp_node *x, fp_node *y, const fp_acc *a)
     uint64_t d = y->aseq - e->aseq;
     if (d >= FP_W) { g_st[ST_WINDOW]++; return 1; }
     if (!e->a.mtl4_stage && !a->mtl4_stage) {
-        if (y->ned && bit_test(&y->anc[a->sf], 2 * d + e->a.sl)) return 1;
+        if (y->ned && bit_test(&node_ancestors(y)[a->sf], 2 * d + e->a.sl)) return 1;
         if (!atomic_load_explicit(&g_fp4_active, memory_order_relaxed)) return 0;
     }
     int from_stage = e->a.mtl4_stage ? __builtin_ctz(e->a.mtl4_stage) : e->a.sl;
@@ -3137,8 +3144,8 @@ static void check_barrier(fp_node *y)
                 continue;
             }
         } else if (y->ned) {
-            if (bit_test(&y->anc[0], 2 * d + 1)) continue;
-            if (bit_test(&y->anc[1], 2 * d + 1)) { if (!part) part = x; continue; }
+            if (bit_test(&node_ancestors(y)[0], 2 * d + 1)) continue;
+            if (bit_test(&node_ancestors(y)[1], 2 * d + 1)) { if (!part) part = x; continue; }
         }
         if (!bad) bad = x;
         nbad++;
@@ -3219,7 +3226,8 @@ static void check_barrier(fp_node *y)
 static void analyse(fp_node *y)   /* lock held; every edge source is analysed or gone */
 {
     y->aseq = ++g_aseq;
-    if (y->ned) memset(y->anc, 0, sizeof y->anc);
+    fp_bits *anc = node_ancestors(y);
+    if (y->ned) memset(anc, 0, sizeof g_ancestors[0]);
     uint32_t best = 0;
     if (y->mtl4 && y->kind == FPK_SIGNAL) {
         for (fp_node *x = node_get(y->mtl4_previous); x && x->frame == y->frame; x = node_get(x->mtl4_previous)) {
@@ -3234,13 +3242,13 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
         if (x->frame == y->frame && x->depth > best) { best = x->depth; y->chain_prev = x->uid; }
         uint64_t d = y->aseq - x->aseq;
         if (d >= FP_W) continue;
-        fp_bits *t = &y->anc[e->before];
+        fp_bits *t = &anc[e->before];
         bit_set(t, 2 * d);
         if (e->after) bit_set(t, 2 * d + 1);
-        if (x->ned) bits_or_shift(t, &x->anc[e->after], 2 * d);
+        if (x->ned) bits_or_shift(t, &node_ancestors(x)[e->after], 2 * d);
     }
     if (y->ned) {   /* fragment work starts after vertex work */
-        for (int i = 0; i < FP_WORDS; i++) y->anc[1].w[i] |= y->anc[0].w[i];
+        for (int i = 0; i < FP_WORDS; i++) anc[1].w[i] |= anc[0].w[i];
     }
     y->state = 4;
     y->depth = best + (y->kind != FPK_SIGNAL);   /* an event signal passes its chain on */
