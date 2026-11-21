@@ -206,6 +206,7 @@ static atomic_long g_fp4_address_misses, g_fp4_id_misses, g_fp4_unknown_pipeline
 static atomic_int g_fp4_active;   /* the process made a Metal 4 object: request pipeline reflection */
 #ifdef FENCEPOST_TEST_HOOKS
 static unsigned g_mtl4_test_error_commit;
+static int g_mtl4_test_reflection_fail, g_mtl4_test_reflection_failed;
 #endif
 static FILE *g_out;
 static long g_max_reports = 200, g_printed;
@@ -4737,13 +4738,29 @@ static int fp4_reflect_device(NSUInteger options)
            !(options & MTLPipelineOptionFailOnBinaryArchiveMiss);   /* an archive may hold no reflection */
 }
 
+#ifdef FENCEPOST_TEST_HOOKS
+/* Fail fencepost's own BindingInfo request, so the retry path runs as if Metal refused it. */
+static int fp4_test_fail_reflection(void)
+{
+    if (!g_mtl4_test_reflection_fail) return 0;
+    g_mtl4_test_reflection_fail--;
+    g_mtl4_test_reflection_failed++;
+    return 1;
+}
+#endif
+
 static id fp4_device_sync(int h, id self, SEL cmd, id desc, NSUInteger options, id *reflection, NSError **error)
 {
     ENTER;
     fp4_reflect_imp orig = (fp4_reflect_imp)orig_imp(h, self);
     int want = OUTER && fp4_reflect_device(options);
     id local = nil, *out = reflection ? reflection : want ? &local : NULL;
-    id pipeline = orig(self, cmd, desc, want ? options | MTLPipelineOptionBindingInfo : options, out, error);
+    id pipeline = nil;
+#ifdef FENCEPOST_TEST_HOOKS
+    int force = want && !(options & MTLPipelineOptionBindingInfo) && fp4_test_fail_reflection();
+    if (!force)
+#endif
+        pipeline = orig(self, cmd, desc, want ? options | MTLPipelineOptionBindingInfo : options, out, error);
     if (want && pipeline) fp4_attach_reflection(pipeline, *out);
     else if (want && !(options & MTLPipelineOptionBindingInfo)) {
         if (error) *error = nil;
@@ -4760,8 +4777,11 @@ static id fp4_device_plain(int h, id self, SEL cmd, SEL with_reflection, id desc
     id pipeline = nil;
     if (OUTER && fp4_reflect_device(0)) {
         id reflection = nil;
-        pipeline = ((fp4_reflect_imp)objc_msgSend)(self, with_reflection, desc, MTLPipelineOptionBindingInfo,
-                                                   &reflection, error);
+#ifdef FENCEPOST_TEST_HOOKS
+        if (!fp4_test_fail_reflection())
+#endif
+            pipeline = ((fp4_reflect_imp)objc_msgSend)(self, with_reflection, desc, MTLPipelineOptionBindingInfo,
+                                                       &reflection, error);
         fp4_attach_reflection(pipeline, reflection);
         if (!pipeline && error) *error = nil;
     }
@@ -4775,7 +4795,7 @@ static void fp4_device_async(int h, id self, SEL cmd, id desc, NSUInteger option
     ENTER;
     void (*orig)(id, SEL, id, NSUInteger, fp4_reflection_handler) = (void *)orig_imp(h, self);
     if (OUTER && handler && fp4_reflect_device(options)) {
-        orig(self, cmd, desc, options | MTLPipelineOptionBindingInfo, ^(id pipeline, id reflection, NSError *error) {
+        void (^complete)(id, id, NSError *) = ^(id pipeline, id reflection, NSError *error) {
             if (!pipeline && !(options & MTLPipelineOptionBindingInfo)) {
                 tl_depth++;
                 orig(self, cmd, desc, options, handler);
@@ -4784,7 +4804,12 @@ static void fp4_device_async(int h, id self, SEL cmd, id desc, NSUInteger option
             }
             fp4_attach_reflection(pipeline, reflection);
             handler(pipeline, reflection, error);
-        });
+        };
+#ifdef FENCEPOST_TEST_HOOKS
+        if (!(options & MTLPipelineOptionBindingInfo) && fp4_test_fail_reflection()) complete(nil, nil, nil);
+        else
+#endif
+        orig(self, cmd, desc, options | MTLPipelineOptionBindingInfo, complete);
     } else orig(self, cmd, desc, options, handler);
     LEAVE;
 }
@@ -4911,11 +4936,15 @@ static id fp4_compile(int h, id self, SEL cmd, id desc, id x, id y, NSError **er
     IMP imp = orig_imp(h, self);
 #define FP4_CALL(d) (four ? ((id (*)(id, SEL, id, id, id, NSError **))imp)(self, cmd, d, x, y, error) \
                           : ((id (*)(id, SEL, id, id, NSError **))imp)(self, cmd, d, x, error))
-    id pipeline;
+    id pipeline = nil;
     if (OUTER) {
         id mine = fp4_reflect_descriptor(desc), base = specialize ? x : nil;
         int private_reflection = fp4_private_reflection(desc, mine, base);
-        pipeline = FP4_CALL(mine);
+#ifdef FENCEPOST_TEST_HOOKS
+        int force = mine != desc && fp4_test_fail_reflection();
+        if (!force)
+#endif
+            pipeline = FP4_CALL(mine);
         if (!pipeline && mine != desc) {
             if (error) *error = nil;
             pipeline = FP4_CALL(desc);
@@ -5003,7 +5032,7 @@ static id fp4_compile_async(int h, id self, SEL cmd, id desc, id x, id y, fp4_pi
         if (mine != desc) {
             int private_reflection = fp4_private_reflection(desc, mine, base);
             FP4CompilerTask *request = [[FP4CompilerTask alloc] initWithCompiler:self];
-            id initial = FP4_CALL(mine, ^(id pipeline, NSError *error) {
+            void (^complete)(id, NSError *) = ^(id pipeline, NSError *error) {
                 if (pipeline) {
                     fp4_compiled(pipeline, base, private_reflection);
                     [request finish];
@@ -5018,7 +5047,13 @@ static id fp4_compile_async(int h, id self, SEL cmd, id desc, id x, id y, fp4_pi
                     tl_depth--;
                     [retry release];
                 }
-            });
+            };
+            id initial = nil;
+#ifdef FENCEPOST_TEST_HOOKS
+            if (fp4_test_fail_reflection()) complete(nil, nil);
+            else
+#endif
+            initial = FP4_CALL(mine, complete);
             [request setInitialTask:initial];
             [initial release];
             task = request;
@@ -6880,6 +6915,7 @@ __attribute__((constructor)) static void fp_init(void)
 {
 #ifdef FENCEPOST_TEST_HOOKS
     g_mtl4_test_error_commit = trace_unsigned("FENCEPOST_MTL4_TEST_ERROR_COMMIT", 0);
+    g_mtl4_test_reflection_fail = trace_unsigned("FENCEPOST_MTL4_TEST_REFLECTION_FAIL", 0);
 #endif
     if (@available(macOS 26.0, *)) {
         g_mtl4_options_class = objc_lookUpClass("MTL4CommitOptions");
@@ -6973,6 +7009,11 @@ __attribute__((visibility("default"))) long fencepost_test_trace_cbs(long *peak)
     *peak = g_mtl4_trace_peak;
     pthread_mutex_unlock(&g_lock);
     return live;
+}
+
+__attribute__((visibility("default"))) int fencepost_test_reflection_failures(void)
+{
+    return g_mtl4_test_reflection_failed;
 }
 
 __attribute__((visibility("default"))) long fencepost_test_retired_signals(void)

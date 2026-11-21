@@ -335,6 +335,59 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
            added_total != expected_producer_feedback || batch_total != (int)frames || error_total != 0;
 }
 
+/* Under libfencepost-testhooks.dylib, fencepost's own BindingInfo request fails on each
+ * path once. The app's original request must still build a pipeline, leave error nil, and
+ * call the async handler exactly once. */
+API_AVAILABLE(macos(26.0))
+static int reflection_retry(id<MTLDevice> device)
+{
+    if (![device supportsFamily:MTLGPUFamilyMetal4]) return fail("Metal 4 unavailable");
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    NSError *error = nil;
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void word(device uint *dst [[buffer(0)]]) { *dst = 1; }\n";
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!queue || !library) return fail("reflection retry setup failed");
+    id<MTLFunction> function = [library newFunctionWithName:@"word"];
+    if (!function) return fail("reflection retry function missing");
+
+    MTLComputePipelineReflection *reflection = nil;
+    id<MTLComputePipelineState> devicePipeline = [device newComputePipelineStateWithFunction:function
+        options:MTLPipelineOptionNone reflection:&reflection error:&error];
+    if (!devicePipeline || error || reflection) return fail("device reflection retry was not clean");
+
+    id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+    MTL4LibraryFunctionDescriptor *fd = [MTL4LibraryFunctionDescriptor new];
+    fd.library = library;
+    fd.name = @"word";
+    MTL4ComputePipelineDescriptor *desc = [MTL4ComputePipelineDescriptor new];
+    desc.computeFunctionDescriptor = fd;
+    id<MTLComputePipelineState> syncPipeline = compiler
+        ? [compiler newComputePipelineStateWithDescriptor:desc compilerTaskOptions:nil error:&error] : nil;
+    if (!syncPipeline || error) return fail("compiler reflection retry was not clean");
+
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block atomic_int calls = 0;
+    __block id asyncPipeline = nil;
+    __block NSError *asyncError = nil;
+    id<MTL4CompilerTask> task = compiler
+        ? [compiler newComputePipelineStateWithDescriptor:desc compilerTaskOptions:nil
+            completionHandler:^(id<MTLComputePipelineState> pipeline, NSError *e) {
+                asyncPipeline = pipeline;
+                asyncError = e;
+                atomic_fetch_add(&calls, 1);
+                dispatch_semaphore_signal(done);
+            }] : nil;
+    if (!task || !wait_cpu(done)) return fail("async reflection retry timed out");
+    if (atomic_load(&calls) != 1) return fail("async reflection handler was not called exactly once");
+    if (!asyncPipeline || asyncError) return fail("async reflection retry was not clean");
+
+    int (*failures)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_reflection_failures");
+    if (!failures || failures() != 3) return fail("the BindingInfo build did not fail three times");
+    printf("reflection retry: device, compiler and async pipelines built; handler called once\n");
+    return 0;
+}
+
 int main(int argc, const char **argv)
 {
     @autoreleasepool {
@@ -359,6 +412,11 @@ int main(int argc, const char **argv)
             if (!test_window || !test_window()) return fail("signal outside recent queue entries did not retire");
             puts("signal outside the queue window retired");
             return 0;
+        }
+        if (argc == 2 && !strcmp(argv[1], "--reflection-retry")) {
+            if (@available(macOS 26.0, *))
+                return reflection_retry(MTLCreateSystemDefaultDevice());
+            return fail("Metal 4 unavailable");
         }
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--drawable")) drawable = true;

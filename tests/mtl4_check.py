@@ -88,6 +88,13 @@ def check_testhooks(arch, directory, env):
     injection = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost-testhooks.dylib"}
     for scenario in ("--wait-source", "--recycled-signal", "--signal-window"):
         subprocess.run(command(arch, injection, scenario), env=env, check=True, timeout=20)
+    retry = subprocess.run(command(arch, dict(injection, FENCEPOST_MTL4_TEST_REFLECTION_FAIL="3"),
+                                  "--reflection-retry"),
+                           env=env, capture_output=True, text=True, timeout=20)
+    assert retry.returncode == 0, (retry.stdout, retry.stderr)
+    assert ("reflection retry: device, compiler and async pipelines built; handler called once"
+            in retry.stdout), retry.stdout
+    print("reflection retry: device, compiler and async paths built after a forced failure", flush=True)
     path = directory / "long.json"
     result = subprocess.check_output(command(arch, dict(injection, FENCEPOST_TRACE=path), "--long"),
                                      env=env, text=True, timeout=20)
