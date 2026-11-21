@@ -775,7 +775,7 @@ static int g_capture_busy;                   /* starting, active or stopping (g_
 static unsigned g_capture_commits;           /* tracked commits still in Metal (g_lock) */
 static uint64_t g_capture_last_commit;        /* most recent submission activity (g_lock) */
 static int g_capture_mtl4, g_capture_mtl4_unsafe;  /* Metal 4 observed / tracking lost (g_lock) */
-static CFMutableSetRef g_capture_mtl4_ended;       /* raw buffer identities, independent of detector (g_lock) */
+static unsigned g_capture_mtl4_ended;       /* ended, unsubmitted buffers (g_lock) */
 static int g_capture_starting, g_capture_stop_queued;
 static uint64_t g_capture_generation, g_capture_feedback;
 static unsigned g_capture_attempts;          /* first begins tried for this request (capture lock) */
@@ -789,6 +789,26 @@ static dispatch_queue_t g_capture_reporter;
  * start, via the condition under g_lock, so stop cannot block an end hook. */
 static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 static void capture_feedback_done(uint64_t generation, int failed);
+
+@interface FPCaptureBufferOwner : NSObject {
+@public
+    atomic_int ended;
+}
+@end
+
+static char g_capture_buffer_key;
+
+@implementation FPCaptureBufferOwner
+- (void)dealloc
+{
+    if (atomic_load_explicit(&ended, memory_order_relaxed)) {
+        pthread_mutex_lock(&g_lock);
+        g_capture_mtl4_ended--;
+        pthread_mutex_unlock(&g_lock);
+    }
+    [super dealloc];
+}
+@end
 
 static void capture_mtl4_tracking_lost(void)
 {
@@ -4666,8 +4686,7 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
          * count until it returns. End cannot enter Metal during this start. */
         pthread_mutex_lock(&g_lock);
         int unsafe = g_capture_mtl4_unsafe;
-        int blocked = (g_capture_mtl4_ended && CFSetGetCount(g_capture_mtl4_ended)) ||
-                      (g_capture_mtl4 && g_capture_commits);
+        int blocked = g_capture_mtl4_ended || (g_capture_mtl4 && g_capture_commits);
         if (!unsafe && !blocked) g_capture_starting = 1;
         pthread_mutex_unlock(&g_lock);
         if (unsafe) {
@@ -5232,10 +5251,16 @@ static void h_mtl4_end(id self, SEL _cmd)
 {
     ENTER;
     if (g_capture_available) {
+        FPCaptureBufferOwner *owner = objc_getAssociatedObject(self, &g_capture_buffer_key);
+        if (!owner) {
+            owner = [[FPCaptureBufferOwner alloc] init];
+            objc_setAssociatedObject(self, &g_capture_buffer_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [owner release];
+        }
         pthread_mutex_lock(&g_lock);
         while (g_capture_starting) pthread_cond_wait(&g_capture_started_cond, &g_lock);
-        if (!g_capture_mtl4_ended) g_capture_mtl4_ended = CFSetCreateMutable(NULL, 0, NULL);
-        if (g_capture_mtl4_ended) CFSetAddValue(g_capture_mtl4_ended, self);
+        if (owner)
+            g_capture_mtl4_ended += !atomic_exchange_explicit(&owner->ended, 1, memory_order_relaxed);
         else g_capture_mtl4_unsafe = 1;
         pthread_mutex_unlock(&g_lock);
     }
@@ -6479,8 +6504,9 @@ static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, u
     int tracked = outer;
     if (g_capture_mtl4_ended) {
         for (NSUInteger i = 0; i < count; i++) {
-            if (!buffers[i] || !CFSetContainsValue(g_capture_mtl4_ended, buffers[i])) continue;
-            CFSetRemoveValue(g_capture_mtl4_ended, buffers[i]);
+            FPCaptureBufferOwner *owner = objc_getAssociatedObject(buffers[i], &g_capture_buffer_key);
+            if (!owner || !atomic_exchange_explicit(&owner->ended, 0, memory_order_relaxed)) continue;
+            g_capture_mtl4_ended--;
             tracked = 1;
         }
     }

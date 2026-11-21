@@ -90,7 +90,8 @@ static BOOL wait_capture_stop(MTLCaptureManager *manager)
 API_AVAILABLE(macos(26.0))
 static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), void (*capture)(const char *))
 {
-    BOOL defer = !strcmp(mode, "mtl4-defer"), blocked = !strcmp(mode, "mtl4-blocked");
+    BOOL discard = !strcmp(mode, "mtl4-discard");
+    BOOL defer = !strcmp(mode, "mtl4-defer") || discard, blocked = !strcmp(mode, "mtl4-blocked");
     BOOL mixed = !strcmp(mode, "mtl4-mixed"), quota = !strcmp(mode, "mtl4-quota");
     BOOL cooldown = !strcmp(mode, "mtl4-cooldown"), space = !strcmp(mode, "mtl4-space");
     BOOL multi = !strcmp(mode, "mtl4-multi"), idle = !strcmp(mode, "mtl4-idle");
@@ -102,18 +103,23 @@ static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), v
     dispatch_group_t worker = NULL;
     __block BOOL ended_ok = NO, held_ok = NO;
     if (defer || blocked) {
-        struct mtl4_fixture held = {0};
-        id<MTLSharedEvent> finished = [[device newSharedEvent] autorelease];
-        if (!mtl4_setup(device, &held) || !finished) return 2;
         ended = dispatch_semaphore_create(0);
         release_held = dispatch_semaphore_create(0);
         worker = dispatch_group_create();
         dispatch_group_async(worker, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             @autoreleasepool {
-                ended_ok = mtl4_encode(held, 99, NULL);
+                struct mtl4_fixture held = {0};
+                ended_ok = mtl4_setup(device, &held) && mtl4_encode(held, 99, NULL);
                 dispatch_semaphore_signal(ended);
                 if (!ended_ok || dispatch_semaphore_wait(release_held, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)))
                     return;
+                if (discard) {
+                    // Drain the worker pool and release the ended CB without submitting it.
+                    held_ok = YES;
+                    return;
+                }
+                id<MTLSharedEvent> finished = [[device newSharedEvent] autorelease];
+                if (!finished) return;
                 // Exercise the plain commit hook on a different queue.
                 [held.queue commit:&held.cb count:1];
                 [held.queue signalEvent:finished value:1];

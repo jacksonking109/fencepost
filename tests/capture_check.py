@@ -115,7 +115,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     if reason is None:
         assert not captures and not starts and not stops, (captures, log)
         return
-    frame = {"empty-file": 3, "wrong-pid": 4, "mtl4-defer": 3, "mtl4-drawable": 3}.get(mode, 2)
+    frame = {"empty-file": 3, "wrong-pid": 4, "mtl4-defer": 3, "mtl4-discard": 3, "mtl4-drawable": 3}.get(mode, 2)
     expected = directory / f"capture-{test.pid}-f{frame}-{reason}.gputrace"
     assert captures == [expected] and expected.is_dir(), (captures, log)
     size = sum(path.stat().st_size for path in expected.rglob("*") if path.is_file())
@@ -140,7 +140,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
             for part in range(2):
                 label = f"fp4-capture-frame-{index}-encoder-{part}".encode()
                 assert any(label in blob for blob in blobs) == (index not in excluded), (label, log)
-        if mode == "mtl4-defer":
+        if mode in {"mtl4-defer", "mtl4-discard"}:
             assert log.count("fencepost: capture deferred: Metal 4 command buffers awaiting submission") == 1, log
 
 
@@ -215,6 +215,7 @@ def main():
                     ("mtl4-api", "Metal 4 next-frame encoder labels", api),
                     ("mtl4-drawable", "Metal 4 file trigger after signalDrawable:", {"reason": "file-request"}),
                     ("mtl4-defer", "Metal 4 defers across an ended buffer on another thread and queue", api),
+                    ("mtl4-discard", "Metal 4 starts after an ended buffer is discarded", api),
                     ("mtl4-blocked", "Metal 4 gives up after three blocked frame starts", {
                         "message": "fencepost: capture refused: Metal 4 command buffers still awaiting submission after 3 frame starts"}),
                     ("mtl4-mixed", "mixed process starts at Metal 4 begin", api),

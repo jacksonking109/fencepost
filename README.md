@@ -334,7 +334,7 @@ first Metal 4 begin can fall outside the capture.
 
 A Metal 4 buffer that has ended and is awaiting submission on any queue blocks the start. Fencepost
 tries the first begin of each eligible frame and logs a refusal after three blocked frame starts.
-An ended buffer discarded without a commit can keep the gate closed. Metal 4 captures stop at a frame
+An ended buffer stops blocking capture when it is submitted or deallocated. Metal 4 captures stop at a frame
 boundary once submission feedback has arrived. If the app starts another frame while feedback is pending,
 the capture can extend to its end. The idle and hard-cap timers still apply.
 
