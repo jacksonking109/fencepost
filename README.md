@@ -1,7 +1,7 @@
 # fencepost
 
-A race detector for Metal 3 GPU synchronisation, with timeline support for Metal 4. Inject it into a Metal 3
-program to find encoders that touch the same memory without a fence or other synchronisation.
+A race detector for Metal GPU synchronisation. Inject it into a Metal 3 or Metal 4 program to find encoders
+that touch the same memory without ordering between their accesses.
 
 ```
 DYLD_INSERT_LIBRARIES=/path/to/libfencepost.dylib  your-metal-program
@@ -118,19 +118,34 @@ Set `FENCEPOST_TRACE_GPU=0` to disable encoder counter sampling and keep command
 On macOS 26 and later, fencepost records Metal 4 queues, render and compute encoders (including blit commands),
 and event signals and waits. Each queue commit has one measured GPU span, including commits that batch several
 logical command buffers. Encoders appear in submission and encoding order with estimated GPU positions.
-Machine-learning encoders are counted in the log.
+
+Race analysis tracks render attachments, copies, fills, mipmap generation, and the argument-table bindings
+that each draw or dispatch uses. For tracked buffers, an address inside a buffer covers the remaining range
+when Metal supplies no length. Texture views are checked against their underlying storage. Unresolved
+addresses and resource IDs are counted in the summary. Enable `FENCEPOST_BIND_MAYWRITE=1` for possible-race
+reports from shader bindings with unknown write access.
+
+A Metal 4 queue supplies no implicit ordering between encoders. Queue barriers order earlier work only for
+the specified producer and consumer stages, across command buffers and commits on the queue. A fence update
+and wait orders covered work on the same queue. Queue events order all covered stages, and commit feedback
+orders completed work before a later submission. Reports name the stages of both accesses.
 
 Fencepost submits `commit:count:` as `commit:count:options:` with fresh options for its own feedback. For
 app options it tracks, it transfers the registered handlers to fresh options for that submission. Each handler
 registration is consumed once, including when the app reuses its options.
 
 `signalDrawable:` marks the end of a frame. Programs can use `fencepost_frame` to supply their own frame
-boundaries. Ring dumps support manual requests, frame spikes, and GPU errors reported by commit feedback.
-Metal 4 race detection is pending. `FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
+boundaries. Ring dumps support manual requests, races, frame spikes, and GPU errors reported by commit feedback.
+`FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
 because fencepost learns the submitting queue after encoding.
 
 Fencepost records a queue's events in the order its hooks see them. When two threads submit to the same
 `MTL4CommandQueue` without the app serializing those calls, Metal can see them in a different order.
+
+Metal 4 analysis covers races between encoders. It skips within-encoder races, argument-buffer and indirect
+resource contents, and `MTL4VisibilityOptions` correctness. Residency-set membership alone supplies no
+accesses. The summary counts encoders with residency sets and no visible accesses, machine-learning encoders,
+and acceleration-structure builds. Frame chains follow queue event ordering.
 
 The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
 process stopped before writing the closing bracket.
@@ -278,7 +293,7 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_POSSIBLE` | 1 | 0 hides "possible" reports |
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
 | `FENCEPOST_CHAIN` | 0 | list the longest ordered chain of this frame (counted from 1) |
-| `FENCEPOST_BIND_MAYWRITE` | 0 | 1: direct compute bindings of writable resources count as "may write", not reads |
+| `FENCEPOST_BIND_MAYWRITE` | 0 | 1 counts unknown writes as possible in Metal 3 compute bindings and Metal 4 argument tables |
 | `FENCEPOST_TRACE` | unset | stream to this JSON file (`%p` expands to the process id), or use this literal prefix for ring dumps |
 | `FENCEPOST_TRACE_FRAMES` | all | capture frames `a:b`, inclusive and counted from 1 |
 | `FENCEPOST_TRACE_MB` | 512 | stop streaming when the file reaches this size in MiB |
@@ -348,6 +363,8 @@ python3 -I tests/mtl4_check.py arm64
 python3 -I tests/mtl4_check.py x86_64
 python3 -I tests/mtl4_check.py arm64 --threads
 python3 -I tests/mtl4_check.py x86_64 --threads
+python3 -I tests/mtl4_race_check.py arm64
+python3 -I tests/mtl4_race_check.py x86_64
 ```
 
 `tests/fptest.m` holds 35 small Metal programs with and without the synchronisation they need, each with the number of
@@ -367,8 +384,9 @@ to check that the app still gets its own timestamps when tracing is on.
 macOS session. Check the global hotkey by hand as described above.
 
 On a Metal 4 device, `mtl4bench metal4-commit` measures CPU time for small submissions with up to eight in
-flight. `mtl4frames --long` checks frame chain depth over 512 frames. When the dylib is compiled with
-`-DFENCEPOST_TEST_HOOKS`, it also reports live trace records and retired queue signals. In that build,
+flight. `mtl4frames --long` checks frame chain depth over 512 frames. `./build.sh` also builds
+`out/libfencepost-testhooks.dylib` for checking live trace records, retired queue signals, and synthetic errors.
+In that build,
 `FENCEPOST_MTL4_TEST_ERROR_COMMIT` selects a submission by its one-based number for simulated feedback errors.
 
 ## Results so far
