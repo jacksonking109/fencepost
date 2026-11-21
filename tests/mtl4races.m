@@ -42,7 +42,8 @@ static NSString *const kernels =
     "}\n"
     "fragment float4 frag(VOut in [[stage_in]], const device uint *data [[buffer(0)]]) {\n"
     "    return float4(float(data[0] & 255u) / 255.0f, 0.0f, 0.0f, 1.0f);\n"
-    "}\n";
+    "}\n"
+    "fragment float4 solid() { return float4(0.0f, 1.0f, 0.0f, 1.0f); }\n";
 
 API_AVAILABLE(macos(26.0))
 static int commit_and_wait(id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> cb)
@@ -60,6 +61,61 @@ static BOOL binding_access(NSArray<id<MTLBinding>> *bindings, NSUInteger index, 
     for (id<MTLBinding> binding in bindings)
         if (binding.type == MTLBindingTypeBuffer && binding.index == index) return binding.used && binding.access == access;
     return NO;
+}
+
+/* Attachment loads against queue barriers: a clear-and-store pass, then a load-and-store pass
+ * whose Fragment -> Fragment consumer barrier comes before its first draw or between draws. */
+API_AVAILABLE(macos(26.0))
+static int run_attachments(id<MTLDevice> device, NSString *mode)
+{
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    id<MTL4CommandBuffer> cb = [device newCommandBuffer];
+    if (!queue || !allocator || !cb) return fail("command setup failed");
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:kernels options:nil error:&error];
+    MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+    rd.vertexFunction = [library newFunctionWithName:@"vtx"];
+    rd.fragmentFunction = [library newFunctionWithName:@"solid"];
+    rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = library ? [device newRenderPipelineStateWithDescriptor:rd error:&error] : nil;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> target = [device newTextureWithDescriptor:td];
+    id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    if (!pipeline || !target || !residency) return fail("render setup failed");
+    [residency addAllocation:target];
+    [residency commit];
+    [queue addResidencySet:residency];
+
+    [cb beginCommandBufferWithAllocator:allocator];
+    BOOL early = [mode isEqualToString:@"load-early"];
+    for (int pass = 0; pass < 2; pass++) {
+        MTL4RenderPassDescriptor *desc = [MTL4RenderPassDescriptor new];
+        desc.colorAttachments[0].texture = target;
+        desc.colorAttachments[0].loadAction = pass ? MTLLoadActionLoad : MTLLoadActionClear;
+        desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> draw = [cb renderCommandEncoderWithDescriptor:desc];
+        if (!draw) return fail("render encoder creation failed");
+        draw.label = pass ? @"load" : @"clear";
+        [draw setRenderPipelineState:pipeline];
+        if (pass && early)
+            [draw barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageFragment
+                        visibilityOptions:MTL4VisibilityOptionDevice];
+        [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        if (pass && !early) {
+            [draw barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageFragment
+                        visibilityOptions:MTL4VisibilityOptionDevice];
+            [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        [draw endEncoding];
+    }
+    [cb endCommandBuffer];
+    int failed = commit_and_wait(queue, cb);
+    if (!failed) printf("case %s: submitted successfully\n", mode.UTF8String);
+    return failed;
 }
 
 /* Binding access from pipeline reflection: each mode is one queue and one command buffer. */
@@ -198,6 +254,7 @@ static int run(id<MTLDevice> device, NSString *mode)
     BOOL use_fence = [mode hasPrefix:@"fence"];
     if ([@[@"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race"] containsObject:mode])
         return run_reflection(device, mode);
+    if ([mode hasPrefix:@"load-"]) return run_attachments(device, mode);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
@@ -379,7 +436,8 @@ int main(int argc, const char **argv)
         NSString *mode = argc == 2 ? [NSString stringWithUTF8String:argv[1]] : nil;
         if (!mode || ![@[@"producer", @"fence", @"fence-missing", @"commits", @"commits-barrier", @"color-fragment",
                         @"color-vertex", @"mutate", @"disjoint", @"overlap", @"placement", @"order", @"partial",
-                        @"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race"]
+                        @"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race",
+                        @"load-early", @"load-late"]
                        containsObject:mode])
             return fail("expected a named Metal 4 race case");
         if (@available(macOS 26.0, *)) {

@@ -123,7 +123,7 @@ typedef struct fp_node {
     uint64_t cb_uid, commit_tick, done_tick, pend_since;
     int kind, state, idx;           /* state: 1 encoding, 2 ended, 3 committed, 4 analysed */
     void *enc;
-    uint8_t uncertain, exempt, mtl4;
+    uint8_t uncertain, exempt, mtl4, mtl4_drawn;   /* mtl4_drawn: a draw or dispatch was encoded */
     int att[10];                    /* acc index of colour 0-7, depth, stencil attachments */
     char label[64];
     fp_acc *acc;     int nacc, cacc;
@@ -287,7 +287,7 @@ static fp_node *node_new(int kind)   /* lock held */
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
-    n->mtl4 = 0;
+    n->mtl4 = 0; n->mtl4_drawn = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->frame = 0; n->queue_seq = 0; n->chain_prev = 0; n->depth = 0;
     n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
@@ -3549,6 +3549,7 @@ static void fp4_capture_tables(id encoder, unsigned stages)
 {
     fp_node *n = cur_node(encoder);
     if (!n || !n->mtl4) return;
+    n->mtl4_drawn = 1;
     while (stages) {
         int stage = __builtin_ctz(stages);
         unsigned together = FP4_STAGE(stage);
@@ -5046,13 +5047,23 @@ static unsigned fp4_stage_mask(NSUInteger mask)
     return 0;
 }
 
+/* Render pass attachments. Neither the headers nor Apple's synchronization articles say
+ * whether a consumer barrier or fence wait at the start of a render encoder orders the
+ * pass's attachment loads (the articles say only that loads happen at the start of the
+ * pass and stores at its end). fencepost decides conservatively:
+ * - a consumer queue barrier or fence wait encoded before the encoder's first draw covers
+ *   the attachment loads and stores (in its before stages, attachments being Fragment);
+ * - one encoded after a draw does not cover the loads, but does cover the stores.
+ * A pre-draw wait gets epoch 0, before the attachments' epoch 1, so it covers all of the
+ * encoder's work. At endEncoding the stores become accesses at the encoder's final epoch. */
 static void fp4_record_sync(id encoder, int kind, id fence, NSUInteger after, NSUInteger before)
 {
     fp_node *n = cur_node(encoder);
     if (!n || !n->mtl4) return;
-    fp4_sync sync = { (void *)fence, n->mtl4_epoch++, fp4_stage_mask(after), fp4_stage_mask(before), kind };
+    int pass_start = n->kind == FPK_RENDER && !n->mtl4_drawn && (kind == FP4_CONSUMER || kind == FP4_FENCE_WAIT);
+    fp4_sync sync = { (void *)fence, pass_start ? 0 : n->mtl4_epoch++, fp4_stage_mask(after), fp4_stage_mask(before), kind };
     PUSH(n->mtl4_sync, n->mtl4_nsync, n->mtl4_csync, sync);
-    memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
+    if (!pass_start) memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
 }
 
 #define FP4_BARRIER(fn, hook_id, kind) \
@@ -5645,12 +5656,21 @@ static void h_end(id self, SEL _cmd)
     if (!n) return;
     NSString *l = [self label];
     if (n->mtl4) {
-        for (int i = 0; i < n->nacc; i++) {
+        for (int i = 0, count = n->nacc; i < count; i++) {
             fp_acc *access = &n->acc[i];
-            if (access->via == VIA_ATT || access->via == VIA_ATT_LOAD || access->via == VIA_RESOLVE) {
-                access->last_epoch = n->mtl4_epoch;
-                fp4_note_work(n, FP4_FRAGMENT);
-            }
+            if (access->via != VIA_ATT && access->via != VIA_ATT_LOAD && access->via != VIA_RESOLVE) continue;
+            access->last_epoch = n->mtl4_epoch;
+            fp4_note_work(n, FP4_FRAGMENT);
+            if (!(access->rw & FP_WR)) continue;
+            /* The store happens at the end of the pass (see fp4_record_sync). */
+            if (access->via == VIA_ATT_LOAD) {
+                fp_acc store = *access;
+                access->rw &= ~FP_WR;
+                store.rw = FP_WR;
+                store.via = VIA_ATT;
+                store.first_epoch = n->mtl4_epoch;
+                push_acc(n, &store);
+            } else access->first_epoch = n->mtl4_epoch;
         }
         for (int i = 0; i < FP4_TABLES; i++) {
             [n->mtl4_tables[i] release];

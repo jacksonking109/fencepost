@@ -21,6 +21,7 @@ WHY = {
     "overlap": "no Metal 4 ordering covers Blit -> Dispatch",
     "fragment-vertex": "queue barrier Blit -> Vertex does not order Blit -> Fragment",
     "compiler-race": "no Metal 4 ordering covers Dispatch -> Dispatch",
+    "load-late": "queue barrier Fragment -> Fragment does not order Fragment -> Fragment",
 }
 
 
@@ -59,6 +60,8 @@ def check_case(arch, directory, program, mode, env, **extra):
         assert summary["accesses"] == 4, summary
     if mode == "placement":
         assert summary["accesses"] == 3, summary
+    if mode == "load-late":
+        assert "  second: " in result.stderr and "attachment load" in result.stderr, result.stderr
     if mode == "order":
         assert "Blit -> Blit is unordered" in result.stderr, result.stderr
     if mode == "partial":
@@ -73,7 +76,8 @@ def check_suite(arch, directory):
         check_case(arch, directory, "mtl4test", mode, env)
     for mode in ("producer", "fence", "fence-missing", "commits", "commits-barrier", "color-fragment",
                  "color-vertex", "mutate", "disjoint", "overlap", "placement", "order", "partial",
-                 "const-shared", "fragment-only", "fragment-vertex", "reflect-app", "compiler-race"):
+                 "const-shared", "fragment-only", "fragment-vertex", "reflect-app", "compiler-race",
+                 "load-early", "load-late"):
         check_case(arch, directory, "mtl4races", mode, env)
     possible = directory / "rw"
     possible.mkdir()
@@ -95,4 +99,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 24 Metal 4 verdicts, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 26 Metal 4 verdicts, race ring dump and clean benchmark passed")

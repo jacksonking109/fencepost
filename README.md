@@ -150,6 +150,11 @@ the specified producer and consumer stages, across command buffers and commits o
 and wait orders covered work on the same queue. Queue events order all covered stages, and commit feedback
 orders completed work before a later submission. Reports name the stages of both accesses.
 
+Render attachments load at the start of the pass and store at its end, both in the Fragment stage. Apple's
+documentation does not say whether a consumer barrier or fence wait inside a render encoder orders the load, so
+fencepost decides conservatively: one encoded before the encoder's first draw covers the attachment loads and
+stores; one encoded after a draw covers the stores only.
+
 Fencepost submits `commit:count:` as `commit:count:options:` with fresh options for its own feedback. For
 app options it tracks, it transfers the registered handlers to fresh options for that submission. Each handler
 registration is consumed once, including when the app reuses its options.
