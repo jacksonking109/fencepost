@@ -27,6 +27,7 @@
 #include <Block.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
+#include <os/lock.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -165,7 +166,7 @@ typedef struct fp_queue {
     uint64_t *held; int nheld, cheld;
     fp_evwait *mtl4_waits;
     int mtl4_nwaits, mtl4_cwaits;
-    uint64_t mtl4_wait_ticket, mtl4_last_node;
+    uint64_t mtl4_wait_ticket, mtl4_last_node, mtl4_event_completed_through;
     fp4_prefixes *mtl4_prefixes;
     struct fp_trace_cb *mtl4_last_trace;
     void **mtl4_residency;
@@ -220,7 +221,12 @@ static long g_chain_frame;                   /* FENCEPOST_CHAIN: the frame whose
 static int g_frame_api;                      /* fencepost_frame was called: presents no longer end frames */
 
 static __thread int tl_depth;   /* >0 inside a hooked Metal call: nested hooked calls pass through */
-static __thread struct { void *enc; uint64_t uid; } tl_cache;
+static __thread struct {
+    void *enc;
+    uint64_t uid;
+    void *table, *table_state;
+    uint64_t table_generation;
+} tl_cache;
 
 /* ---------------------------------------------------------------- utilities */
 
@@ -3203,10 +3209,10 @@ static fp4_resource fp4_lookup(uintptr_t device, uint64_t key, int by_id)
 
 static void fp4_note_work(fp_node *n, int stage)
 {
+    if (n->mtl4_last[stage] == n->mtl4_epoch) return;
     unsigned mask = FP4_STAGE(stage);
     n->mtl4_work |= mask;
     if (!n->mtl4_first[stage]) n->mtl4_first[stage] = n->mtl4_epoch;
-    if (n->mtl4_last[stage] == n->mtl4_epoch) return;
     n->mtl4_last[stage] = n->mtl4_epoch;
     if (n->mtl4_nwork_epochs && n->mtl4_work_epochs[n->mtl4_nwork_epochs - 1].epoch == n->mtl4_epoch)
         n->mtl4_work_epochs[n->mtl4_nwork_epochs - 1].mask |= mask;
@@ -3237,14 +3243,22 @@ static int fp4_record_access(fp_node *n, fp4_resource r, uint64_t off, uint64_t 
 }
 
 typedef struct {
-    uint64_t value;
+    uint64_t value, generation, sampled_uid;
+    uint32_t sampled_epoch;
+    uint16_t sampled_stages;
     int by_id;
-    struct { uint64_t value, generation; int by_id; fp4_resource resource; } cache[2];
+    fp4_resource resource;
+} fp4_slot_cache;
+
+typedef struct {
+    atomic_uint_fast64_t value;
+    atomic_int by_id;
+    fp4_slot_cache cache[2];
 } fp4_arg_slot;
 
 @interface FP4ArgumentState : NSObject {
 @public
-    pthread_mutex_t lock;
+    os_unfair_lock lock;
     atomic_uint_fast64_t version;
     uintptr_t device;
     NSUInteger buffers, textures;
@@ -3257,68 +3271,115 @@ typedef struct {
 {
     self = [super init];
     if (self) {
-        pthread_mutex_init(&lock, NULL);
+        lock = OS_UNFAIR_LOCK_INIT;
         atomic_init(&version, 1);
     }
     return self;
 }
 - (void)dealloc
 {
-    pthread_mutex_destroy(&lock);
     free(slots);
     [super dealloc];
 }
 @end
 
+@interface FP4ArgumentOwner : NSObject {
+@public
+    FP4ArgumentState *state;
+}
+@end
+
+static atomic_uint_fast64_t g_fp4_table_generation;
 static char g_fp4_argument_key;
+
+@implementation FP4ArgumentOwner
+- (void)dealloc
+{
+    atomic_fetch_add_explicit(&g_fp4_table_generation, 1, memory_order_release);
+    [state release];
+    [super dealloc];
+}
+@end
+
+static FP4ArgumentState *fp4_argument_state(id table)
+{
+    if (!table) return nil;
+    /* The generation invalidates cached identities when an Objective-C
+     * table dies, even if an encoder still owns its recording state. */
+    uint64_t generation = atomic_load_explicit(&g_fp4_table_generation, memory_order_acquire);
+    if (tl_cache.table != (void *)table || tl_cache.table_generation != generation) {
+        FP4ArgumentOwner *owner = objc_getAssociatedObject(table, &g_fp4_argument_key);
+        tl_cache.table_generation = generation;
+        tl_cache.table = (void *)table;
+        tl_cache.table_state = owner ? owner->state : nil;
+    }
+    return tl_cache.table_state;
+}
 
 static void fp4_set_slot(id table, NSUInteger index, int texture, uint64_t value, int by_id)
 {
-    FP4ArgumentState *state = objc_getAssociatedObject(table, &g_fp4_argument_key);
+    FP4ArgumentState *state = fp4_argument_state(table);
     if (!state || index >= (texture ? state->textures : state->buffers)) return;
-    pthread_mutex_lock(&state->lock);
     fp4_arg_slot *slot = &state->slots[index + (texture ? state->buffers : 0)];
-    if (slot->value != value || slot->by_id != by_id) {
-        slot->value = value;
-        slot->by_id = by_id;
-        atomic_fetch_add_explicit(&state->version, 1, memory_order_release);
-    }
-    pthread_mutex_unlock(&state->lock);
+    if (atomic_load_explicit(&slot->value, memory_order_relaxed) == value &&
+        atomic_load_explicit(&slot->by_id, memory_order_relaxed) == by_id) return;
+    /* The application's ordering of mutations and draws also orders the
+     * native table snapshot. Atomics keep observation safe across threads. */
+    atomic_store_explicit(&slot->by_id, by_id, memory_order_relaxed);
+    atomic_store_explicit(&slot->value, value, memory_order_relaxed);
+    atomic_fetch_add_explicit(&state->version, 1, memory_order_release);
 }
 
-static fp4_resource fp4_resolve_slot(FP4ArgumentState *state, fp4_arg_slot *slot)
+static fp4_slot_cache *fp4_resolve_slot(FP4ArgumentState *state, fp4_arg_slot *slot,
+                                        uint64_t value, int by_id, uint64_t generation)
 {
-    uint64_t generation = atomic_load_explicit(&g_fp4_resource_generation, memory_order_relaxed);
     for (int i = 0; i < 2; i++)
-        if (slot->cache[i].value == slot->value && slot->cache[i].by_id == slot->by_id &&
+        if (slot->cache[i].value == value && slot->cache[i].by_id == by_id &&
             slot->cache[i].generation == generation)
-            return slot->cache[i].resource;
-    fp4_resource resource = fp4_lookup(state->device, slot->value, slot->by_id);
+            return &slot->cache[i];
     slot->cache[1] = slot->cache[0];
-    slot->cache[0].value = slot->value;
-    slot->cache[0].by_id = slot->by_id;
-    slot->cache[0].generation = generation;
-    slot->cache[0].resource = resource;
-    return resource;
+    slot->cache[0] = (fp4_slot_cache){
+        .value = value, .generation = generation, .by_id = by_id,
+        .resource = fp4_lookup(state->device, value, by_id)
+    };
+    return &slot->cache[0];
 }
 
-static void fp4_sample_table(fp_node *n, int stage)
+static void fp4_sample_table(fp_node *n, FP4ArgumentState *state, unsigned stages)
 {
-    FP4ArgumentState *state = n->mtl4_tables[stage];
-    if (!state || n->mtl4_versions[stage] == atomic_load_explicit(&state->version, memory_order_acquire)) return;
-    pthread_mutex_lock(&state->lock);
-    n->mtl4_versions[stage] = atomic_load_explicit(&state->version, memory_order_relaxed);
+    uint64_t version = atomic_load_explicit(&state->version, memory_order_acquire);
+    unsigned changed = 0;
+    for (unsigned bits = stages; bits; bits &= bits - 1) {
+        int stage = __builtin_ctz(bits);
+        if (n->mtl4_versions[stage] != version) changed |= FP4_STAGE(stage);
+    }
+    if (!changed) return;
+    os_unfair_lock_lock(&state->lock);
+    uint64_t generation = atomic_load_explicit(&g_fp4_resource_generation, memory_order_relaxed);
+    for (unsigned bits = changed; bits; bits &= bits - 1) n->mtl4_versions[__builtin_ctz(bits)] = version;
     for (NSUInteger i = 0; i < state->buffers + state->textures; i++) {
         fp4_arg_slot *slot = &state->slots[i];
-        if (!slot->value) continue;
-        fp4_resource r = fp4_resolve_slot(state, slot);
-        if (!r.store) continue;
+        uint64_t value = atomic_load_explicit(&slot->value, memory_order_relaxed);
+        if (!value) continue;
+        int by_id = atomic_load_explicit(&slot->by_id, memory_order_relaxed);
+        fp4_slot_cache *cache = fp4_resolve_slot(state, slot, value, by_id, generation);
+        if (!cache->resource.store) continue;
+        if (cache->sampled_uid != n->uid || cache->sampled_epoch != n->mtl4_epoch) {
+            cache->sampled_uid = n->uid;
+            cache->sampled_epoch = n->mtl4_epoch;
+            cache->sampled_stages = 0;
+        }
+        unsigned pending = changed & ~cache->sampled_stages;
+        if (!pending) continue;
+        fp4_resource r = cache->resource;
         int rw = FP_RD;
         if (g_bind_maywrite && (i < state->buffers || r.shader_write)) rw |= FP_MAYBE;
-        uint64_t off = slot->by_id ? 0 : slot->value - r.address;
-        fp4_record_access(n, r, off, r.texture ? r.levels : UINT64_MAX, 0, r.slices, rw, stage, VIA_BIND);
+        uint64_t off = by_id ? 0 : value - r.address;
+        for (unsigned bits = pending; bits; bits &= bits - 1)
+            fp4_record_access(n, r, off, r.texture ? r.levels : UINT64_MAX, 0, r.slices, rw, __builtin_ctz(bits), VIA_BIND);
+        cache->sampled_stages |= pending;
     }
-    pthread_mutex_unlock(&state->lock);
+    os_unfair_lock_unlock(&state->lock);
 }
 
 static void fp4_capture_tables(id encoder, unsigned stages)
@@ -3327,9 +3388,20 @@ static void fp4_capture_tables(id encoder, unsigned stages)
     if (!n || !n->mtl4) return;
     while (stages) {
         int stage = __builtin_ctz(stages);
+        unsigned together = FP4_STAGE(stage);
         stages &= stages - 1;
         fp4_note_work(n, stage);
-        fp4_sample_table(n, stage);
+        FP4ArgumentState *state = n->mtl4_tables[stage];
+        if (!state) continue;
+        for (unsigned bits = stages; bits; bits &= bits - 1) {
+            int other = __builtin_ctz(bits);
+            if (n->mtl4_tables[other] == state) {
+                together |= FP4_STAGE(other);
+                fp4_note_work(n, other);
+            }
+        }
+        stages &= ~together;
+        fp4_sample_table(n, state, together);
     }
 }
 
@@ -3337,7 +3409,7 @@ static void fp4_bind_table(id encoder, id table, unsigned stages)
 {
     fp_node *n = cur_node(encoder);
     if (!n || !n->mtl4) return;
-    FP4ArgumentState *state = objc_getAssociatedObject(table, &g_fp4_argument_key);
+    FP4ArgumentState *state = fp4_argument_state(table);
     while (stages) {
         int stage = __builtin_ctz(stages);
         stages &= stages - 1;
@@ -4308,7 +4380,15 @@ static id h_mtl4_argument_table(id self, SEL _cmd, MTL4ArgumentTableDescriptor *
         state->textures = desc.maxTextureBindCount;
         state->slots = calloc(state->buffers + state->textures, sizeof *state->slots);
         if (state->slots) {
-            objc_setAssociatedObject(table, &g_fp4_argument_key, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            for (NSUInteger i = 0; i < state->buffers + state->textures; i++) {
+                atomic_init(&state->slots[i].value, 0);
+                atomic_init(&state->slots[i].by_id, 0);
+            }
+            FP4ArgumentOwner *owner = [[FP4ArgumentOwner alloc] init];
+            owner->state = [state retain];
+            objc_setAssociatedObject(table, &g_fp4_argument_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [owner release];
+            atomic_fetch_add_explicit(&g_fp4_table_generation, 1, memory_order_release);
             hook_mtl4_argument(object_getClass(table));
         }
         [state release];
@@ -4318,10 +4398,8 @@ static id h_mtl4_argument_table(id self, SEL _cmd, MTL4ArgumentTableDescriptor *
 
 static void h_mtl4_address(id self, SEL _cmd, uint64_t address, NSUInteger index)
 {
-    ENTER;
     ORIG(H_4_ADDRESS, void (*)(id, SEL, uint64_t, NSUInteger))(self, _cmd, address, index);
-    LEAVE;
-    if (OUTER) fp4_set_slot(self, index, 0, address, 0);
+    fp4_set_slot(self, index, 0, address, 0);
 }
 
 static void h_mtl4_stride(id self, SEL _cmd, uint64_t address, NSUInteger stride, NSUInteger index)
@@ -4342,10 +4420,8 @@ static void h_mtl4_resource(id self, SEL _cmd, MTLResourceID resource, NSUIntege
 
 static void h_mtl4_texture(id self, SEL _cmd, MTLResourceID resource, NSUInteger index)
 {
-    ENTER;
     ORIG(H_4_TEXTURE, void (*)(id, SEL, MTLResourceID, NSUInteger))(self, _cmd, resource, index);
-    LEAVE;
-    if (OUTER) fp4_set_slot(self, index, 1, resource._impl, 1);
+    fp4_set_slot(self, index, 1, resource._impl, 1);
 }
 
 static void h_mtl4_bind_compute(id self, SEL _cmd, id table)
@@ -4387,10 +4463,8 @@ static void h_mtl4_accel_build(id self, SEL _cmd, id accel, id descriptor, MTL4B
 
 static void h_mtl4_draw(id self, SEL _cmd, NSUInteger primitive, NSUInteger start, NSUInteger count)
 {
-    ENTER;
-    if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
+    fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
     ORIG(H_4_DRAW, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count);
-    LEAVE;
 }
 
 static void h_mtl4_draw_i(id self, SEL _cmd, NSUInteger primitive, NSUInteger start, NSUInteger count, NSUInteger instances)
@@ -4899,10 +4973,13 @@ static void mtl4_retire_waits(fp_queue *q, uint64_t limit)
         if (event && event->cpu_max >= wait.val) continue;
         fp_node *signal = first_event_signal(event, q, wait);
         if (!signal || !signal->mtl4) continue;
-        for (fp_node *p = signal; p; p = node_get(p->mtl4_previous)) {
+        fp_queue *producer = signal->req_q;
+        for (fp_node *p = signal; p && p->queue_seq >= producer->mtl4_event_completed_through;
+             p = node_get(p->mtl4_previous)) {
             if (p->kind == FPK_SIGNAL) continue;   /* signal retirement has its own completion checkpoint */
             if (!p->done_tick) p->done_tick = g_tick;
         }
+        producer->mtl4_event_completed_through = MAX(producer->mtl4_event_completed_through, signal->queue_seq + 1);
     }
     if (retired) {
         q->mtl4_nwaits -= retired;
