@@ -355,6 +355,78 @@ static int run_stitched(id<MTLDevice> device, NSString *mode)
     return atomic_load(&errors) ? fail("stitched GPU feedback error") : 0;
 }
 
+API_AVAILABLE(macos(26.0))
+static int run_mixed_event(id<MTLDevice> device, NSString *mode)
+{
+    BOOL legacyWrites = [mode hasPrefix:@"mixed-3to4"];
+    BOOL early = [mode hasSuffix:@"-early"];
+    uint64_t value = early ? 1 : 2;
+    id<MTLCommandQueue> legacy = [device newCommandQueue];
+    id<MTL4CommandQueue> modern = [device newMTL4CommandQueue];
+    id<MTLCommandBuffer> oldCB = [legacy commandBuffer];
+    id<MTL4CommandBuffer> newCB = [device newCommandBuffer];
+    __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    id<MTLEvent> event = [device newEvent];
+    id<MTLSharedEvent> gate = [device newSharedEvent];
+    MTLResourceOptions options = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
+    __attribute__((objc_precise_lifetime)) id<MTLBuffer> data = [device newBufferWithLength:16 options:options];
+    __attribute__((objc_precise_lifetime)) id<MTLBuffer> result = [device newBufferWithLength:16 options:options];
+    __attribute__((objc_precise_lifetime)) id<MTLResidencySet> residency =
+        [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    if (!oldCB || !modern || !newCB || !allocator || !event || !gate || !data || !result || !residency)
+        return fail("mixed event setup failed");
+    memset(data.contents, 0, data.length);
+    memset(result.contents, 0, result.length);
+    [residency addAllocation:data];
+    [residency addAllocation:result];
+    [residency commit];
+    [modern addResidencySet:residency];
+
+    if (legacyWrites) {
+        [oldCB encodeSignalEvent:event value:1];
+        [oldCB encodeWaitForEvent:gate value:1];
+    } else [oldCB encodeWaitForEvent:event value:value];
+    id<MTLBlitCommandEncoder> b = [oldCB blitCommandEncoder];
+    if (!b) return fail("Metal 3 blit encoder creation failed");
+    b.label = legacyWrites ? @"Metal 3 writer" : @"Metal 3 reader";
+    if (legacyWrites) [b fillBuffer:data range:NSMakeRange(0, 16) value:0x5A];
+    else [b copyFromBuffer:data sourceOffset:0 toBuffer:result destinationOffset:0 size:16];
+    [b endEncoding];
+    if (legacyWrites) [oldCB encodeSignalEvent:event value:2];
+
+    [newCB beginCommandBufferWithAllocator:allocator];
+    id<MTL4ComputeCommandEncoder> c = [newCB computeCommandEncoder];
+    if (!c) return fail("Metal 4 blit encoder creation failed");
+    c.label = legacyWrites ? @"Metal 4 reader" : @"Metal 4 writer";
+    if (!legacyWrites) [c fillBuffer:data range:NSMakeRange(0, 16) value:0x5A];
+    else [c copyFromBuffer:data sourceOffset:0 toBuffer:result destinationOffset:0 size:16];
+    [c endEncoding];
+    [newCB endCommandBuffer];
+
+    /* Hold the writer behind a CPU signal until both sides are submitted,
+     * so the early-value case cannot pass by CPU completion ordering. */
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block atomic_int errors = 0;
+    if (legacyWrites) {
+        [oldCB commit];
+        [modern waitForEvent:event value:value];
+        submit(modern, newCB, done, &errors);
+    } else {
+        [modern signalEvent:event value:1];
+        [modern waitForEvent:gate value:1];
+        submit(modern, newCB, done, &errors);
+        [modern signalEvent:event value:2];
+        [oldCB commit];
+    }
+    gate.signaledValue = 1;
+    [oldCB waitUntilCompleted];
+    if (!wait_cpu(done) || atomic_load(&errors) || oldCB.status != MTLCommandBufferStatusCompleted)
+        return fail("mixed event GPU execution failed");
+    if (!early && *(const uint32_t *)result.contents != 0x5A5A5A5A)
+        return fail("mixed event synchronized copy mismatch");
+    return 0;
+}
+
 /* A clear-and-store pass followed by a load-and-store pass with Fragment synchronization. */
 API_AVAILABLE(macos(26.0))
 static int run_attachments(id<MTLDevice> device, NSString *mode)
@@ -659,6 +731,7 @@ static int run(id<MTLDevice> device, NSString *mode)
     if ([mode hasPrefix:@"load-"]) return run_attachments(device, mode);
     if ([mode hasPrefix:@"store-"]) return run_attachment_stores(device, mode);
     if ([mode hasPrefix:@"stitched"]) return run_stitched(device, mode);
+    if ([mode hasPrefix:@"mixed-"]) return run_mixed_event(device, mode);
     if ([mode hasPrefix:@"consumer-"] || [mode hasPrefix:@"chain-"]) return run_consumer_barriers(device, mode);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
@@ -819,6 +892,7 @@ int main(int argc, const char **argv)
                         @"load-fence-late-split", @"load-producer", @"load-producer-before",
                         @"store-depth-discard", @"store-depth", @"store-resolve-separate", @"store-resolve-same",
                         @"stitched", @"stitched-load", @"stitched-writer",
+                        @"mixed-3to4", @"mixed-3to4-early", @"mixed-4to3", @"mixed-4to3-early",
                         @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
                         @"consumer-intervening", @"chain-empty", @"chain-before-blit", @"chain-blit", @"chain-fence",
                         @"copy-compute", @"copy-compute-async", @"copy-render", @"copy-render-async", @"rw-texture"]

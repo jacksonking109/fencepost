@@ -99,7 +99,7 @@ typedef struct {
     uint8_t is_tex, rw, sf, sl, via;   /* sf/sl: first and last stage the access happens in */
     uint16_t mtl4_stage;
     uint32_t first_epoch, last_epoch;
-    uint64_t gpu_address;
+    union { uint64_t gpu_address; void *object; };   /* Metal 3 keeps its object pointer for diagnostics */
 } fp_acc;
 
 typedef struct { uint64_t src; uint8_t after, before; } fp_edge;
@@ -462,7 +462,7 @@ static void describe_store(char *buf, size_t len, const fp_acc *a, int safe)
     char what[160] = "";
     if (a->is_tex) {
         if (safe) {
-            id<MTLTexture> t = (id<MTLTexture>)a->store;
+            id<MTLTexture> t = (id<MTLTexture>)a->object;
             const char *l = t.label ? t.label.UTF8String : NULL;
             snprintf(what, sizeof what, "texture %s%s%s%lux%lu, pixel format %lu, %lu levels",
                      l ? "\"" : "", l ? l : "", l ? "\" " : "", (unsigned long)t.width, (unsigned long)t.height,
@@ -473,15 +473,15 @@ static void describe_store(char *buf, size_t len, const fp_acc *a, int safe)
         else snprintf(lv, sizeof lv, "level %llu", (unsigned long long)a->a0);
         if (a->s1 - a->s0 > 1) snprintf(sl, sizeof sl, "slices %u-%u", a->s0, a->s1 - 1);
         else snprintf(sl, sizeof sl, "slice %u", a->s0);
-        snprintf(buf, len, "%s %p, %s, %s", what, a->store, lv, sl);
+        snprintf(buf, len, "%s %p, %s, %s", what, a->object, lv, sl);
     } else {
         if (safe) {
-            id<MTLBuffer> b = (id<MTLBuffer>)a->store;
+            id<MTLBuffer> b = (id<MTLBuffer>)a->object;
             const char *l = b.label ? b.label.UTF8String : NULL;
             snprintf(what, sizeof what, "buffer %s%s%s%lu bytes", l ? "\"" : "", l ? l : "", l ? "\" " : "",
                      (unsigned long)b.length);
         } else snprintf(what, sizeof what, "buffer");
-        snprintf(buf, len, "%s %p, bytes [%llu, %llu)", what, a->store,
+        snprintf(buf, len, "%s %p, bytes [%llu, %llu)", what, a->object,
                  (unsigned long long)a->a0, (unsigned long long)a->a1);
     }
 }
@@ -2523,11 +2523,12 @@ static int fp4_reaches(fp_node *from, int from_stage, uint32_t from_epoch,
     if (from->done_tick && from->done_tick < to->commit_tick) return 1;
     g_fp4_query++;
     g_fp4_nwork = 0;
-    fp4_push_visit(to, FP4_STAGE(to_stage), to_epoch, 0);
+    if (to->mtl4) fp4_push_visit(to, FP4_STAGE(to_stage), to_epoch, 0);
+    else fp4_visit_work(to, to_stage, 0, 0);
     while (g_fp4_nwork) {
         fp4_visit v = g_fp4_worklist[--g_fp4_nwork];
         fp_node *n = v.node;
-        if (from == n && v.stage == from_stage &&
+        if (from == n && (n->mtl4 ? v.stage == from_stage : v.stage >= from_stage) &&
             (v.stores_only ? from_epoch == v.epoch : from_epoch <= v.epoch)) return 1;
         if (from->done_tick && from->done_tick < n->commit_tick) return 1;
         if (v.stage == FP4_FRAGMENT && n->mtl4_resume_from) {
@@ -2543,9 +2544,14 @@ static int fp4_reaches(fp_node *from, int from_stage, uint32_t from_epoch,
             fp4_walk_prefix(n, fp4_previous_prefix(n), FP4_ALL, from, from_stage, from_epoch))
             return 1;
         for (int i = 0; i < n->ned; i++) {
-            fp_node *p = node_get(n->ed[i].src);
-            if (p && p->aseq >= from->aseq)
-                fp4_push_visit(p, FP4_ALL, UINT32_MAX, 0);
+            const fp_edge *edge = &n->ed[i];
+            if (!n->mtl4 && edge->before > v.stage) continue;
+            fp_node *p = node_get(edge->src);
+            if (!p || p->aseq < from->aseq) continue;
+            /* Event edges cover all Metal 4 stages. On Metal 3 the edge's
+             * vertex/fragment slots also preserve intervening fence scope. */
+            if (p->mtl4) fp4_push_visit(p, FP4_ALL, UINT32_MAX, 0);
+            else fp4_visit_work(p, edge->after, 0, 0);
         }
         if (n->mtl4_prefixes) {
             for (int a = 0; a < FP4_STAGE_COUNT; a++)
@@ -2629,10 +2635,13 @@ static int ordered(const fp_ent *e, fp_node *x, fp_node *y, const fp_acc *a)
     if (x->done_tick && x->done_tick < y->commit_tick) return 1;   /* completed before y was committed */
     uint64_t d = y->aseq - e->aseq;
     if (d >= FP_W) { g_st[ST_WINDOW]++; return 1; }
-    if (e->a.mtl4_stage && a->mtl4_stage)
-        return fp4_reaches(x, __builtin_ctz(e->a.mtl4_stage), e->a.last_epoch,
-                           y, __builtin_ctz(a->mtl4_stage), a->first_epoch);
-    return bit_test(&y->anc[a->sf], 2 * d + e->a.sl);
+    if (!e->a.mtl4_stage && !a->mtl4_stage) {
+        if (bit_test(&y->anc[a->sf], 2 * d + e->a.sl)) return 1;
+        if (!atomic_load_explicit(&g_fp4_active, memory_order_relaxed)) return 0;
+    }
+    int from_stage = e->a.mtl4_stage ? __builtin_ctz(e->a.mtl4_stage) : e->a.sl;
+    int to_stage = a->mtl4_stage ? __builtin_ctz(a->mtl4_stage) : a->sf;
+    return fp4_reaches(x, from_stage, e->a.last_epoch, y, to_stage, a->first_epoch);
 }
 
 static int same_range(const fp_acc *a, const fp_acc *b)
@@ -2992,7 +3001,7 @@ static fp_node *phase_signal(fp_queue *q, uint64_t cb_uid, uint64_t tick, fp_ite
     fp_ev *ev = ev_get(it->ev, 1);
     if (ev) {
         ev->gpu = 1;
-        if (q->mtl4) ev->known = 1;
+        ev->known = 1;
         ev->h[ev->nh % FP_EVHIST].val = it->val;
         ev->h[ev->nh % FP_EVHIST].uid = n->uid;
         ev->nh++;
@@ -3287,8 +3296,7 @@ static fp4_resource fp4_install_resource(id resource, FP4ResourceOwner *owner, i
     pthread_mutex_lock(&g_fp4_resource_lock);
     FP4ResourceOwner *existing = objc_getAssociatedObject(resource, &g_fp4_resource_key);
     if (!existing) {
-        /* Tagged keys distinguish allocation lifetimes and don't alias Metal 3
-         * object pointers in the shadow table. */
+        /* Both APIs share a key for this allocation's lifetime. */
         if (!owner->info.store) owner->info.store = (void *)((++g_fp4_store_id << 4) | 1);
         if (owner->resource_id) fp4_index_insert(&g_fp4_ids, owner);
         else if (index_address && owner->info.address && owner->info.end > owner->info.address)
@@ -3763,7 +3771,9 @@ static int acc_buf(fp_node *n, id<MTLBuffer> b, uint64_t off, uint64_t end, int 
     uint64_t len = b.length;
     if (end > len) end = len;
     if (off >= end) return -1;
-    fp_acc a = { (void *)b, off, end, 0, 0, 0, (uint8_t)rw, (uint8_t)sf, (uint8_t)sl, (uint8_t)via, 0, 0, 0, 0 };
+    void *store = (void *)b;
+    if (@available(macOS 26.0, *)) store = fp4_buffer(b).store;
+    fp_acc a = { .store = store, .a0 = off, .a1 = end, .rw = rw, .sf = sf, .sl = sl, .via = via, .object = b };
     push_acc(n, &a);
     return n->nacc - 1;
 }
@@ -3784,8 +3794,10 @@ static int acc_tex(fp_node *n, id<MTLTexture> t, uint64_t level, uint64_t nlev, 
     }
     if (t.buffer) return acc_buf(n, t.buffer, t.bufferOffset, UINT64_MAX, rw, sf, sl, via);
     if (t.hazardTrackingMode != MTLHazardTrackingModeUntracked) { __atomic_fetch_add(&g_st[ST_TRACKED], 1, __ATOMIC_RELAXED); return -1; }
-    fp_acc a = { (void *)t, level, level + (nlev ? nlev : 1), slice, slice + (nsl ? nsl : 1), 1,
-                 (uint8_t)rw, (uint8_t)sf, (uint8_t)sl, (uint8_t)via, 0, 0, 0, 0 };
+    void *store = (void *)t;
+    if (@available(macOS 26.0, *)) store = fp4_texture(t).store;
+    fp_acc a = { .store = store, .a0 = level, .a1 = level + MAX(1, nlev), .s0 = slice, .s1 = slice + MAX(1, nsl),
+                 .is_tex = 1, .rw = rw, .sf = sf, .sl = sl, .via = via, .object = t };
     push_acc(n, &a);
     return n->nacc - 1;
 }

@@ -12,6 +12,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = 3   # every verdict must hold on every run
 OUT = ROOT / "out"
+MIXED_EARLY = "the first's command buffer had not completed when the second's was committed, and no fence or event orders them"
 WHY = {
     "nobarrier": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "wrongstage": "queue barrier Blit -> Dispatch does not order Dispatch -> Dispatch",
@@ -30,6 +31,8 @@ WHY = {
     "store-depth": "no Metal 4 ordering covers Fragment -> Fragment",
     "store-resolve-same": "no Metal 4 ordering covers Fragment -> Fragment",
     "stitched-writer": "no Metal 4 ordering covers Fragment -> Fragment",
+    "mixed-3to4-early": MIXED_EARLY,
+    "mixed-4to3-early": MIXED_EARLY,
     "consumer-intervening": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-empty": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-before-blit": "no Metal 4 ordering covers Dispatch -> Dispatch",
@@ -95,6 +98,8 @@ def check_run(arch, directory, program, mode, env, run_index, baseline, **extra)
         assert result.stderr.count(": MSAA resolve,") == 2, result.stderr
     if mode == "stitched-writer":
         assert 'MTL4 outside writer' in result.stderr and 'MTL4 resume' in result.stderr, result.stderr
+    if mode.startswith("mixed-") and expected:
+        assert "read-after-write" in races[0] and "Metal 3 " in result.stderr and "Metal 4 " in result.stderr, result.stderr
     if mode == "order":
         assert "Blit -> Blit is unordered" in result.stderr, result.stderr
     if mode == "partial":
@@ -116,6 +121,7 @@ def check_suite(arch, directory):
                  "load-producer", "load-producer-before",
                  "store-depth-discard", "store-depth", "store-resolve-separate", "store-resolve-same",
                  "stitched", "stitched-load", "stitched-writer",
+                 "mixed-3to4", "mixed-3to4-early", "mixed-4to3", "mixed-4to3-early",
                  "consumer-buffer", "consumer-buffers", "consumer-commits",
                  "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence",
                  "copy-compute", "copy-compute-async", "copy-render", "copy-render-async", "rw-texture"):
@@ -141,4 +147,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 56 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 60 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
