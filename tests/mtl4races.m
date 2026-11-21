@@ -17,21 +17,28 @@ static BOOL wait_cpu(dispatch_semaphore_t sem)
 }
 
 API_AVAILABLE(macos(26.0))
-static void submit(id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> cb,
-                   dispatch_semaphore_t complete, atomic_int *errors)
+static void submit_batch(id<MTL4CommandQueue> queue, const id<MTL4CommandBuffer> *buffers, NSUInteger count,
+                         dispatch_semaphore_t complete, atomic_int *errors)
 {
     MTL4CommitOptions *options = [MTL4CommitOptions new];
     [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
         if (feedback.error) atomic_fetch_add(errors, 1);
         dispatch_semaphore_signal(complete);
     }];
-    [queue commit:&cb count:1 options:options];
+    [queue commit:buffers count:count options:options];
+}
+
+API_AVAILABLE(macos(26.0))
+static void submit(id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> cb,
+                   dispatch_semaphore_t complete, atomic_int *errors)
+{
+    submit_batch(queue, &cb, 1, complete, errors);
 }
 
 /* Hold the feedback queue until both commits are issued. The GPU never waits on the gate. */
 API_AVAILABLE(macos(26.0))
-static int submit_split(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> a,
-                        id<MTL4CommandBuffer> b)
+static int submit_split_batch(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> a,
+                              const id<MTL4CommandBuffer> *buffers, NSUInteger count)
 {
     dispatch_semaphore_t releaseFeedback = dispatch_semaphore_create(0);
     dispatch_semaphore_t blocked = dispatch_semaphore_create(0);
@@ -51,10 +58,17 @@ static int submit_split(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL
     [queue commit:&warm count:1 options:options];
     if (!wait_cpu(blocked)) return fail("feedback gate timeout");
     submit(queue, a, finished, &errors);
-    submit(queue, b, finished, &errors);
+    submit_batch(queue, buffers, count, finished, &errors);
     dispatch_semaphore_signal(releaseFeedback);
     if (!wait_cpu(finished) || !wait_cpu(finished)) return fail("commit feedback timeout");
     return atomic_load(&errors) ? fail("GPU feedback error") : 0;
+}
+
+API_AVAILABLE(macos(26.0))
+static int submit_split(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> a,
+                        id<MTL4CommandBuffer> b)
+{
+    return submit_split_batch(device, queue, a, &b, 1);
 }
 
 static NSString *const kernels =
@@ -269,6 +283,76 @@ static int run_attachment_stores(id<MTLDevice> device, NSString *mode)
     }
     [cb endCommandBuffer];
     return commit_and_wait(queue, cb);
+}
+
+API_AVAILABLE(macos(26.0))
+static int run_stitched(id<MTLDevice> device, NSString *mode)
+{
+    BOOL writer = [mode hasSuffix:@"-writer"], load = [mode hasSuffix:@"-load"];
+    NSUInteger count = load ? 3 : 2;
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTLLibrary> lib = [device newLibraryWithSource:kernels options:nil error:NULL];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vtx"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"solid"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = lib ? [device newRenderPipelineStateWithDescriptor:pd error:NULL] : nil;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:4 height:4 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> target = [device newTextureWithDescriptor:td];
+    __attribute__((objc_precise_lifetime)) id<MTLResidencySet> residency =
+        [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    if (!queue || !pipeline || !target || !residency) return fail("stitched pass setup failed");
+    uint32_t pixels[16] = {0};
+    [target replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:pixels bytesPerRow:16];
+    [residency addAllocation:target];
+    [residency commit];
+    [queue addResidencySet:residency];
+
+    MTL4RenderPassDescriptor *desc = [MTL4RenderPassDescriptor new];
+    desc.colorAttachments[0].texture = target;
+    desc.colorAttachments[0].loadAction = load ? MTLLoadActionLoad : MTLLoadActionClear;
+    desc.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4CommandBuffer> buffers[3];
+    __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> allocators[3];
+    /* Encode in reverse CPU order and submit in pass order. */
+    for (NSUInteger i = count; i-- > 0;) {
+        buffers[i] = [device newCommandBuffer];
+        allocators[i] = [device newCommandAllocator];
+        if (!buffers[i] || !allocators[i]) return fail("stitched command setup failed");
+        [buffers[i] beginCommandBufferWithAllocator:allocators[i]];
+        MTL4RenderEncoderOptions options = MTL4RenderEncoderOptionNone;
+        if (i) options |= MTL4RenderEncoderOptionResuming;
+        if (i + 1 < count) options |= MTL4RenderEncoderOptionSuspending;
+        id<MTL4RenderCommandEncoder> draw = [buffers[i] renderCommandEncoderWithDescriptor:desc options:options];
+        if (!draw) return fail("stitched render encoder creation failed");
+        draw.label = i ? @"resume" : @"suspend";
+        if (i == 0 || i + 1 == count) {
+            [draw setRenderPipelineState:pipeline];
+            [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        [draw endEncoding];
+        [buffers[i] endCommandBuffer];
+    }
+    if (writer) {
+        id<MTL4CommandBuffer> other = [device newCommandBuffer];
+        __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+        if (!other || !allocator) return fail("writer setup failed");
+        [other beginCommandBufferWithAllocator:allocator];
+        id<MTL4RenderCommandEncoder> draw = [other renderCommandEncoderWithDescriptor:desc];
+        if (!draw) return fail("writer encoder creation failed");
+        draw.label = @"outside writer";
+        [draw endEncoding];
+        [other endCommandBuffer];
+        return submit_split_batch(device, queue, other, buffers, count);
+    }
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block atomic_int errors = 0;
+    submit_batch(queue, buffers, count, done, &errors);
+    if (!wait_cpu(done)) return fail("stitched commit feedback timeout");
+    return atomic_load(&errors) ? fail("stitched GPU feedback error") : 0;
 }
 
 /* A clear-and-store pass followed by a load-and-store pass with Fragment synchronization. */
@@ -574,6 +658,7 @@ static int run(id<MTLDevice> device, NSString *mode)
     if ([mode isEqualToString:@"rw-texture"]) return run_rw_texture(device);
     if ([mode hasPrefix:@"load-"]) return run_attachments(device, mode);
     if ([mode hasPrefix:@"store-"]) return run_attachment_stores(device, mode);
+    if ([mode hasPrefix:@"stitched"]) return run_stitched(device, mode);
     if ([mode hasPrefix:@"consumer-"] || [mode hasPrefix:@"chain-"]) return run_consumer_barriers(device, mode);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
@@ -733,6 +818,7 @@ int main(int argc, const char **argv)
                         @"load-fence-multiple", @"load-fence-before", @"load-fence-split",
                         @"load-fence-late-split", @"load-producer", @"load-producer-before",
                         @"store-depth-discard", @"store-depth", @"store-resolve-separate", @"store-resolve-same",
+                        @"stitched", @"stitched-load", @"stitched-writer",
                         @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
                         @"consumer-intervening", @"chain-empty", @"chain-before-blit", @"chain-blit", @"chain-fence",
                         @"copy-compute", @"copy-compute-async", @"copy-render", @"copy-render-async", @"rw-texture"]

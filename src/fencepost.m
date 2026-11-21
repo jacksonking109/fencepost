@@ -76,6 +76,7 @@ static const char *const fp4_stage_names[] = {
 #define FP4_STAGE(i) (1u << (i))
 #define FP4_ALL (FP4_STAGE(FP4_STAGE_COUNT) - 1)
 enum { FP4_TABLES = FP4_DISPATCH + 1 };
+enum { FP4_SUSPENDING = 1, FP4_RESUMING = 2 };
 enum { VIA_ATT_LOAD, VIA_ATT, VIA_RESOLVE, VIA_USE, VIA_BIND, VIA_BLIT_SRC, VIA_BLIT_DST,
        VIA_FILL, VIA_MIPGEN, VIA_INDEX, VIA_INDIRECT, VIA_VISIBILITY, VIA_SYNC };
 static const char *const via_name[] = { "attachment load", "attachment", "MSAA resolve", "useResource",
@@ -130,7 +131,7 @@ typedef struct fp_node {
     int kind, state, idx;           /* state: 1 encoding, 2 ended, 3 committed, 4 analysed */
     void *enc;
     uint8_t uncertain, exempt, mtl4, mtl4_drawn;   /* mtl4_drawn: a draw or dispatch was encoded */
-    uint8_t mtl4_has_attachment;
+    uint8_t mtl4_has_attachment, mtl4_render_options;
     fp_deferred_att *deferred_att; int ndeferred_att, cdeferred_att;
     char label[64];
     fp_acc *acc;     int nacc, cacc;
@@ -145,7 +146,7 @@ typedef struct fp_node {
     uint32_t depth;                 /* encoders on that chain within the frame, this one included */
     uint32_t mtl4_epoch, mtl4_work, mtl4_store_epoch, mtl4_draw_epoch;
     uint32_t mtl4_first[FP4_STAGE_COUNT], mtl4_last[FP4_STAGE_COUNT];
-    uint64_t mtl4_previous;
+    uint64_t mtl4_previous, mtl4_resume_from;
     fp4_sync *mtl4_sync; int mtl4_nsync, mtl4_csync;
     fp4_work_epoch *mtl4_work_epochs; int mtl4_nwork_epochs, mtl4_cwork_epochs;
     fp4_prefixes *mtl4_prefixes;
@@ -294,14 +295,14 @@ static fp_node *node_new(int kind)   /* lock held */
     n->mtl4_pipeline = nil; n->mtl4_pipeline_object = NULL; n->mtl4_pipeline_serial = 0;
     memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
     n->mtl4_epoch = 1; n->mtl4_work = 0; n->mtl4_store_epoch = 0; n->mtl4_draw_epoch = 0;
-    n->mtl4_previous = 0; n->mtl4_nsync = 0; n->mtl4_nwork_epochs = 0;
+    n->mtl4_previous = n->mtl4_resume_from = 0; n->mtl4_nsync = 0; n->mtl4_nwork_epochs = 0;
     free(n->mtl4_prefixes); n->mtl4_prefixes = NULL;
     memset(n->mtl4_first, 0, sizeof n->mtl4_first);
     memset(n->mtl4_last, 0, sizeof n->mtl4_last);
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
-    n->mtl4 = 0; n->mtl4_drawn = 0; n->mtl4_has_attachment = 0;
+    n->mtl4 = 0; n->mtl4_drawn = 0; n->mtl4_has_attachment = n->mtl4_render_options = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->frame = 0; n->queue_seq = 0; n->chain_prev = 0; n->depth = 0;
     n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
@@ -2529,6 +2530,15 @@ static int fp4_reaches(fp_node *from, int from_stage, uint32_t from_epoch,
         if (from == n && v.stage == from_stage &&
             (v.stores_only ? from_epoch == v.epoch : from_epoch <= v.epoch)) return 1;
         if (from->done_tick && from->done_tick < n->commit_tick) return 1;
+        if (v.stage == FP4_FRAGMENT && n->mtl4_resume_from) {
+            /* Skip drawless middle segments without adding work to an empty stage. */
+            for (fp_node *p = node_get(n->mtl4_resume_from); p && p->aseq >= from->aseq;
+                 p = node_get(p->mtl4_resume_from)) {
+                if (!p->mtl4_last[FP4_FRAGMENT]) continue;
+                fp4_visit_work(p, FP4_FRAGMENT, p->mtl4_last[FP4_FRAGMENT], 0);
+                break;
+            }
+        }
         if (n->kind == FPK_SIGNAL && n->mtl4 &&
             fp4_walk_prefix(n, fp4_previous_prefix(n), FP4_ALL, from, from_stage, from_epoch))
             return 1;
@@ -3012,7 +3022,7 @@ static void phase_node(fp_queue *q, fp_node *n, uint64_t tick, fp_trace_cb *trac
 
 /* Phase 1, in submission order: resolve fence waits against the latest update, record
  * fence updates and event signals, queue the nodes for analysis. */
-static void phase1(fp_cb *c)
+static void phase1(fp_cb *c, fp_node **suspended)
 {
     fp_evwait active[32]; int nactive = 0;
     fp_queue *q = c->q;
@@ -3042,7 +3052,10 @@ static void phase1(fp_cb *c)
             n = phase_signal(q, c->uid, c->commit_tick, it);
         } else {
             n = node_get(it->uid);
-            if (!n) continue;
+            if (!n) {
+                if (suspended) *suspended = NULL;
+                continue;
+            }
             if (c->mtl4 && !n->nacc && (c->mtl4_resident || q->mtl4_nresidency)) g_mtl4_residency_only++;
             for (int k = 0; k < n->nfw; k++) {
                 int s = fence_slot(n->fw[k].f, 0);
@@ -3056,6 +3069,13 @@ static void phase1(fp_cb *c)
                 int s = fence_slot(n->fu[k].f, 1);
                 if (s >= 0) { g_fence[s].uid = n->uid; g_fence[s].after = n->fu[k].st; }
             }
+        }
+        if (suspended) {
+            /* Metal stitches the same pass in commit-array order. CPU
+             * encoding can happen concurrently or in a different order. */
+            if (*suspended && (n->mtl4_render_options & FP4_RESUMING) && (*suspended)->cb_uid != n->cb_uid)
+                n->mtl4_resume_from = (*suspended)->uid;
+            *suspended = n->mtl4_render_options & FP4_SUSPENDING ? n : NULL;
         }
         const fp_evwait *waits = c->mtl4 ? q->mtl4_waits : active;
         int nwaits = c->mtl4 ? q->mtl4_nwaits : nactive;
@@ -3090,7 +3110,7 @@ static void queue_submit(fp_queue *q, fp_cb *c)   /* in enqueue order */
         fp_cb *h = cb_get(q->held[best]);
         q->held[best] = q->held[--q->nheld];
         q->enq_next = h->enq + 1;
-        phase1(h);
+        phase1(h, NULL);
     }
 }
 
@@ -3798,6 +3818,10 @@ static void record_attachment(fp_node *n, id<MTLTexture> t, MTLRenderPassAttachm
                               NSUInteger layers, MTLStoreAction sa)
 {
     MTLLoadAction la = d.loadAction;
+    /* Tile contents survive between stitched segments. Only the endpoints
+     * operate on attachment memory. */
+    if (n->mtl4_render_options & FP4_RESUMING) la = MTLLoadActionDontCare;
+    if (n->mtl4_render_options & FP4_SUSPENDING) sa = MTLStoreActionDontCare;
     int rw = la == MTLLoadActionLoad ? FP_RD : 0;
     if (sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve ||
         sa == MTLStoreActionCustomSampleDepthStore) rw |= FP_WR;
@@ -4702,8 +4726,11 @@ static id h_mtl4_render_opts(id self, SEL _cmd, id desc, NSUInteger options)
     if (OUTER) {
         if (@available(macOS 26.0, *)) {
             fp_node *n = on_encoder_kind(self, enc, FPK_RENDER, trace, 1);
-            fp4_render_attachments(n, desc);
-            /* Suspend/resume encoders are pieces of a single stitched render pass. */
+            if (n) {
+                if (options & MTL4RenderEncoderOptionSuspending) n->mtl4_render_options |= FP4_SUSPENDING;
+                if (options & MTL4RenderEncoderOptionResuming) n->mtl4_render_options |= FP4_RESUMING;
+                fp4_render_attachments(n, desc);
+            }
             if (options == MTL4RenderEncoderOptionNone) trace_mtl4_begin_encoder(enc, n, trace);
         }
     }
@@ -5702,11 +5729,13 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
         if (!g_inflight && g_tick) { frame_get(g_frame_cur)->idle++; g_st[ST_GPU_IDLE]++; }
         uint64_t tick = ++g_tick;
         int nenc = 0;
+        fp_node *suspended = NULL;
         if (g_ring) ring_poll_file();
         for (NSUInteger i = 0; i < count; i++) {
             id cb = buffers[i];
             fp_cb *c = cb_find_open((void *)cb);
             if (!c || !c->mtl4 || c->state != 2) {
+                suspended = NULL;
                 if (g_trace_enabled && g_trace_gpu) trace_mtl4_abandon_samples(cb);
                 continue;
             }
@@ -5717,7 +5746,8 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
             nenc += c->nenc;
             cb_close((void *)cb);
             trace_mtl4_join(&submission->trace, c);
-            phase1(c);
+            phase1(c, &suspended);
+            if (!c->nenc) suspended = NULL;
         }
         trace_mtl4_submit(q, submission->trace);
         if (submission->ncbs) {
