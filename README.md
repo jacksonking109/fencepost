@@ -105,12 +105,16 @@ The streaming trace keeps up to 20,000 of these markers. Perfetto can omit arrow
 source finished, or attach an arrow to a diagnostic marker at the destination's start. The JSON retains both
 endpoints. The **fencepost summary** gives the detector counters and trace counts.
 
-GPU timestamps require stage-boundary sampling and measure whole encoders. Render spans run from vertex start
-to fragment end. Empty passes, parallel render encoders and systems without usable counter samples have no
-per-encoder GPU timing. For timestamped passes fencepost passes Metal a descriptor copy (or makes a descriptor
-for the descriptorless calls). A program that attaches its own counter sample buffers at the same stage boundaries,
-such as Madeira with `gpu-pass-profile`, keeps its samples. Fencepost skips sampling those encoders and also skips
-sampling if all attachment slots are occupied. A capture can change the timing of the work it observes.
+On Metal 3, GPU timestamps require stage-boundary sampling and measure whole encoders. Render spans run from
+vertex start to fragment end. Empty passes, parallel render encoders and systems without usable counter samples
+have no per-encoder GPU timing. For timestamped passes fencepost passes Metal a descriptor copy (or makes a
+descriptor for the descriptorless calls). A program that attaches its own counter sample buffers at the same stage
+boundaries, such as Madeira with `gpu-pass-profile`, keeps its samples. Fencepost skips sampling those encoders
+and also skips sampling if all attachment slots are occupied.
+
+On Metal 4, sampled render and compute encoders have their own spans inside the commit's GPU span. Overlapping
+GPU work stays overlapping in separate lanes, and race markers use both measured spans when available.
+A capture can change the timing of the work it observes.
 Set `FENCEPOST_TRACE_GPU=0` to disable encoder counter sampling and keep command buffer GPU timing.
 
 ## Metal 4
@@ -165,6 +169,14 @@ render pass covers its attachment stores at pass end.
 Fencepost submits `commit:count:` as `commit:count:options:` with fresh options for its own feedback. For
 app options it tracks, it transfers the registered handlers to fresh options for that submission. Each handler
 registration is consumed once, including when the app reuses its options.
+
+With GPU tracing on, fencepost inserts two Relaxed timestamp writes into each sampled app encoder. Relaxed
+sampling keeps overhead low and avoids the encoder splitting that Precise sampling can cause. The writes can
+shift GPU timing slightly. Render samples go from the vertex stage before the first draw to the fragment
+stage after the last draw. Fencepost resolves samples on commit feedback from its own timestamp heap per
+device. The heap holds 4,096 entries, enough for 2,048 encoder pairs across outstanding submissions.
+Excess encoders, machine-learning encoders, suspend/resume render segments and encoders without a valid
+timestamp pair get estimated spans and count toward `sampling_skipped` when GPU sampling is enabled.
 
 `signalDrawable:` marks the end of a frame. Programs can use `fencepost_frame` to supply their own frame
 boundaries. Ring dumps support manual requests, races, frame spikes, and GPU errors reported by commit feedback.
@@ -399,6 +411,7 @@ python3 -I tests/mtl4_check.py x86_64 --threads
 python3 -I tests/mtl4_race_check.py arm64
 python3 -I tests/mtl4_race_check.py x86_64
 python3 -I tests/mtl4_overhead.py                            # CPU overhead table, both slices
+python3 -I tests/mtl4_overhead.py --trace-timing arm64 x86_64 # CPU cost of estimated and sampled traces
 ```
 
 `tests/fptest.m` holds 35 small Metal programs with and without the synchronisation they need, each with the number of
