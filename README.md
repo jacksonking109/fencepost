@@ -465,6 +465,7 @@ for slice in arm64 x86_64; do
         -e FENCEPOST_TRACE="out/tracetest-$slice.json" -e FENCEPOST_MAX_REPORTS=0 out/tracetest
     python3 -I tests/trace_check.py --shape "out/tracetest-$slice.json"
     for check in ring trigger capture; do python3 -I "tests/${check}_check.py" "$slice"; done
+    python3 -I tests/safety_check.py "$slice"
 done
 ```
 

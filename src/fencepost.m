@@ -893,6 +893,7 @@ static uint64_t g_ring_floor, g_ring_latest, g_ring_evictions, g_ring_cap_evicti
 static fp_trace_endpoint *g_trace_history;
 #ifdef FENCEPOST_TEST_HOOKS
 static long g_mtl4_trace_live, g_mtl4_trace_peak, g_mtl4_signals_retired;
+static long g_mtl3_trace_live;
 #endif
 static char *g_ring_prefix;
 static int g_ring_encoded, g_ring_race = 1, g_ring_gpuerr = 1;
@@ -1552,7 +1553,7 @@ static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4, fp_tr
     if (mtl4) {
         g_mtl4_trace_live++;
         g_mtl4_trace_peak = MAX(g_mtl4_trace_peak, g_mtl4_trace_live);
-    }
+    } else g_mtl3_trace_live++;
 #endif
     c->device = device;
     if (!g_trace_origin) trace_start();
@@ -1577,6 +1578,7 @@ static void trace_free_cb(fp_trace_cb *c)
 {
 #ifdef FENCEPOST_TEST_HOOKS
     if (c->mtl4) g_mtl4_trace_live--;
+    else g_mtl3_trace_live--;
 #endif
     free(c);
 }
@@ -7852,6 +7854,145 @@ __attribute__((visibility("default"))) int fencepost_test_signal_window(void)
     g_mtl4_signals_retired -= retired;
     pthread_mutex_unlock(&g_lock);
     return retired;
+}
+
+__attribute__((visibility("default"))) void fencepost_test_safety_log(void)
+{
+    atexit(final_summary);
+    pthread_mutex_lock(&g_lock);
+    g_st[ST_NODES] = 1;
+    for (int i = 0; i < 16000; i++)
+        fp_log("fencepost probe: %05d --------------------------------------------------\n", i);
+    pthread_mutex_unlock(&g_lock);
+}
+
+__attribute__((visibility("default"))) int fencepost_test_safety_pool(void)
+{
+    atexit(final_summary);
+    pthread_mutex_lock(&g_lock);
+    uint64_t first_uid = g_uid + 1;
+    for (int i = 0; i < FP_POOL; i++) node_new(FPK_COMPUTE);
+    fp_node *first = node_get(first_uid);
+    long before = g_st[ST_NODE_POOL_EXHAUSTED];
+    int full = !node_new(FPK_COMPUTE) && first && g_st[ST_NODE_POOL_EXHAUSTED] == before + 1;
+    pthread_mutex_unlock(&g_lock);
+    /* Each fixture must return failure with no available slots. */
+    int hooks_safe = !fencepost_test_wait_source() && !fencepost_test_recycled_signal() &&
+        !fencepost_test_rotated_signal() && !fencepost_test_event_lifetime() && !fencepost_test_signal_window();
+    pthread_mutex_lock(&g_lock);
+    fp_node *last = node_get(first_uid + FP_POOL - 1);
+    if (last) last->state = 2;
+    fp_node *next = node_new(FPK_COMPUTE);
+    int passed = full && hooks_safe && next && next == last && node_get(first_uid) == first;
+    for (int i = 0; i < FP_POOL; i++) g_pool[i].state = 0;
+    pthread_mutex_unlock(&g_lock);
+    return passed;
+}
+
+__attribute__((visibility("default"))) int fencepost_test_safety_abandoned(void)
+{
+    atexit(final_summary);
+    NSObject *cb = [[NSObject alloc] init], *encoder = [[NSObject alloc] init];
+    pthread_mutex_lock(&g_lock);
+    cb_record_new(cb, NULL, 0, NULL);
+    pthread_mutex_unlock(&g_lock);
+    fp_node *first = on_encoder(cb, encoder, FPK_COMPUTE, NULL);
+    if (!first) {
+        [encoder release];
+        [cb release];
+        return 0;
+    }
+    uint64_t uid = first->uid;
+    pthread_mutex_lock(&g_lock);
+    long before = g_st[ST_ABANDONED_ENCODERS];
+    for (int i = 1; i < FP_POOL; i++) node_new(FPK_COMPUTE);
+    pthread_mutex_unlock(&g_lock);
+    [encoder release];
+    pthread_mutex_lock(&g_lock);
+    int reclaimed = !node_get(uid) && g_st[ST_ABANDONED_ENCODERS] == before + 1;
+    fp_node *replacement = node_new(FPK_COMPUTE);
+    for (int i = 0; i < FP_POOL; i++) g_pool[i].state = 0;
+    cb_close(cb);
+    pthread_mutex_unlock(&g_lock);
+    [cb release];
+    return reclaimed && replacement == first;
+}
+
+@interface FPSafetyResource : NSObject
+@end
+@implementation FPSafetyResource
+- (NSString *)label { return @"released safety buffer"; }
+- (NSUInteger)length { return 16; }
+@end
+
+__attribute__((visibility("default"))) int fencepost_test_safety_resource(void)
+{
+    FPSafetyResource *resource = [[FPSafetyResource alloc] init];
+    fp_node first = { .kind = FPK_BLIT }, second = { .kind = FPK_BLIT };
+    fp_acc access = { .store = resource, .a0 = 4, .a1 = 12, .rw = FP_WR, .via = VIA_FILL };
+    record_store(&first, &access, (id<MTLResource>)resource, 16);
+    record_store(&second, &access, (id<MTLResource>)resource, 16);
+    [resource release];
+    pthread_mutex_lock(&g_lock);
+    report(&first, &first.acc[0], &second, &second.acc[0]);
+    pthread_mutex_unlock(&g_lock);
+    free(first.acc); free(first.descriptions);
+    free(second.acc); free(second.descriptions);
+    return 1;
+}
+
+__attribute__((visibility("default"))) long fencepost_test_safety_trace_live(long *endpoints)
+{
+    pthread_mutex_lock(&g_lock);
+    long buffers = g_mtl3_trace_live;
+    *endpoints = g_trace_nodes ? CFDictionaryGetCount(g_trace_nodes) : -1;
+    pthread_mutex_unlock(&g_lock);
+    return buffers;
+}
+
+__attribute__((visibility("default"))) int fencepost_test_safety_trace_recycled(void)
+{
+    if (!g_trace_enabled) return 0;
+    NSObject *cb = [[NSObject alloc] init];
+    static fp_queue queue;
+    pthread_mutex_lock(&g_lock);
+    fp_cb *buffer = cb_record_new(cb, &queue, 0, NULL);
+    pthread_mutex_unlock(&g_lock);
+    fp_trace_encoder *encoder = trace_encoder_begin(cb);
+    pthread_mutex_lock(&g_lock);
+    fp_node *n = node_new(FPK_COMPUTE);
+    if (!n || !encoder) {
+        if (n) n->state = 0;
+        cb_close(cb);
+        pthread_mutex_unlock(&g_lock);
+        [cb release];
+        return 0;
+    }
+    n->cb_uid = buffer->uid;
+    n->state = 4;
+    snprintf(n->label, sizeof n->label, "recycled safety encoder");
+    trace_encoder_register(encoder, n);
+    trace_encoder_end(n);
+    fp_trace_cb *trace = buffer->trace;
+    trace_phase_node(trace, n, NULL, 0);
+    trace_analyse(n);
+    trace->phased = 1;
+    trace->owner->record = NULL;
+    trace->owner = nil;
+    uint64_t uid = n->uid;
+    for (int i = 0; i < FP_POOL; i++) {
+        fp_node *replacement = node_new(FPK_SIGNAL);
+        if (!replacement) break;
+        replacement->state = 4;
+    }
+    int recycled = !node_get(uid);
+    uint64_t before = g_trace_encoders;
+    trace_cb_completed(trace, 0, 0, NULL, (fp_trace_calibration){0});
+    int written = g_trace_encoders == before + 1;
+    cb_close(cb);
+    pthread_mutex_unlock(&g_lock);
+    [cb release];
+    return recycled && written;
 }
 #endif
 /* Declare a barrier at the current point of cb: every encoder submitted to cb's queue

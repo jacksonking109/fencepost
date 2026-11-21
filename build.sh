@@ -19,6 +19,8 @@ if [[ $1 != release ]]; then
     codesign -f -s - out/.libfencepost-testhooks.dylib.new 2>/dev/null
     mv -f out/.libfencepost-testhooks.dylib.new out/libfencepost-testhooks.dylib
     echo "built out/libfencepost-testhooks.dylib"
+    clang $FLAGS -o out/safetytest tests/safetytest.m -framework Metal -framework Foundation
+    codesign -f -s - out/safetytest 2>/dev/null
 fi
 clang $FLAGS -o out/fptest tests/fptest.m -framework Metal -framework Foundation
 clang $FLAGS -o out/tracetest tests/tracetest.m -framework Metal -framework Foundation
