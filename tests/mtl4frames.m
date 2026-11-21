@@ -419,6 +419,12 @@ int main(int argc, const char **argv)
             puts("an expired event record was removed and its wait was counted without an edge");
             return 0;
         }
+        if (argc == 2 && !strcmp(argv[1], "--rotated-signal")) {
+            int (*test_rotated)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_rotated_signal");
+            if (!test_rotated || !test_rotated()) return fail("wait used the wrong signal after history rotation");
+            puts("rotated source counted without an edge; higher value used the recorded signal");
+            return 0;
+        }
         if (argc == 2 && !strcmp(argv[1], "--reflection-retry")) {
             if (@available(macOS 26.0, *))
                 return reflection_retry(MTLCreateSystemDefaultDevice());

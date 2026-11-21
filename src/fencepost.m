@@ -87,7 +87,7 @@ enum { ST_RACE_UNIQ, ST_POSS_UNIQ, ST_RACE_HITS, ST_POSS_HITS, ST_NODES, ST_ACCE
        ST_ORDER_UNIQ, ST_ORDER_HITS, ST_PARTIAL_UNIQ, ST_PARTIAL_HITS, ST_BARRIERS,
        ST_OBJS, ST_OBJ_DROPS, ST_ANALYSIS_NS,
        ST_FRAMES, ST_FRAME_ENC, ST_FRAME_CHAIN, ST_GPU_IDLE,   /* last finished frame's encoders and chain */
-       ST_EVENT_LOOKUP_MISSES,
+       ST_EVENT_LOOKUP_MISSES, ST_EVENT_UNKNOWN_SIGNALS,
        ST_COUNT };
 
 typedef struct { uint64_t w[FP_WORDS]; } fp_bits;
@@ -189,7 +189,11 @@ typedef struct fp_queue {
 
 typedef struct { fp_acc a; uint64_t uid, aseq; } fp_ent;
 typedef struct { void *key; fp_ent *w; int nw, cw; fp_ent *r; int nr, cr; } fp_obj;   /* writes (incl. may-write) and pure reads */
-typedef struct { int known, gpu; uint64_t cpu_max; struct { uint64_t val, uid; } h[FP_EVHIST]; unsigned nh; } fp_ev;
+typedef struct {
+    int known, gpu;
+    uint64_t cpu_max, nh, rotated_max;
+    struct { uint64_t val, uid; } h[FP_EVHIST];
+} fp_ev;
 
 #define PUSH(arr, n, cap, val) do { if ((n) == (cap)) { (cap) = (cap) ? (cap) * 2 : 8; \
     (arr) = realloc((arr), (size_t)(cap) * sizeof *(arr)); } (arr)[(n)++] = (val); } while (0)
@@ -1888,7 +1892,7 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
         "heap_uses", "parallel", "tracked", "timeouts", "uncertain", "window", "lost",
         "order_unique", "order_hits", "partial_unique", "partial_hits", "barriers",
         "objs", "obj_drops", "analysis_ns", "frames", "frame_enc", "frame_chain", "gpu_idle",
-        "event_wait_lookup_misses"
+        "event_wait_lookup_misses", "event_wait_unknown_signals"
     };
     _Static_assert(sizeof stats / sizeof *stats == ST_COUNT, "trace summary must include all detector counters");
     trace_header_at(f, 'i', 0, timestamp, "fencepost", "fencepost summary", state->origin ?: timestamp);
@@ -2456,6 +2460,8 @@ static void summary(int final)
                FP_W, g_st[ST_LOST]);
     if (g_st[ST_EVENT_LOOKUP_MISSES])
         fp_log("fencepost:   event waits with missing records: %ld\n", g_st[ST_EVENT_LOOKUP_MISSES]);
+    if (g_st[ST_EVENT_UNKNOWN_SIGNALS])
+        fp_log("fencepost:   event waits with unavailable signal history: %ld\n", g_st[ST_EVENT_UNKNOWN_SIGNALS]);
     if (g_trace) fflush(g_trace);
     pthread_mutex_unlock(&g_lock);
 }
@@ -2907,17 +2913,30 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
     if (g_trace_enabled) trace_analyse(y);
 }
 
-/* The earliest signal in event history order whose value satisfies the wait. A signal
- * whose node was recycled from the pool is at least FP_POOL nodes old, so it finished long
- * ago: it settles the wait without an edge (*gone), like an event fencepost never saw. It
- * must not hand the wait to a later signal, which would order the waiter after work the
- * real (earlier) signal never covered. */
+static void record_event_signal(fp_ev *ev, uint64_t value, uint64_t uid)
+{
+    unsigned slot = ev->nh % FP_EVHIST;
+    if (ev->nh >= FP_EVHIST) ev->rotated_max = MAX(ev->rotated_max, ev->h[slot].val);
+    ev->h[slot].val = value;
+    ev->h[slot].uid = uid;
+    ev->nh++;
+    ev->gpu = ev->known = 1;
+}
+
+/* Find the earliest eligible signal. A recycled node or a rotated-out value
+ * that could satisfy the wait leaves its source unknown. Substituting a newer
+ * signal could incorrectly order the waiter after unrelated work. */
 static fp_node *first_event_signal(const fp_ev *ev, const fp_queue *queue, fp_evwait wait, int *gone)
 {
     if (gone) *gone = 0;
     if (!ev || !ev->known) return NULL;
-    unsigned first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
-    for (unsigned k = first; k < ev->nh; k++) {
+    uint64_t first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
+    if (first && ev->rotated_max >= wait.val) {
+        /* The discarded values no longer have queue and position metadata. */
+        if (gone) *gone = 1;
+        return NULL;
+    }
+    for (uint64_t k = first; k < ev->nh; k++) {
         if (ev->h[k % FP_EVHIST].val < wait.val) continue;
         fp_node *signal = node_get(ev->h[k % FP_EVHIST].uid);
         if (!signal) {
@@ -2944,7 +2963,10 @@ static int ready(fp_node *n, int force)
             int gone;
             fp_node *signal = first_event_signal(ev, n->req_q, w, &gone);
             int pending_signal = signal && !signal->aseq;
-            if (gone) done = 1;
+            if (gone) {
+                g_st[ST_EVENT_UNKNOWN_SIGNALS]++;
+                done = 1;
+            }
             if (signal && !pending_signal) {
                 fp_edge e = { signal->uid, 1, w.before };
                 PUSH(n->ed, n->ned, n->ced, e);
@@ -3040,13 +3062,7 @@ static fp_node *phase_signal(fp_queue *q, uint64_t cb_uid, uint64_t tick, fp_ite
         PUSH(n->ed, n->ned, n->ced, e);
     }
     fp_ev *ev = ev_get(it->ev);
-    if (ev) {
-        ev->gpu = 1;
-        ev->known = 1;
-        ev->h[ev->nh % FP_EVHIST].val = it->val;
-        ev->h[ev->nh % FP_EVHIST].uid = n->uid;
-        ev->nh++;
-    }
+    if (ev) record_event_signal(ev, it->val, n->uid);
     return n;
 }
 
@@ -7096,10 +7112,8 @@ __attribute__((visibility("default"))) int fencepost_test_wait_source(void)
     second->aseq = 1;
     waiter->req_q = &consumer;
     fp_ev *event = ev_get(key);
-    event->known = event->gpu = 1;
-    event->h[0].uid = first->uid; event->h[0].val = 1;
-    event->h[1].uid = second->uid; event->h[1].val = 2;
-    event->nh = 2;
+    record_event_signal(event, 1, first->uid);
+    record_event_signal(event, 2, second->uid);
     fp_evwait wait = { key, 1, 0, 0, 0 };
     PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
     int pending = !ready(waiter, 0) && !waiter->ned;
@@ -7125,17 +7139,46 @@ __attribute__((visibility("default"))) int fencepost_test_recycled_signal(void)
     waiter->req_q = &consumer;
     uint64_t recycled = later->uid > FP_POOL ? later->uid - FP_POOL : later->uid + FP_POOL;
     fp_ev *event = ev_get(key);
-    event->known = event->gpu = 1;
-    event->h[0].uid = recycled; event->h[0].val = 1;
-    event->h[1].uid = later->uid; event->h[1].val = 2;
-    event->nh = 2;
+    record_event_signal(event, 1, recycled);
+    record_event_signal(event, 2, later->uid);
     fp_evwait wait = { key, 1, 0, 0, 0 };
     PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
-    int settled = !node_get(recycled) && ready(waiter, 0) && !waiter->ned && !waiter->nev;
+    long before = g_st[ST_EVENT_UNKNOWN_SIGNALS];
+    int settled = !node_get(recycled) && ready(waiter, 0) && !waiter->ned && !waiter->nev &&
+        g_st[ST_EVENT_UNKNOWN_SIGNALS] == before + 1;
     later->state = waiter->state = 0;
     pthread_mutex_unlock(&g_lock);
     [object release];
     return settled;
+}
+
+__attribute__((visibility("default"))) int fencepost_test_rotated_signal(void)
+{
+    NSObject *object = [[NSObject alloc] init];
+    void *key = event_key(object, 1);
+    pthread_mutex_lock(&g_lock);
+    static fp_queue producer, consumer;
+    fp_node *first = node_new(FPK_SIGNAL), *later = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
+    first->req_q = later->req_q = &producer;
+    first->aseq = 1;
+    later->aseq = 2;
+    waiter->req_q = &consumer;
+    fp_ev *event = ev_get(key);
+    record_event_signal(event, 2, first->uid);
+    record_event_signal(event, 1, first->uid);
+    for (unsigned i = 0; i < FP_EVHIST; i++) record_event_signal(event, 3, later->uid);
+    long before = g_st[ST_EVENT_UNKNOWN_SIGNALS];
+    fp_evwait wait = { key, 2, 0, 0, 0 };
+    PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
+    int unknown = ready(waiter, 0) && !waiter->ned && !waiter->nev &&
+        g_st[ST_EVENT_UNKNOWN_SIGNALS] == before + 1;
+    wait.val = 3;
+    PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
+    int selected = ready(waiter, 0) && waiter->ned == 1 && waiter->ed[0].src == later->uid;
+    first->state = later->state = waiter->state = 0;
+    pthread_mutex_unlock(&g_lock);
+    [object release];
+    return unknown && selected;
 }
 
 __attribute__((visibility("default"))) int fencepost_test_event_lifetime(void)

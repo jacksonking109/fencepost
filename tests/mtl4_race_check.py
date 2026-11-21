@@ -102,7 +102,7 @@ def check_run(arch, directory, program, mode, env, run_index, baseline, **extra)
         assert "read-after-write" in races[0] and "Metal 3 " in result.stderr and "Metal 4 " in result.stderr, result.stderr
     if mode == "event-churn":
         assert "5000 events signaled, waited, and released" in result.stdout, result.stdout
-        assert summary["event_wait_lookup_misses"] == 0 and summary["timeouts"] == 0, summary
+        assert all(summary[key] == 0 for key in ("event_wait_lookup_misses", "event_wait_unknown_signals", "timeouts")), summary
     if mode == "order":
         assert "Blit -> Blit is unordered" in result.stderr, result.stderr
     if mode == "partial":

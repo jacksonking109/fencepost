@@ -246,19 +246,20 @@ static int run_attachment_stores(id<MTLDevice> device, NSString *mode)
     BOOL sameResolve = [mode hasSuffix:@"-same"];
     BOOL store = [mode isEqualToString:@"store-depth"];
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
-    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
     id<MTL4CommandBuffer> cb = [device newCommandBuffer];
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
         resolve ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatDepth32Float width:4 height:4 mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> resolveA = resolve ? [device newTextureWithDescriptor:td] : nil;
-    id<MTLTexture> resolveB = resolve && !sameResolve ? [device newTextureWithDescriptor:td] : resolveA;
+    __attribute__((objc_precise_lifetime)) id<MTLTexture> resolveA = resolve ? [device newTextureWithDescriptor:td] : nil;
+    __attribute__((objc_precise_lifetime)) id<MTLTexture> resolveB =
+        resolve && !sameResolve ? [device newTextureWithDescriptor:td] : resolveA;
     if (resolve) {
         td.textureType = MTLTextureType2DMultisample;
         td.sampleCount = 4;
     }
-    id<MTLTexture> target = [device newTextureWithDescriptor:td];
+    __attribute__((objc_precise_lifetime)) id<MTLTexture> target = [device newTextureWithDescriptor:td];
     __attribute__((objc_precise_lifetime)) id<MTLResidencySet> residency =
         [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
     if (!queue || !allocator || !cb || !target || !residency || (resolve && (!resolveA || !resolveB)))
@@ -296,12 +297,13 @@ static int run_stitched(id<MTLDevice> device, NSString *mode)
     pd.vertexFunction = [lib newFunctionWithName:@"vtx"];
     pd.fragmentFunction = [lib newFunctionWithName:@"solid"];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-    id<MTLRenderPipelineState> pipeline = lib ? [device newRenderPipelineStateWithDescriptor:pd error:NULL] : nil;
+    __attribute__((objc_precise_lifetime)) id<MTLRenderPipelineState> pipeline =
+        lib ? [device newRenderPipelineStateWithDescriptor:pd error:NULL] : nil;
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
         width:4 height:4 mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModeShared;
-    id<MTLTexture> target = [device newTextureWithDescriptor:td];
+    __attribute__((objc_precise_lifetime)) id<MTLTexture> target = [device newTextureWithDescriptor:td];
     __attribute__((objc_precise_lifetime)) id<MTLResidencySet> residency =
         [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
     if (!queue || !pipeline || !target || !residency) return fail("stitched pass setup failed");
@@ -366,8 +368,8 @@ static int run_mixed_event(id<MTLDevice> device, NSString *mode)
     id<MTLCommandBuffer> oldCB = [legacy commandBuffer];
     id<MTL4CommandBuffer> newCB = [device newCommandBuffer];
     __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
-    id<MTLEvent> event = [device newEvent];
-    id<MTLSharedEvent> gate = [device newSharedEvent];
+    __attribute__((objc_precise_lifetime)) id<MTLEvent> event = [device newEvent];
+    __attribute__((objc_precise_lifetime)) id<MTLSharedEvent> gate = [device newSharedEvent];
     MTLResourceOptions options = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
     __attribute__((objc_precise_lifetime)) id<MTLBuffer> data = [device newBufferWithLength:16 options:options];
     __attribute__((objc_precise_lifetime)) id<MTLBuffer> result = [device newBufferWithLength:16 options:options];

@@ -167,13 +167,18 @@ buffers and commits. [Apple's consumer barrier reference](https://developer.appl
 A producer barrier orders earlier commands in its own encoder before work at the specified stages in later
 encoders. Two barriers chain through a shared stage only if both cover an operation in that stage, which can
 be a fence update or wait. Fences order covered work on the same queue. Queue event signals and waits order
-work across queues. Commit feedback orders completed work before a later submission.
+work across queues, including between Metal 3 and Metal 4. Commit feedback orders completed work before a
+later submission. The trace summary counts waits with missing event records in `event_wait_lookup_misses`
+and waits whose signal history has become unavailable in `event_wait_unknown_signals`. These waits resolve
+without a dependency edge.
 
 Render attachments load at the start of the pass and store at its end, both in the Fragment stage. Apple's
 documentation leaves the effect of an in-encoder wait on the load unspecified. Fencepost treats a consumer
 barrier or fence wait covering Fragment before the first draw as covering both loads and stores. After a draw,
 it covers stores only. A Fragment fence update or producer barrier covers stores only if it follows the last
-draw. One before or between draws leaves the stores and subsequent draws uncovered.
+draw. One before or between draws leaves the stores and subsequent draws uncovered. A pass stitched across
+command buffers in one commit loads in its first segment and stores in its last. `DontCare` discards the
+attachment, and `MultisampleResolve` stores only the resolve target.
 
 ### Timing, frames and capture
 
@@ -432,7 +437,7 @@ python3 -I tests/mtl4_overhead.py arm64 x86_64
 python3 -I tests/mtl4_overhead.py --trace-timing arm64 x86_64
 ```
 
-`tests/fptest.m` holds 35 small Metal programs with and without the synchronisation they need, each with the number of
+`tests/fptest.m` holds 43 small Metal programs with and without the synchronisation they need, each with the number of
 races, barrier violations or frame chain lengths fencepost must report. Examples:
 - a fence updated after the vertex stage while the write happens in the fragment stage;
 - a fence re-updated by an unrelated encoder before the wait;

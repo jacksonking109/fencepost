@@ -86,7 +86,7 @@ def check_threads(arch):
 
 def check_testhooks(arch, directory, env):
     injection = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost-testhooks.dylib"}
-    for scenario in ("--wait-source", "--recycled-signal", "--signal-window", "--event-lifetime"):
+    for scenario in ("--wait-source", "--recycled-signal", "--signal-window", "--event-lifetime", "--rotated-signal"):
         subprocess.run(command(arch, injection, scenario), env=env, check=True, timeout=20)
     retry = subprocess.run(command(arch, dict(injection, FENCEPOST_MTL4_TEST_REFLECTION_FAIL="3"),
                                   "--reflection-retry"),
