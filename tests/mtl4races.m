@@ -34,7 +34,156 @@ static NSString *const kernels =
     "kernel void word(const device uint *src [[buffer(0)]], device uint *dst [[buffer(1)]]) { *dst = *src; }\n"
     "kernel void texel(texture2d<float, access::read> src [[texture(0)]], device uint *dst [[buffer(0)]]) {\n"
     "    *dst = uint(src.read(uint2(0)).r * 255.0f);\n"
+    "}\n"
+    "struct VOut { float4 position [[position]]; };\n"
+    "vertex VOut vtx(uint vid [[vertex_id]]) {\n"
+    "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "    VOut out; out.position = float4(p * 2.0f - 1.0f, 0.0f, 1.0f); return out;\n"
+    "}\n"
+    "fragment float4 frag(VOut in [[stage_in]], const device uint *data [[buffer(0)]]) {\n"
+    "    return float4(float(data[0] & 255u) / 255.0f, 0.0f, 0.0f, 1.0f);\n"
     "}\n";
+
+API_AVAILABLE(macos(26.0))
+static int commit_and_wait(id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> cb)
+{
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block atomic_int errors = 0;
+    submit(queue, cb, done, &errors);
+    if (!wait_cpu(done)) return fail("commit feedback timeout");
+    return atomic_load(&errors) ? fail("GPU feedback error") : 0;
+}
+
+API_AVAILABLE(macos(26.0))
+static BOOL binding_access(NSArray<id<MTLBinding>> *bindings, NSUInteger index, MTLBindingAccess access)
+{
+    for (id<MTLBinding> binding in bindings)
+        if (binding.type == MTLBindingTypeBuffer && binding.index == index) return binding.used && binding.access == access;
+    return NO;
+}
+
+/* Binding access from pipeline reflection: each mode is one queue and one command buffer. */
+API_AVAILABLE(macos(26.0))
+static int run_reflection(id<MTLDevice> device, NSString *mode)
+{
+    BOOL render = [mode hasPrefix:@"fragment"], compiler = [mode isEqualToString:@"compiler-race"];
+    BOOL app = [mode isEqualToString:@"reflect-app"];
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    id<MTL4CommandBuffer> cb = [device newCommandBuffer];
+    if (!queue || !allocator || !cb) return fail("command setup failed");
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:kernels options:nil error:&error];
+    if (!library) return fail(error.localizedDescription.UTF8String ?: "shader compilation failed");
+
+    id<MTLBuffer> source = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> first = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> second = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    if (!source || !first || !second) return fail("buffer allocation failed");
+    memset(source.contents, 0, 64);
+    id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    if (!residency) return fail("residency allocation failed");
+    [residency addAllocation:source];
+    [residency addAllocation:first];
+    [residency addAllocation:second];
+
+    MTL4ArgumentTableDescriptor *layout = [MTL4ArgumentTableDescriptor new];
+    layout.maxBufferBindCount = 2;
+    id<MTL4ArgumentTable> one = [device newArgumentTableWithDescriptor:layout error:&error];
+    id<MTL4ArgumentTable> two = [device newArgumentTableWithDescriptor:layout error:&error];
+    if (!one || !two) return fail("argument table creation failed");
+    [one setAddress:source.gpuAddress atIndex:0];
+    [one setAddress:first.gpuAddress atIndex:1];
+    [two setAddress:source.gpuAddress atIndex:0];
+    [two setAddress:(compiler ? first : second).gpuAddress atIndex:1];
+
+    [cb beginCommandBufferWithAllocator:allocator];
+    if (render) {
+        MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+        rd.vertexFunction = [library newFunctionWithName:@"vtx"];
+        rd.fragmentFunction = [library newFunctionWithName:@"frag"];
+        rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:rd error:&error];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:4 height:4 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> target = [device newTextureWithDescriptor:td];
+        if (!pipeline || !target) return fail("render setup failed");
+        [residency addAllocation:target];
+        [residency commit];
+        [queue addResidencySet:residency];
+
+        id<MTL4ComputeCommandEncoder> fill = [cb computeCommandEncoder];
+        fill.label = @"write";
+        [fill fillBuffer:source range:NSMakeRange(0, 64) value:0x40];
+        [fill endEncoding];
+        MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];
+        pass.colorAttachments[0].texture = target;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTL4RenderCommandEncoder> draw = [cb renderCommandEncoderWithDescriptor:pass];
+        if (!draw) return fail("render encoder creation failed");
+        draw.label = @"draw";
+        MTLStages before = [mode isEqualToString:@"fragment-only"] ? MTLStageFragment : MTLStageVertex;
+        [draw barrierAfterQueueStages:MTLStageBlit beforeStages:before visibilityOptions:MTL4VisibilityOptionDevice];
+        [draw setRenderPipelineState:pipeline];
+        [draw setArgumentTable:one atStages:MTLRenderStageVertex | MTLRenderStageFragment];
+        [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [draw endEncoding];
+    } else {
+        [residency commit];
+        [queue addResidencySet:residency];
+        id<MTLFunction> function = [library newFunctionWithName:@"word"];
+        id<MTLComputePipelineState> pipeline = nil;
+        if (compiler || app) {
+            id<MTL4Compiler> c = [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+            MTL4LibraryFunctionDescriptor *fd = [MTL4LibraryFunctionDescriptor new];
+            fd.library = library;
+            fd.name = @"word";
+            MTL4ComputePipelineDescriptor *cd = [MTL4ComputePipelineDescriptor new];
+            cd.computeFunctionDescriptor = fd;
+            MTL4PipelineOptions *options = app ? [MTL4PipelineOptions new] : nil;
+            options.shaderReflection = MTL4ShaderReflectionBindingInfo;
+            cd.options = options;
+            pipeline = [c newComputePipelineStateWithDescriptor:cd compilerTaskOptions:nil error:&error];
+            if (!pipeline) return fail("compiler pipeline creation failed");
+            // fencepost compiles a copy: the app's descriptor must be as it left it.
+            if (cd.options != options || (app && options.shaderReflection != MTL4ShaderReflectionBindingInfo))
+                return fail("the app's pipeline descriptor changed");
+            if (app && (!binding_access(pipeline.reflection.bindings, 0, MTLBindingAccessReadOnly) ||
+                        !binding_access(pipeline.reflection.bindings, 1, MTLBindingAccessReadWrite)))
+                return fail("compiler reflection the app asked for is missing");
+        }
+        if (app) {
+            MTLComputePipelineReflection *reflection = nil;
+            id<MTLComputePipelineState> own = [device newComputePipelineStateWithFunction:function
+                options:MTLPipelineOptionBindingInfo reflection:&reflection error:&error];
+            if (!own || !binding_access(reflection.bindings, 0, MTLBindingAccessReadOnly) ||
+                !binding_access(reflection.bindings, 1, MTLBindingAccessReadWrite))
+                return fail("device reflection the app asked for is missing");
+            reflection = nil;
+            own = [device newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone
+                                                   reflection:&reflection error:&error];
+            if (!own || !reflection) return fail("device reflection out-parameter is missing");
+        }
+        if (!pipeline) pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) return fail("pipeline creation failed");
+        for (int pass = 0; pass < (app ? 1 : 2); pass++) {
+            id<MTL4ComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+            if (!encoder) return fail("encoder creation failed");
+            encoder.label = pass ? @"second" : @"first";
+            [encoder setComputePipelineState:pipeline];
+            [encoder setArgumentTable:pass ? two : one];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [encoder endEncoding];
+        }
+    }
+    [cb endCommandBuffer];
+    int failed = commit_and_wait(queue, cb);
+    if (!failed) printf("case %s: submitted successfully\n", mode.UTF8String);
+    return failed;
+}
 
 API_AVAILABLE(macos(26.0))
 static int run(id<MTLDevice> device, NSString *mode)
@@ -47,6 +196,8 @@ static int run(id<MTLDevice> device, NSString *mode)
     BOOL shader = color || mutate || placement || partial || [mode isEqualToString:@"disjoint"] ||
                   [mode isEqualToString:@"overlap"];
     BOOL use_fence = [mode hasPrefix:@"fence"];
+    if ([@[@"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race"] containsObject:mode])
+        return run_reflection(device, mode);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
@@ -227,7 +378,8 @@ int main(int argc, const char **argv)
     @autoreleasepool {
         NSString *mode = argc == 2 ? [NSString stringWithUTF8String:argv[1]] : nil;
         if (!mode || ![@[@"producer", @"fence", @"fence-missing", @"commits", @"commits-barrier", @"color-fragment",
-                        @"color-vertex", @"mutate", @"disjoint", @"overlap", @"placement", @"order", @"partial"]
+                        @"color-vertex", @"mutate", @"disjoint", @"overlap", @"placement", @"order", @"partial",
+                        @"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race"]
                        containsObject:mode])
             return fail("expected a named Metal 4 race case");
         if (@available(macOS 26.0, *)) {

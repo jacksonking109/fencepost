@@ -122,8 +122,28 @@ logical command buffers. Encoders appear in submission and encoding order with e
 Race analysis tracks render attachments, copies, fills, mipmap generation, and the argument-table bindings
 that each draw or dispatch uses. For tracked buffers, an address inside a buffer covers the remaining range
 when Metal supplies no length. Texture views are checked against their underlying storage. Unresolved
-addresses and resource IDs are counted in the summary. Enable `FENCEPOST_BIND_MAYWRITE=1` for possible-race
-reports from shader bindings with unknown write access.
+addresses and resource IDs are counted in the summary.
+
+Argument-table slots take their read/write access from the bound pipeline's binding reflection, per stage. A
+slot that a stage's shader does not declare or use has no access in that stage, so a table bound at
+Vertex|Fragment counts a buffer only in the stage that reads it. `const` buffers and read textures are reads,
+write-only textures are writes, and read-write bindings are definite writes. Metal reflects every non-`const`
+`device` pointer as read-write, even when the shader only reads it; `FENCEPOST_MTL4_RW=possible` reports those
+conflicts as possible races instead. fencepost requests the reflection itself when pipelines are built:
+- through the device (`newComputePipelineStateWith…`, `newRenderPipelineStateWith…`, tile and mesh variants,
+  synchronous and asynchronous), once the process has made a Metal 4 queue, command buffer, argument table or
+  compiler, so programs that use only Metal 3 build their pipelines unchanged. It adds
+  `MTLPipelineOptionBindingInfo`, except with `MTLPipelineOptionFailOnBinaryArchiveMiss`;
+- through `MTL4Compiler` (compute, render and specialization, with and without dynamic linking, synchronous and
+  `MTL4CompilerTask`), from a copy of the app's descriptor with `shaderReflection` including `BindingInfo`.
+
+What the app can see: a Metal 4 compiler pipeline has a non-nil `reflection` even if the app asked for none, and
+a pipeline data-set serializer records the copy's reflection option. A device-path app that asked for
+reflection without binding information also gets the bindings. A synchronous build that fails with the
+reflection request is retried as the app asked. Pipelines fencepost did not see built (binary archives, data
+sets, device pipelines made before the first Metal 4 object) use their own reflection when Metal kept one, and
+are otherwise counted as "access unknown" in the summary. Their slots fall back to reads, or to possible writes
+with `FENCEPOST_BIND_MAYWRITE=1`.
 
 A Metal 4 queue supplies no implicit ordering between encoders. Queue barriers order earlier work only for
 the specified producer and consumer stages, across command buffers and commits on the queue. A fence update
@@ -293,7 +313,8 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_POSSIBLE` | 1 | 0 hides "possible" reports |
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
 | `FENCEPOST_CHAIN` | 0 | list the longest ordered chain of this frame (counted from 1) |
-| `FENCEPOST_BIND_MAYWRITE` | 0 | 1 counts unknown writes as possible in Metal 3 compute bindings and Metal 4 argument tables |
+| `FENCEPOST_BIND_MAYWRITE` | 0 | 1 counts unknown writes as possible in Metal 3 compute bindings and in Metal 4 argument tables bound with an access-unknown pipeline |
+| `FENCEPOST_MTL4_RW` | write | `possible` reports conflicts through read-write Metal 4 bindings (any non-`const` `device` pointer) as possible races |
 | `FENCEPOST_TRACE` | unset | stream to this JSON file (`%p` expands to the process id), or use this literal prefix for ring dumps |
 | `FENCEPOST_TRACE_FRAMES` | all | capture frames `a:b`, inclusive and counted from 1 |
 | `FENCEPOST_TRACE_MB` | 512 | stop streaming when the file reaches this size in MiB |

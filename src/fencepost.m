@@ -23,6 +23,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #include <Block.h>
 #include <dispatch/dispatch.h>
@@ -143,6 +144,9 @@ typedef struct fp_node {
     fp4_prefixes *mtl4_prefixes;
     id mtl4_tables[FP4_TABLES];
     uint64_t mtl4_versions[FP4_TABLES];
+    id mtl4_pipeline;               /* FP4PipelineTable of the bound pipeline, nil = access unknown */
+    void *mtl4_pipeline_object;     /* the bound pipeline itself, compared only */
+    uint32_t mtl4_pipeline_serial;
     fp_bits anc[2];                 /* what is ordered before this node's vertex / fragment work */
 } fp_node;
 
@@ -198,13 +202,14 @@ static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
 static long g_st[ST_COUNT];
 static long g_mtl4_ml_encoders, g_mtl4_gpu_errors;
 static long g_mtl4_residency_only, g_mtl4_accel_builds, g_mtl4_partial_hits;
-static atomic_long g_fp4_address_misses, g_fp4_id_misses;
+static atomic_long g_fp4_address_misses, g_fp4_id_misses, g_fp4_unknown_pipelines;
+static atomic_int g_fp4_active;   /* the process made a Metal 4 object: request pipeline reflection */
 #ifdef FENCEPOST_TEST_HOOKS
 static unsigned g_mtl4_test_error_commit;
 #endif
 static FILE *g_out;
 static long g_max_reports = 200, g_printed;
-static int g_show_possible = 1, g_summary_secs = 10, g_started, g_bind_maywrite;
+static int g_show_possible = 1, g_summary_secs = 10, g_started, g_bind_maywrite, g_mtl4_rw_possible;
 static time_t g_last_summary;
 static long g_last_summary_hits = -1, g_last_summary_frames;
 
@@ -270,7 +275,9 @@ static fp_node *node_new(int kind)   /* lock held */
     fp_node *n = &g_pool[uid % FP_POOL];
     if (n->mtl4)
         for (int i = 0; i < FP4_TABLES; i++) [n->mtl4_tables[i] release];
+    if (n->mtl4) [n->mtl4_pipeline release];
     memset(n->mtl4_tables, 0, sizeof n->mtl4_tables);
+    n->mtl4_pipeline = nil; n->mtl4_pipeline_object = NULL; n->mtl4_pipeline_serial = 0;
     memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
     n->mtl4_epoch = 1; n->mtl4_work = 0;
     n->mtl4_previous = 0; n->mtl4_nsync = 0; n->mtl4_nwork_epochs = 0;
@@ -2314,6 +2321,9 @@ static void summary(int final)
     long id_misses = atomic_load_explicit(&g_fp4_id_misses, memory_order_relaxed);
     if (address_misses || id_misses)
         fp_log("fencepost:   Metal 4 unknown bindings: %ld GPU addresses, %ld resource IDs\n", address_misses, id_misses);
+    long unknown_pipelines = atomic_load_explicit(&g_fp4_unknown_pipelines, memory_order_relaxed);
+    if (unknown_pipelines)
+        fp_log("fencepost:   Metal 4 pipelines without binding reflection (access unknown): %ld\n", unknown_pipelines);
     if (g_mtl4_residency_only)
         fp_log("fencepost:   Metal 4 encoders with residency sets and no visible accesses: %ld\n", g_mtl4_residency_only);
     long accel_builds = __atomic_load_n(&g_mtl4_accel_builds, __ATOMIC_RELAXED);
@@ -3244,7 +3254,7 @@ static int fp4_record_access(fp_node *n, fp4_resource r, uint64_t off, uint64_t 
 
 typedef struct {
     uint64_t value, generation, sampled_uid;
-    uint32_t sampled_epoch;
+    uint32_t sampled_epoch, sampled_pipeline;
     uint16_t sampled_stages;
     int by_id;
     fp4_resource resource;
@@ -3345,6 +3355,156 @@ static fp4_slot_cache *fp4_resolve_slot(FP4ArgumentState *state, fp4_arg_slot *s
     return &slot->cache[0];
 }
 
+/* Per-slot shader access of one pipeline, from binding reflection. A stage the
+ * reflection describes lists every slot it declares and uses; any other slot has no
+ * access in that stage. Stages it does not describe fall back to the binding policy. */
+@interface FP4PipelineTable : NSObject {
+@public
+    uint16_t stages;
+    uint16_t buffers[FP4_TABLES], textures[FP4_TABLES];
+    uint8_t *access[FP4_TABLES];    /* FP_RD | FP_WR per slot: buffers, then textures */
+}
+@end
+
+@implementation FP4PipelineTable
+- (void)dealloc
+{
+    for (int i = 0; i < FP4_TABLES; i++) free(access[i]);
+    [super dealloc];
+}
+@end
+
+static char g_fp4_pipeline_key;
+static FP4PipelineTable *g_fp4_unknown_table;   /* marks a pipeline whose access is unknown */
+#define FP4_MAX_SLOT 4096
+
+API_AVAILABLE(macos(13.0))
+static int fp4_binding_space(id<MTLBinding> binding)   /* 0 buffer index, 1 texture index, -1 neither */
+{
+    switch (binding.type) {
+    case MTLBindingTypeBuffer: case MTLBindingTypeVisibleFunctionTable: case MTLBindingTypeIntersectionFunctionTable:
+    case MTLBindingTypePrimitiveAccelerationStructure: case MTLBindingTypeInstanceAccelerationStructure:
+        return 0;
+    case MTLBindingTypeTexture: return 1;
+    default: return -1;
+    }
+}
+
+API_AVAILABLE(macos(13.0))
+static void fp4_table_stage(FP4PipelineTable *table, int stage, NSArray<id<MTLBinding>> *bindings)
+{
+    NSUInteger counts[2] = { 0, 0 };
+    for (id<MTLBinding> binding in bindings) {
+        int space = fp4_binding_space(binding);
+        if (space >= 0 && binding.used && binding.index < FP4_MAX_SLOT)
+            counts[space] = MAX(counts[space], binding.index + 1);
+    }
+    uint8_t *access = counts[0] + counts[1] ? calloc(counts[0] + counts[1], 1) : NULL;
+    if (counts[0] + counts[1] && !access) return;   /* undescribed: the stage keeps the fallback */
+    for (id<MTLBinding> binding in bindings) {
+        int space = fp4_binding_space(binding);
+        if (space < 0 || !binding.used || binding.index >= FP4_MAX_SLOT) continue;
+        MTLBindingAccess mode = binding.access;
+        access[binding.index + (space ? counts[0] : 0)] |= mode == MTLBindingAccessReadOnly ? FP_RD
+            : mode == MTLBindingAccessWriteOnly ? FP_WR : (FP_RD | FP_WR);
+    }
+    table->stages |= FP4_STAGE(stage);
+    table->buffers[stage] = (uint16_t)counts[0];
+    table->textures[stage] = (uint16_t)counts[1];
+    table->access[stage] = access;
+}
+
+/* nil when reflection carries no binding information. */
+static FP4PipelineTable *fp4_table_new(id reflection)
+{
+    if (!reflection) return nil;
+    FP4PipelineTable *table = [[FP4PipelineTable alloc] init];
+    if (@available(macOS 13.0, *)) {
+        if ([reflection isKindOfClass:[MTLComputePipelineReflection class]]) {
+            fp4_table_stage(table, FP4_DISPATCH, [(MTLComputePipelineReflection *)reflection bindings]);
+        } else if ([reflection isKindOfClass:[MTLRenderPipelineReflection class]]) {
+            MTLRenderPipelineReflection *render = reflection;
+            fp4_table_stage(table, FP4_VERTEX, render.vertexBindings);
+            fp4_table_stage(table, FP4_FRAGMENT, render.fragmentBindings);
+            fp4_table_stage(table, FP4_TILE, render.tileBindings);
+            fp4_table_stage(table, FP4_OBJECT, render.objectBindings);
+            fp4_table_stage(table, FP4_MESH, render.meshBindings);
+        }
+    }
+    if (!table->stages) { [table release]; return nil; }
+    return table;
+}
+
+static void fp4_attach_table(id pipeline, FP4PipelineTable *table)
+{
+    if (pipeline && table)
+        objc_setAssociatedObject(pipeline, &g_fp4_pipeline_key, table, OBJC_ASSOCIATION_RETAIN);
+}
+
+static void fp4_attach_reflection(id pipeline, id reflection)
+{
+    if (!pipeline || !reflection) return;
+    FP4PipelineTable *table = fp4_table_new(reflection);
+    fp4_attach_table(pipeline, table);
+    [table release];
+}
+
+/* A pipeline fencepost did not see built (binary archives, data sets, pipelines made
+ * before the first Metal 4 object) is looked up once: its own reflection if Metal kept
+ * one, otherwise it is marked access unknown. */
+static FP4PipelineTable *fp4_pipeline_table(id pipeline)
+{
+    if (!pipeline) return nil;
+    FP4PipelineTable *table = objc_getAssociatedObject(pipeline, &g_fp4_pipeline_key);
+    if (!table) {
+        id reflection = nil;
+        if (@available(macOS 26.0, *))
+            if ([pipeline respondsToSelector:@selector(reflection)]) reflection = [pipeline reflection];
+        table = [fp4_table_new(reflection) autorelease];
+        if (!table) {
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{ g_fp4_unknown_table = [[FP4PipelineTable alloc] init]; });
+            table = g_fp4_unknown_table;
+            atomic_fetch_add_explicit(&g_fp4_unknown_pipelines, 1, memory_order_relaxed);
+        }
+        fp4_attach_table(pipeline, table);
+    }
+    return table->stages ? table : nil;
+}
+
+static void fp4_bind_pipeline(id encoder, id pipeline)
+{
+    fp_node *n = cur_node(encoder);
+    if (!n || !n->mtl4 || n->mtl4_pipeline_object == (void *)pipeline) return;
+    FP4PipelineTable *table = fp4_pipeline_table(pipeline);
+    n->mtl4_pipeline_object = (void *)pipeline;
+    if (table == n->mtl4_pipeline) return;
+    [n->mtl4_pipeline release];
+    n->mtl4_pipeline = [table retain];
+    n->mtl4_pipeline_serial++;
+    memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);   /* resample every bound table */
+}
+
+/* The access a draw or dispatch makes through slot i of a table bound at stage. */
+static int fp4_slot_access(const fp_node *n, const FP4ArgumentState *state, NSUInteger i, int stage,
+                           const fp4_resource *r)
+{
+    FP4PipelineTable *table = n->mtl4_pipeline;
+    int texture = i >= state->buffers;
+    if (!table || !(table->stages & FP4_STAGE(stage))) {
+        int rw = FP_RD;
+        if (g_bind_maywrite && (!texture || r->shader_write)) rw |= FP_MAYBE;
+        return rw;
+    }
+    NSUInteger index = texture ? i - state->buffers : i;
+    NSUInteger count = texture ? table->textures[stage] : table->buffers[stage];
+    if (index >= count) return 0;
+    int access = table->access[stage][index + (texture ? table->buffers[stage] : 0)];
+    /* A non-const device pointer reflects as read-write even when the shader only reads it. */
+    if (access == (FP_RD | FP_WR) && g_mtl4_rw_possible) return FP_RD | FP_MAYBE;
+    return access;
+}
+
 static void fp4_sample_table(fp_node *n, FP4ArgumentState *state, unsigned stages)
 {
     uint64_t version = atomic_load_explicit(&state->version, memory_order_acquire);
@@ -3364,19 +3524,22 @@ static void fp4_sample_table(fp_node *n, FP4ArgumentState *state, unsigned stage
         int by_id = atomic_load_explicit(&slot->by_id, memory_order_relaxed);
         fp4_slot_cache *cache = fp4_resolve_slot(state, slot, value, by_id, generation);
         if (!cache->resource.store) continue;
-        if (cache->sampled_uid != n->uid || cache->sampled_epoch != n->mtl4_epoch) {
+        if (cache->sampled_uid != n->uid || cache->sampled_epoch != n->mtl4_epoch ||
+            cache->sampled_pipeline != n->mtl4_pipeline_serial) {
             cache->sampled_uid = n->uid;
             cache->sampled_epoch = n->mtl4_epoch;
+            cache->sampled_pipeline = n->mtl4_pipeline_serial;
             cache->sampled_stages = 0;
         }
         unsigned pending = changed & ~cache->sampled_stages;
         if (!pending) continue;
         fp4_resource r = cache->resource;
-        int rw = FP_RD;
-        if (g_bind_maywrite && (i < state->buffers || r.shader_write)) rw |= FP_MAYBE;
         uint64_t off = by_id ? 0 : value - r.address;
-        for (unsigned bits = pending; bits; bits &= bits - 1)
-            fp4_record_access(n, r, off, r.texture ? r.levels : UINT64_MAX, 0, r.slices, rw, __builtin_ctz(bits), VIA_BIND);
+        for (unsigned bits = pending; bits; bits &= bits - 1) {
+            int stage = __builtin_ctz(bits);
+            int rw = fp4_slot_access(n, state, i, stage, &r);
+            if (rw) fp4_record_access(n, r, off, r.texture ? r.levels : UINT64_MAX, 0, r.slices, rw, stage, VIA_BIND);
+        }
         cache->sampled_stages |= pending;
     }
     os_unfair_lock_unlock(&state->lock);
@@ -3533,6 +3696,11 @@ enum {
     H_4_DISPATCH, H_4_DISPATCH_GROUPS, H_4_DISPATCH_IND, H_4_DISPATCH_GROUPS_IND,
     H_4_RES_ADD, H_4_RES_ADDS, H_4_RES_REMOVE, H_4_RES_REMOVES, H_4_RES_USE, H_4_RES_USES,
     H_4_CONSUMER_BARRIER, H_4_PRODUCER_BARRIER, H_4_INTRA_BARRIER, H_4_FENCE_UPDATE, H_4_FENCE_WAIT,
+    H_4_SET_COMPUTE_PIPELINE, H_4_SET_RENDER_PIPELINE, H_4_NEW_COMPILER,
+    H_P_CFN, H_P_CFN_R, H_P_CFN_A, H_P_CFN_AR, H_P_CDESC_R, H_P_CDESC_AR,
+    H_P_RDESC, H_P_RDESC_R, H_P_RDESC_A, H_P_RDESC_AR, H_P_TILE_R, H_P_TILE_AR, H_P_MESH_R, H_P_MESH_AR,
+    H_C4_COMPUTE, H_C4_COMPUTE_LINK, H_C4_RENDER, H_C4_RENDER_LINK, H_C4_SPECIALIZE,
+    H_C4_COMPUTE_A, H_C4_COMPUTE_LINK_A, H_C4_RENDER_A, H_C4_RENDER_LINK_A, H_C4_SPECIALIZE_A,
     H_COUNT
 };
 
@@ -4245,6 +4413,7 @@ static id h_cb_benc_d(id self, SEL _cmd, id d)
 /* Metal 4 buffers are recorded independently of the queue that submits them. */
 static void on_mtl4_queue(id queue)
 {
+    atomic_store_explicit(&g_fp4_active, 1, memory_order_relaxed);
     if (!queue) return;
     /* A Metal 4 buffer has no queue during encoding. The Metal 3 capture
      * path starts on the intended queue before a command buffer is opened. */
@@ -4278,6 +4447,7 @@ static id h_mtl4_dev_q_desc(id self, SEL _cmd, id desc, NSError **error)
 
 static id h_mtl4_dev_cb(id self, SEL _cmd)
 {
+    atomic_store_explicit(&g_fp4_active, 1, memory_order_relaxed);
     ENTER; id cb = ORIG(H_4_DEV_CB, id (*)(id, SEL))(self, _cmd); LEAVE;
     if (OUTER && cb) hook_mtl4_cb(object_getClass(cb));
     return cb;
@@ -4370,6 +4540,7 @@ static id h_mtl4_ml(id self, SEL _cmd)
 API_AVAILABLE(macos(26.0))
 static id h_mtl4_argument_table(id self, SEL _cmd, MTL4ArgumentTableDescriptor *desc, NSError **error)
 {
+    atomic_store_explicit(&g_fp4_active, 1, memory_order_relaxed);
     ENTER;
     id<MTL4ArgumentTable> table = ORIG(H_4_ARGUMENT_TABLE, id (*)(id, SEL, id, NSError **))(self, _cmd, desc, error);
     LEAVE;
@@ -4394,6 +4565,230 @@ static id h_mtl4_argument_table(id self, SEL _cmd, MTL4ArgumentTableDescriptor *
         [state release];
     }
     return table;
+}
+
+/* Pipeline creation. fencepost asks Metal for binding reflection itself so that argument-table
+ * slots get the read/write access the shader declares. Device-built pipelines return it only
+ * through the reflection out-parameter or handler (pipeline.reflection stays nil); Metal 4
+ * compiler pipelines keep it in pipeline.reflection. Device-path requests start only after the
+ * process makes a Metal 4 object, so programs that use only Metal 3 build pipelines unchanged. */
+
+typedef id (*fp4_reflect_imp)(id, SEL, id, NSUInteger, id *, NSError **);
+typedef void (^fp4_pipeline_handler)(id, NSError *);
+typedef void (^fp4_reflection_handler)(id, id, NSError *);
+
+static int fp4_reflect_device(NSUInteger options)
+{
+    return atomic_load_explicit(&g_fp4_active, memory_order_relaxed) &&
+           !(options & MTLPipelineOptionFailOnBinaryArchiveMiss);   /* an archive may hold no reflection */
+}
+
+static id fp4_device_sync(int h, id self, SEL cmd, id desc, NSUInteger options, id *reflection, NSError **error)
+{
+    ENTER;
+    fp4_reflect_imp orig = (fp4_reflect_imp)orig_imp(h, self);
+    int want = OUTER && fp4_reflect_device(options);
+    id local = nil, *out = reflection ? reflection : want ? &local : NULL;
+    id pipeline = orig(self, cmd, desc, want ? options | MTLPipelineOptionBindingInfo : options, out, error);
+    if (want && pipeline) fp4_attach_reflection(pipeline, *out);
+    else if (want) pipeline = orig(self, cmd, desc, options, reflection, error);   /* fail only as the app's call would */
+    LEAVE;
+    return pipeline;
+}
+
+static id fp4_device_plain(int h, id self, SEL cmd, SEL with_reflection, id desc, NSError **error)
+{
+    ENTER;
+    id pipeline = nil;
+    if (OUTER && fp4_reflect_device(0)) {
+        id reflection = nil;
+        pipeline = ((fp4_reflect_imp)objc_msgSend)(self, with_reflection, desc, MTLPipelineOptionBindingInfo,
+                                                   &reflection, error);
+        fp4_attach_reflection(pipeline, reflection);
+    }
+    if (!pipeline) pipeline = ((id (*)(id, SEL, id, NSError **))orig_imp(h, self))(self, cmd, desc, error);
+    LEAVE;
+    return pipeline;
+}
+
+static void fp4_device_async(int h, id self, SEL cmd, id desc, NSUInteger options, fp4_reflection_handler handler)
+{
+    ENTER;
+    void (*orig)(id, SEL, id, NSUInteger, fp4_reflection_handler) = (void *)orig_imp(h, self);
+    if (OUTER && handler && fp4_reflect_device(options)) {
+        orig(self, cmd, desc, options | MTLPipelineOptionBindingInfo, ^(id pipeline, id reflection, NSError *error) {
+            fp4_attach_reflection(pipeline, reflection);
+            handler(pipeline, reflection, error);
+        });
+    } else orig(self, cmd, desc, options, handler);
+    LEAVE;
+}
+
+static void fp4_device_async_plain(int h, id self, SEL cmd, SEL with_reflection, id desc, fp4_pipeline_handler handler)
+{
+    ENTER;
+    if (OUTER && handler && fp4_reflect_device(0)) {
+        ((void (*)(id, SEL, id, NSUInteger, fp4_reflection_handler))objc_msgSend)(self, with_reflection, desc,
+            MTLPipelineOptionBindingInfo, ^(id pipeline, id reflection, NSError *error) {
+                fp4_attach_reflection(pipeline, reflection);
+                handler(pipeline, error);
+            });
+    } else ((void (*)(id, SEL, id, fp4_pipeline_handler))orig_imp(h, self))(self, cmd, desc, handler);
+    LEAVE;
+}
+
+#define FP4_DEVICE_SYNC(fn, hook_id) \
+    static id fn(id self, SEL _cmd, id desc, NSUInteger options, id *reflection, NSError **error) \
+    { return fp4_device_sync(hook_id, self, _cmd, desc, options, reflection, error); }
+#define FP4_DEVICE_ASYNC(fn, hook_id) \
+    static void fn(id self, SEL _cmd, id desc, NSUInteger options, fp4_reflection_handler handler) \
+    { fp4_device_async(hook_id, self, _cmd, desc, options, handler); }
+FP4_DEVICE_SYNC(h_p_cfn_r, H_P_CFN_R)
+FP4_DEVICE_SYNC(h_p_cdesc_r, H_P_CDESC_R)
+FP4_DEVICE_SYNC(h_p_rdesc_r, H_P_RDESC_R)
+FP4_DEVICE_SYNC(h_p_tile_r, H_P_TILE_R)
+FP4_DEVICE_SYNC(h_p_mesh_r, H_P_MESH_R)
+FP4_DEVICE_ASYNC(h_p_cfn_ar, H_P_CFN_AR)
+FP4_DEVICE_ASYNC(h_p_cdesc_ar, H_P_CDESC_AR)
+FP4_DEVICE_ASYNC(h_p_rdesc_ar, H_P_RDESC_AR)
+FP4_DEVICE_ASYNC(h_p_tile_ar, H_P_TILE_AR)
+FP4_DEVICE_ASYNC(h_p_mesh_ar, H_P_MESH_AR)
+#undef FP4_DEVICE_SYNC
+#undef FP4_DEVICE_ASYNC
+
+static id h_p_cfn(id self, SEL _cmd, id function, NSError **error)
+{
+    return fp4_device_plain(H_P_CFN, self, _cmd, @selector(newComputePipelineStateWithFunction:options:reflection:error:),
+                            function, error);
+}
+static id h_p_rdesc(id self, SEL _cmd, id desc, NSError **error)
+{
+    return fp4_device_plain(H_P_RDESC, self, _cmd, @selector(newRenderPipelineStateWithDescriptor:options:reflection:error:),
+                            desc, error);
+}
+static void h_p_cfn_a(id self, SEL _cmd, id function, fp4_pipeline_handler handler)
+{
+    fp4_device_async_plain(H_P_CFN_A, self, _cmd, @selector(newComputePipelineStateWithFunction:options:completionHandler:),
+                           function, handler);
+}
+static void h_p_rdesc_a(id self, SEL _cmd, id desc, fp4_pipeline_handler handler)
+{
+    fp4_device_async_plain(H_P_RDESC_A, self, _cmd, @selector(newRenderPipelineStateWithDescriptor:options:completionHandler:),
+                           desc, handler);
+}
+
+/* A copy of the app's descriptor that also asks for binding reflection (+1). The app's
+ * descriptor and its options object are never changed. */
+static id fp4_reflect_descriptor(id desc)
+{
+    if (@available(macOS 26.0, *)) {
+        if (![desc isKindOfClass:[MTL4PipelineDescriptor class]]) return [desc retain];
+        MTL4PipelineDescriptor *app = desc;
+        MTL4PipelineOptions *options = app.options;
+        if (options.shaderReflection & MTL4ShaderReflectionBindingInfo) return [desc retain];
+        MTL4PipelineDescriptor *copy = [app copy];
+        MTL4PipelineOptions *mine = options ? [options copy] : [[MTL4PipelineOptions alloc] init];
+        mine.shaderReflection |= MTL4ShaderReflectionBindingInfo;
+        copy.options = mine;
+        [mine release];
+        return copy;
+    }
+    return [desc retain];
+}
+
+/* A specialized pipeline without its own reflection keeps the bindings of the one it specializes. */
+static void fp4_compiled(id pipeline, id base)
+{
+    if (!pipeline) return;
+    id reflection = nil;
+    if (@available(macOS 26.0, *))
+        if ([pipeline respondsToSelector:@selector(reflection)]) reflection = [pipeline reflection];
+    FP4PipelineTable *table = fp4_table_new(reflection);
+    if (!table && base) table = [objc_getAssociatedObject(base, &g_fp4_pipeline_key) retain];
+    fp4_attach_table(pipeline, table);
+    [table release];
+}
+
+static id fp4_compile(int h, id self, SEL cmd, id desc, id x, id y, NSError **error, int four, int specialize)
+{
+    ENTER;
+    IMP imp = orig_imp(h, self);
+#define FP4_CALL(d) (four ? ((id (*)(id, SEL, id, id, id, NSError **))imp)(self, cmd, d, x, y, error) \
+                          : ((id (*)(id, SEL, id, id, NSError **))imp)(self, cmd, d, x, error))
+    id pipeline;
+    if (OUTER) {
+        id mine = fp4_reflect_descriptor(desc);
+        pipeline = FP4_CALL(mine);
+        if (!pipeline && mine != desc) pipeline = FP4_CALL(desc);
+        [mine release];
+        fp4_compiled(pipeline, specialize ? x : nil);
+    } else pipeline = FP4_CALL(desc);
+#undef FP4_CALL
+    LEAVE;
+    return pipeline;
+}
+
+static id fp4_compile_async(int h, id self, SEL cmd, id desc, id x, id y, fp4_pipeline_handler handler,
+                            int four, int specialize)
+{
+    ENTER;
+    IMP imp = orig_imp(h, self);
+#define FP4_CALL(d, b) (four ? ((id (*)(id, SEL, id, id, id, fp4_pipeline_handler))imp)(self, cmd, d, x, y, b) \
+                             : ((id (*)(id, SEL, id, id, fp4_pipeline_handler))imp)(self, cmd, d, x, b))
+    id task;
+    if (OUTER && handler) {
+        id mine = fp4_reflect_descriptor(desc), base = specialize ? x : nil;
+        task = FP4_CALL(mine, ^(id pipeline, NSError *error) {
+            fp4_compiled(pipeline, base);
+            handler(pipeline, error);
+        });
+        [mine release];
+    } else task = FP4_CALL(desc, handler);
+#undef FP4_CALL
+    LEAVE;
+    return task;
+}
+
+static id h_c4_compute(id self, SEL _cmd, id desc, id task, NSError **error)
+{ return fp4_compile(H_C4_COMPUTE, self, _cmd, desc, task, nil, error, 0, 0); }
+static id h_c4_compute_link(id self, SEL _cmd, id desc, id link, id task, NSError **error)
+{ return fp4_compile(H_C4_COMPUTE_LINK, self, _cmd, desc, link, task, error, 1, 0); }
+static id h_c4_render(id self, SEL _cmd, id desc, id task, NSError **error)
+{ return fp4_compile(H_C4_RENDER, self, _cmd, desc, task, nil, error, 0, 0); }
+static id h_c4_render_link(id self, SEL _cmd, id desc, id link, id task, NSError **error)
+{ return fp4_compile(H_C4_RENDER_LINK, self, _cmd, desc, link, task, error, 1, 0); }
+static id h_c4_specialize(id self, SEL _cmd, id desc, id pipeline, NSError **error)
+{ return fp4_compile(H_C4_SPECIALIZE, self, _cmd, desc, pipeline, nil, error, 0, 1); }
+static id h_c4_compute_a(id self, SEL _cmd, id desc, id task, fp4_pipeline_handler handler)
+{ return fp4_compile_async(H_C4_COMPUTE_A, self, _cmd, desc, task, nil, handler, 0, 0); }
+static id h_c4_compute_link_a(id self, SEL _cmd, id desc, id link, id task, fp4_pipeline_handler handler)
+{ return fp4_compile_async(H_C4_COMPUTE_LINK_A, self, _cmd, desc, link, task, handler, 1, 0); }
+static id h_c4_render_a(id self, SEL _cmd, id desc, id task, fp4_pipeline_handler handler)
+{ return fp4_compile_async(H_C4_RENDER_A, self, _cmd, desc, task, nil, handler, 0, 0); }
+static id h_c4_render_link_a(id self, SEL _cmd, id desc, id link, id task, fp4_pipeline_handler handler)
+{ return fp4_compile_async(H_C4_RENDER_LINK_A, self, _cmd, desc, link, task, handler, 1, 0); }
+static id h_c4_specialize_a(id self, SEL _cmd, id desc, id pipeline, fp4_pipeline_handler handler)
+{ return fp4_compile_async(H_C4_SPECIALIZE_A, self, _cmd, desc, pipeline, nil, handler, 0, 1); }
+
+static void hook_mtl4_compiler(Class cls);
+static id h_mtl4_new_compiler(id self, SEL _cmd, id desc, NSError **error)
+{
+    atomic_store_explicit(&g_fp4_active, 1, memory_order_relaxed);
+    ENTER; id compiler = ORIG(H_4_NEW_COMPILER, id (*)(id, SEL, id, NSError **))(self, _cmd, desc, error); LEAVE;
+    if (OUTER && compiler) hook_mtl4_compiler(object_getClass(compiler));
+    return compiler;
+}
+
+static void h_mtl4_set_compute_pipeline(id self, SEL _cmd, id pipeline)
+{
+    ENTER; ORIG(H_4_SET_COMPUTE_PIPELINE, void (*)(id, SEL, id))(self, _cmd, pipeline); LEAVE;
+    if (OUTER) fp4_bind_pipeline(self, pipeline);
+}
+
+static void h_mtl4_set_render_pipeline(id self, SEL _cmd, id pipeline)
+{
+    ENTER; ORIG(H_4_SET_RENDER_PIPELINE, void (*)(id, SEL, id))(self, _cmd, pipeline); LEAVE;
+    if (OUTER) fp4_bind_pipeline(self, pipeline);
 }
 
 static void h_mtl4_address(id self, SEL _cmd, uint64_t address, NSUInteger index)
@@ -5261,6 +5656,9 @@ static void h_end(id self, SEL _cmd)
             [n->mtl4_tables[i] release];
             n->mtl4_tables[i] = nil;
         }
+        [n->mtl4_pipeline release];
+        n->mtl4_pipeline = nil;
+        n->mtl4_pipeline_object = NULL;
     }
     pthread_mutex_lock(&g_lock);
     if (n->mtl4) snprintf(n->label, sizeof n->label, "MTL4 %s", l.length ? l.UTF8String : kind_name[n->kind]);
@@ -5623,6 +6021,40 @@ static const hook_def mtl4_device_hooks[] API_AVAILABLE(macos(26.0)) = {
     HD(H_4_NEW_IOSURFACE, "newTextureWithDescriptor:iosurface:plane:", h_mtl4_iosurface),
     HD(H_4_SHARED_TEXTURE, "newSharedTextureWithDescriptor:", h_mtl4_shared_texture),
     HD(H_4_SHARED_HANDLE, "newSharedTextureWithHandle:", h_mtl4_shared_handle),
+    HD(H_4_NEW_COMPILER, "newCompilerWithDescriptor:error:", h_mtl4_new_compiler),
+    HD(H_P_CFN, "newComputePipelineStateWithFunction:error:", h_p_cfn),
+    HD(H_P_CFN_R, "newComputePipelineStateWithFunction:options:reflection:error:", h_p_cfn_r),
+    HD(H_P_CFN_A, "newComputePipelineStateWithFunction:completionHandler:", h_p_cfn_a),
+    HD(H_P_CFN_AR, "newComputePipelineStateWithFunction:options:completionHandler:", h_p_cfn_ar),
+    HD(H_P_CDESC_R, "newComputePipelineStateWithDescriptor:options:reflection:error:", h_p_cdesc_r),
+    HD(H_P_CDESC_AR, "newComputePipelineStateWithDescriptor:options:completionHandler:", h_p_cdesc_ar),
+    HD(H_P_RDESC, "newRenderPipelineStateWithDescriptor:error:", h_p_rdesc),
+    HD(H_P_RDESC_R, "newRenderPipelineStateWithDescriptor:options:reflection:error:", h_p_rdesc_r),
+    HD(H_P_RDESC_A, "newRenderPipelineStateWithDescriptor:completionHandler:", h_p_rdesc_a),
+    HD(H_P_RDESC_AR, "newRenderPipelineStateWithDescriptor:options:completionHandler:", h_p_rdesc_ar),
+    HD(H_P_TILE_R, "newRenderPipelineStateWithTileDescriptor:options:reflection:error:", h_p_tile_r),
+    HD(H_P_TILE_AR, "newRenderPipelineStateWithTileDescriptor:options:completionHandler:", h_p_tile_ar),
+    HD(H_P_MESH_R, "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:", h_p_mesh_r),
+    HD(H_P_MESH_AR, "newRenderPipelineStateWithMeshDescriptor:options:completionHandler:", h_p_mesh_ar),
+};
+static const hook_def mtl4_compiler_hooks[] = {
+    HD(H_C4_COMPUTE, "newComputePipelineStateWithDescriptor:compilerTaskOptions:error:", h_c4_compute),
+    HD(H_C4_COMPUTE_LINK, "newComputePipelineStateWithDescriptor:dynamicLinkingDescriptor:compilerTaskOptions:error:",
+       h_c4_compute_link),
+    HD(H_C4_RENDER, "newRenderPipelineStateWithDescriptor:compilerTaskOptions:error:", h_c4_render),
+    HD(H_C4_RENDER_LINK, "newRenderPipelineStateWithDescriptor:dynamicLinkingDescriptor:compilerTaskOptions:error:",
+       h_c4_render_link),
+    HD(H_C4_SPECIALIZE, "newRenderPipelineStateBySpecializationWithDescriptor:pipeline:error:", h_c4_specialize),
+    HD(H_C4_COMPUTE_A, "newComputePipelineStateWithDescriptor:compilerTaskOptions:completionHandler:", h_c4_compute_a),
+    HD(H_C4_COMPUTE_LINK_A,
+       "newComputePipelineStateWithDescriptor:dynamicLinkingDescriptor:compilerTaskOptions:completionHandler:",
+       h_c4_compute_link_a),
+    HD(H_C4_RENDER_A, "newRenderPipelineStateWithDescriptor:compilerTaskOptions:completionHandler:", h_c4_render_a),
+    HD(H_C4_RENDER_LINK_A,
+       "newRenderPipelineStateWithDescriptor:dynamicLinkingDescriptor:compilerTaskOptions:completionHandler:",
+       h_c4_render_link_a),
+    HD(H_C4_SPECIALIZE_A, "newRenderPipelineStateBySpecializationWithDescriptor:pipeline:completionHandler:",
+       h_c4_specialize_a),
 };
 static const hook_def mtl4_heap_hooks[] = {
     HD(H_4_NEW_BUFFER, "newBufferWithLength:options:", h_mtl4_new_buffer),
@@ -5667,6 +6099,7 @@ static const hook_def mtl4_render_hooks[] = {
     HD(H_R_DSA, "setDepthStoreAction:", h_r_dsa),
     HD(H_R_SSA, "setStencilStoreAction:", h_r_ssa),
     HD(H_4_BIND_RENDER, "setArgumentTable:atStages:", h_mtl4_bind_render),
+    HD(H_4_SET_RENDER_PIPELINE, "setRenderPipelineState:", h_mtl4_set_render_pipeline),
     HD(H_4_DRAW, "drawPrimitives:vertexStart:vertexCount:", h_mtl4_draw),
     HD(H_4_DRAW_I, "drawPrimitives:vertexStart:vertexCount:instanceCount:", h_mtl4_draw_i),
     HD(H_4_DRAW_B, "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:", h_mtl4_draw_b),
@@ -5688,6 +6121,7 @@ static const hook_def mtl4_compute_hooks[] API_AVAILABLE(macos(26.0)) = {
     HD(H_4_FENCE_UPDATE, "updateFence:afterEncoderStages:", h_mtl4_fence_update),
     HD(H_4_FENCE_WAIT, "waitForFence:beforeEncoderStages:", h_mtl4_fence_wait),
     HD(H_4_BIND_COMPUTE, "setArgumentTable:", h_mtl4_bind_compute),
+    HD(H_4_SET_COMPUTE_PIPELINE, "setComputePipelineState:", h_mtl4_set_compute_pipeline),
     HD(H_4_ACCEL_BUILD, "buildAccelerationStructure:descriptor:scratchBuffer:", h_mtl4_accel_build),
     HD(H_4_DISPATCH, "dispatchThreads:threadsPerThreadgroup:", h_mtl4_dispatch),
     HD(H_4_DISPATCH_GROUPS, "dispatchThreadgroups:threadsPerThreadgroup:", h_mtl4_dispatch_groups),
@@ -5835,6 +6269,7 @@ static void hook_mtl4_encoder(Class cls, int kind)
     else if (@available(macOS 26.0, *)) install(cls, 112, mtl4_compute_hooks, N(mtl4_compute_hooks));
 }
 static void hook_mtl4_argument(Class cls) { install(cls, 111, mtl4_argument_hooks, N(mtl4_argument_hooks)); }
+static void hook_mtl4_compiler(Class cls) { install(cls, 113, mtl4_compiler_hooks, N(mtl4_compiler_hooks)); }
 static void hook_mtl4_queue(Class cls)
 {
     if (@available(macOS 26.0, *)) install(cls, 107, mtl4_queue_hooks, N(mtl4_queue_hooks));
@@ -6076,6 +6511,7 @@ __attribute__((constructor)) static void fp_init(void)
     if ((p = getenv("FENCEPOST_POSSIBLE"))) g_show_possible = atoi(p);
     if ((p = getenv("FENCEPOST_SUMMARY_SECS"))) g_summary_secs = atoi(p);
     if ((p = getenv("FENCEPOST_BIND_MAYWRITE"))) g_bind_maywrite = atoi(p);
+    if ((p = getenv("FENCEPOST_MTL4_RW"))) g_mtl4_rw_possible = !strcmp(p, "possible");
     if ((p = getenv("FENCEPOST_CHAIN"))) g_chain_frame = atol(p);
 }
 

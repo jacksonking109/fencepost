@@ -19,6 +19,8 @@ WHY = {
     "commits": "no Metal 4 ordering covers Blit -> Blit",
     "color-vertex": "queue barrier Vertex -> Dispatch does not order Fragment -> Dispatch",
     "overlap": "no Metal 4 ordering covers Blit -> Dispatch",
+    "fragment-vertex": "queue barrier Blit -> Vertex does not order Blit -> Fragment",
+    "compiler-race": "no Metal 4 ordering covers Dispatch -> Dispatch",
 }
 
 
@@ -31,18 +33,17 @@ def run(arch, program, mode, env, **knobs):
     return result
 
 
-def check_case(arch, directory, program, mode, env):
+def check_case(arch, directory, program, mode, env, **extra):
     path = directory / (mode + ".json")
-    knobs = {"FENCEPOST_TRACE": path}
-    if program == "mtl4test":
-        knobs["FENCEPOST_BIND_MAYWRITE"] = 1
+    knobs = {"FENCEPOST_TRACE": path, **extra}
     result = run(arch, program, mode, env, **knobs)
     races = [line for line in result.stderr.splitlines() if line.startswith(("fencepost: RACE ", "fencepost: possible race "))]
     expected = int(mode in WHY)
     assert len(races) == expected, (mode, result.stderr)
     events = json.loads(path.read_text())
     summary = events[-1]["args"]
-    certain = expected and program == "mtl4races"
+    # Pipeline reflection makes shader writes definite; FENCEPOST_MTL4_RW=possible downgrades read-write slots.
+    certain = expected and "FENCEPOST_MTL4_RW" not in extra
     assert summary["race_hits"] == certain and summary["possible_hits"] == expected - certain, (mode, summary)
     assert summary["order_hits"] == int(mode == "order") and summary["partial_hits"] == int(mode == "partial"), summary
     assert not summary.get("mtl4_address_misses") and not summary.get("mtl4_resource_id_misses"), summary
@@ -71,8 +72,12 @@ def check_suite(arch, directory):
     for mode in ("ok", "nobarrier", "wrongstage", "event", "eventlate"):
         check_case(arch, directory, "mtl4test", mode, env)
     for mode in ("producer", "fence", "fence-missing", "commits", "commits-barrier", "color-fragment",
-                 "color-vertex", "mutate", "disjoint", "overlap", "placement", "order", "partial"):
+                 "color-vertex", "mutate", "disjoint", "overlap", "placement", "order", "partial",
+                 "const-shared", "fragment-only", "fragment-vertex", "reflect-app", "compiler-race"):
         check_case(arch, directory, "mtl4races", mode, env)
+    possible = directory / "rw"
+    possible.mkdir()
+    check_case(arch, possible, "mtl4test", "nobarrier", env, FENCEPOST_MTL4_RW="possible")
 
     run(arch, "mtl4races", "fence-missing", env, FENCEPOST_TRACE=directory / "ring",
         FENCEPOST_RING=3, FENCEPOST_RING_AFTER=0, FENCEPOST_TRIGGER_FILE="")
@@ -90,4 +95,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 18 Metal 4 verdicts, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 24 Metal 4 verdicts, race ring dump and clean benchmark passed")
