@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 
-ENCODERS = {"blit", "compute", "render"}
+ENCODERS = {"blit", "compute", "render", "machine learning"}
 FLOW_CATEGORIES = {"fence", "event", "completed", "race", "order"}
 MARKER_PREFIXES = {
     "RACE ": "race",
@@ -96,6 +96,51 @@ def check_shape(encoders, slices, flows, markers, frames, selected, summary):
         assert summary["sampled"] > len(encoders) / 2, "expected GPU timing for most workload encoders"
 
 
+def check_mtl4_timing(case, encoders, command_buffers, markers, summary):
+    spans = list(encoders.values())
+    if case in ("ordered", "overlap", "disabled"):
+        spans = sorted((e for e in spans if e["args"]["cb_label"] == "timing dispatches"),
+                       key=lambda e: e["args"]["uid"])
+        assert [e["name"] for e in spans] == ["MTL4 timing 1x", "MTL4 timing 4x", "MTL4 timing 16x"]
+        commit, = {e["args"]["cb"] for e in spans}
+        assert command_buffers[commit]["dur"] > 0
+        if case == "disabled":
+            assert all(e["args"].get("estimated") for e in spans)
+            assert summary["sampled"] == summary["sampling_skipped"] == summary["pool_exhausted"] == 0
+            return
+        assert all(e["args"]["gpu_time"] for e in spans), spans
+        if case == "ordered":
+            first, middle, last = spans
+            assert slice_end(first) <= middle["ts"] and slice_end(middle) <= last["ts"], spans
+            assert 3 * first["dur"] <= middle["dur"] <= 5 * first["dur"], spans
+            assert 12 * first["dur"] <= last["dur"] <= 20 * first["dur"], spans
+        else:
+            by_time = sorted(spans, key=lambda e: e["ts"])
+            overlapping = [(a, b) for i, a in enumerate(by_time) for b in by_time[i + 1:] if b["ts"] < slice_end(a)]
+            assert overlapping and all(a["tid"] != b["tid"] for a, b in overlapping), spans
+        print("encoder durations in µs", *(e["dur"] for e in spans))
+    elif case == "render":
+        render, = (e for e in spans if e["cat"] == "render")
+        assert render["args"]["gpu_time"] and render["args"]["cb"] in command_buffers, render
+        print(f"render duration {render['dur']} µs")
+    elif case == "race":
+        marker, = markers
+        assert type(marker["args"]["overlapped_on_gpu"]) is bool
+        assert marker["args"]["gpu_order"] in ("overlapped", "in order", "reversed"), marker
+        print(f"race GPU order {marker['args']['gpu_order']}")
+    else:
+        batch = sorted((e for e in spans if e["args"]["cb_label"] == "timing overflow"),
+                       key=lambda e: e["args"]["uid"])
+        assert len(batch) == 2052 and len({e["args"]["cb"] for e in batch}) == 1
+        assert len({e["args"]["logical_cb"] for e in batch}) == 4
+        assert all(e["args"].get("estimated") for e in batch[2048:])
+        assert all(e["args"]["gpu_time"] for e in batch[:2048])
+        assert summary["pool_exhausted"] == 4 and summary["sampling_skipped"] == 5, summary
+        empty, = (e for e in spans if e["name"] == "MTL4 timing empty")
+        reused, = (e for e in spans if e["name"] == "MTL4 timing reused pair")
+        assert empty["args"].get("estimated") and reused["args"]["gpu_time"]
+
+
 def check_trace(events, args):
     assert len({event["pid"] for event in events}) == 1
     summaries = [event for event in events if event["name"] == "fencepost summary"]
@@ -131,6 +176,9 @@ def check_trace(events, args):
             assert cpu_domain(event) == (not (estimated or data["gpu_time"]))
             if data["cb"] in command_buffers:
                 assert estimated or data["gpu_time"]
+                if data["gpu_time"] and "logical_cb" in data:
+                    cb = command_buffers[data["cb"]]
+                    assert cb["ts"] <= start < slice_end(event) <= slice_end(cb)
             if estimated and (not args.dump or data["cb"] in command_buffers):
                 cb = command_buffers[data["cb"]]
                 assert cb["ts"] <= start <= slice_end(event) <= slice_end(cb)
@@ -246,6 +294,8 @@ def check_trace(events, args):
     if args.shape:
         first, last = args.frames or (1, 2)
         check_shape(encoders, slices, flows, markers, frames, set(range(first, last + 1)) & {1, 2}, summary)
+    if args.mtl4_timing:
+        check_mtl4_timing(args.mtl4_timing, encoders, command_buffers, markers, summary)
     print(f"{args.trace}: {len(slices)} X slices, {len(encoders)} encoders ({summary['sampled']} GPU), "
           f"{len(flows)} flows ({len(completed)} completed, {sum(backward.values())} backward), "
           f"{len(markers)} markers, {summary['dropped']} dropped")
@@ -257,6 +307,8 @@ def main():
     parser.add_argument("--shape", action="store_true", help="check tracetest's exact encoders, flows and marker")
     parser.add_argument("--frames", metavar="A:B", help="expect only this inclusive capture range")
     parser.add_argument("--cpu-only", action="store_true", help="expect no sampled GPU encoder times")
+    parser.add_argument("--mtl4-timing", choices=("ordered", "overlap", "render", "race", "disabled", "overflow"),
+                        help="check a Metal 4 timing case")
     parser.add_argument("--dump", action="store_true", help="check a standalone triggered capture")
     parser.add_argument("--trigger", nargs=2, metavar=("FRAME", "REASON"), help="expect this trigger in the dump")
     args = parser.parse_args()
