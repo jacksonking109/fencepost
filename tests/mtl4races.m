@@ -28,6 +28,35 @@ static void submit(id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> cb,
     [queue commit:&cb count:1 options:options];
 }
 
+/* Hold the feedback queue until both commits are issued. The GPU never waits on the gate. */
+API_AVAILABLE(macos(26.0))
+static int submit_split(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> a,
+                        id<MTL4CommandBuffer> b)
+{
+    dispatch_semaphore_t releaseFeedback = dispatch_semaphore_create(0);
+    dispatch_semaphore_t blocked = dispatch_semaphore_create(0);
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+    __block atomic_int errors = 0;
+    id<MTL4CommandBuffer> warm = [device newCommandBuffer];
+    __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    if (!warm || !allocator) return fail("warm-up setup failed");
+    [warm beginCommandBufferWithAllocator:allocator];
+    [warm endCommandBuffer];
+    MTL4CommitOptions *options = [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        if (feedback.error) atomic_fetch_add(&errors, 1);
+        dispatch_semaphore_signal(blocked);
+        wait_cpu(releaseFeedback);
+    }];
+    [queue commit:&warm count:1 options:options];
+    if (!wait_cpu(blocked)) return fail("feedback gate timeout");
+    submit(queue, a, finished, &errors);
+    submit(queue, b, finished, &errors);
+    dispatch_semaphore_signal(releaseFeedback);
+    if (!wait_cpu(finished) || !wait_cpu(finished)) return fail("commit feedback timeout");
+    return atomic_load(&errors) ? fail("GPU feedback error") : 0;
+}
+
 static NSString *const kernels =
     @"#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -53,6 +82,97 @@ static int commit_and_wait(id<MTL4CommandQueue> queue, id<MTL4CommandBuffer> cb)
     submit(queue, cb, done, &errors);
     if (!wait_cpu(done)) return fail("commit feedback timeout");
     return atomic_load(&errors) ? fail("GPU feedback error") : 0;
+}
+
+API_AVAILABLE(macos(26.0))
+static BOOL encode_word(id<MTL4CommandBuffer> cb, id<MTLComputePipelineState> pipeline,
+                        id<MTL4ArgumentTable> table, id<MTLBuffer> source, id<MTLBuffer> dest, NSString *label)
+{
+    id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
+    if (!e) return NO;
+    e.label = label;
+    [table setAddress:source.gpuAddress atIndex:0];
+    [table setAddress:dest.gpuAddress atIndex:1];
+    [e setComputePipelineState:pipeline];
+    [e setArgumentTable:table];
+    [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [e endEncoding];
+    return YES;
+}
+
+API_AVAILABLE(macos(26.0))
+static int run_consumer_barriers(id<MTLDevice> device, NSString *mode)
+{
+    BOOL separate = [mode isEqualToString:@"consumer-buffers"] || [mode isEqualToString:@"consumer-commits"];
+    BOOL intervening = [mode isEqualToString:@"consumer-intervening"];
+    BOOL chain = [mode hasPrefix:@"chain-"];
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTL4CommandAllocator> a1 = [device newCommandAllocator];
+    id<MTL4CommandAllocator> a2 = separate ? [device newCommandAllocator] : a1;
+    id<MTL4CommandBuffer> a = [device newCommandBuffer], b = separate ? [device newCommandBuffer] : a;
+    if (!queue || !a1 || !a2 || !a || !b) return fail("command setup failed");
+    id<MTLLibrary> lib = [device newLibraryWithSource:kernels options:nil error:NULL];
+    id<MTLFunction> function = [lib newFunctionWithName:@"word"];
+    id<MTLComputePipelineState> pipeline = function ? [device newComputePipelineStateWithFunction:function error:NULL] : nil;
+    MTL4ArgumentTableDescriptor *layout = [MTL4ArgumentTableDescriptor new];
+    layout.maxBufferBindCount = 2;
+    id<MTL4ArgumentTable> table = [device newArgumentTableWithDescriptor:layout error:NULL];
+    id<MTLBuffer> input = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> data = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> output = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> scratch = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    BOOL fenceBridge = [mode isEqualToString:@"chain-fence"];
+    __attribute__((objc_precise_lifetime)) id<MTLFence> fence = fenceBridge ? [device newFence] : nil;
+    if (!pipeline || !table || !input || !data || !output || !scratch || !residency) return fail("work setup failed");
+    if (fenceBridge && !fence) return fail("fence creation failed");
+    *(uint32_t *)input.contents = 42;
+    *(uint32_t *)data.contents = 0;
+    for (id<MTLBuffer> buffer in @[input, data, output, scratch]) [residency addAllocation:buffer];
+    [residency commit];
+    [queue addResidencySet:residency];
+
+    [a beginCommandBufferWithAllocator:a1];
+    if (!encode_word(a, pipeline, table, input, intervening ? scratch : data, @"first")) return fail("first encoder failed");
+    id<MTL4ComputeCommandEncoder> barrier = [a computeCommandEncoder];
+    if (!barrier) return fail("barrier encoder failed");
+    if ([mode isEqualToString:@"chain-before-blit"])
+        [barrier fillBuffer:scratch range:NSMakeRange(0, 16) value:0];
+    [barrier barrierAfterQueueStages:MTLStageDispatch beforeStages:chain ? MTLStageBlit : MTLStageDispatch
+                   visibilityOptions:MTL4VisibilityOptionDevice];
+    if ([mode isEqualToString:@"chain-blit"])
+        [barrier fillBuffer:scratch range:NSMakeRange(0, 16) value:0];
+    if (fence) [barrier updateFence:fence afterEncoderStages:MTLStageBlit];
+    [barrier endEncoding];
+    if (chain) {
+        id<MTL4ComputeCommandEncoder> bridge = [a computeCommandEncoder];
+        if (!bridge) return fail("second barrier encoder failed");
+        [bridge barrierAfterQueueStages:MTLStageBlit beforeStages:MTLStageDispatch
+                     visibilityOptions:MTL4VisibilityOptionDevice];
+        [bridge endEncoding];
+    }
+    if (intervening && !encode_word(a, pipeline, table, input, data, @"intervening"))
+        return fail("intervening encoder failed");
+    if (separate) {
+        [a endCommandBuffer];
+        [b beginCommandBufferWithAllocator:a2];
+    }
+    if (!encode_word(b, pipeline, table, data, output, @"last")) return fail("last encoder failed");
+    [b endCommandBuffer];
+
+    if ([mode isEqualToString:@"consumer-commits"]) return submit_split(device, queue, a, b);
+    if (!separate) return commit_and_wait(queue, a);
+    id<MTL4CommandBuffer> const both[] = {a, b};
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block BOOL error = NO;
+    MTL4CommitOptions *options = [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        error = feedback.error != nil;
+        dispatch_semaphore_signal(done);
+    }];
+    [queue commit:both count:2 options:options];
+    if (!wait_cpu(done)) return fail("commit feedback timeout");
+    return error ? fail("GPU feedback error") : 0;
 }
 
 API_AVAILABLE(macos(26.0))
@@ -255,6 +375,7 @@ static int run(id<MTLDevice> device, NSString *mode)
     if ([@[@"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race"] containsObject:mode])
         return run_reflection(device, mode);
     if ([mode hasPrefix:@"load-"]) return run_attachments(device, mode);
+    if ([mode hasPrefix:@"consumer-"] || [mode hasPrefix:@"chain-"]) return run_consumer_barriers(device, mode);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
@@ -388,36 +509,8 @@ static int run(id<MTLDevice> device, NSString *mode)
     [read endEncoding];
     [b endCommandBuffer];
 
-    dispatch_semaphore_t releaseFeedback = nil;
-    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
-    __block atomic_int errors = 0;
-    if (split) {
-        // Hold the serial feedback queue, never GPU execution, until both commits are issued.
-        releaseFeedback = dispatch_semaphore_create(0);
-        dispatch_semaphore_t blocked = dispatch_semaphore_create(0);
-        id<MTL4CommandBuffer> warm = [device newCommandBuffer];
-        __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> warmAllocator = [device newCommandAllocator];
-        if (!warm || !warmAllocator) return fail("warm-up setup failed");
-        [warm beginCommandBufferWithAllocator:warmAllocator];
-        id<MTL4ComputeCommandEncoder> fill = [warm computeCommandEncoder];
-        if (!fill) return fail("warm-up encoder creation failed");
-        [fill fillBuffer:result range:NSMakeRange(48, 16) value:0];
-        [fill endEncoding];
-        [warm endCommandBuffer];
-        MTL4CommitOptions *options = [MTL4CommitOptions new];
-        [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-            if (feedback.error) atomic_fetch_add(&errors, 1);
-            dispatch_semaphore_signal(blocked);
-            wait_cpu(releaseFeedback);
-        }];
-        [queue commit:&warm count:1 options:options];
-        if (!wait_cpu(blocked)) return fail("feedback gate timeout");
-        submit(queue, a, finished, &errors);
-    }
-    submit(queue, b, finished, &errors);
-    if (releaseFeedback) dispatch_semaphore_signal(releaseFeedback);
-    if (!wait_cpu(finished) || (split && !wait_cpu(finished))) return fail("commit feedback timeout");
-    if (atomic_load(&errors)) return fail("GPU feedback error");
+    int failed = split ? submit_split(device, queue, a, b) : commit_and_wait(queue, b);
+    if (failed) return failed;
 
     uint32_t *words = result.contents;
     if (mutate && (words[0] != 11 || words[4] != 22)) return fail("argument-table snapshot mismatch");
@@ -437,7 +530,8 @@ int main(int argc, const char **argv)
         if (!mode || ![@[@"producer", @"fence", @"fence-missing", @"commits", @"commits-barrier", @"color-fragment",
                         @"color-vertex", @"mutate", @"disjoint", @"overlap", @"placement", @"order", @"partial",
                         @"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race",
-                        @"load-early", @"load-late"]
+                        @"load-early", @"load-late", @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
+                        @"consumer-intervening", @"chain-empty", @"chain-before-blit", @"chain-blit", @"chain-fence"]
                        containsObject:mode])
             return fail("expected a named Metal 4 race case");
         if (@available(macOS 26.0, *)) {

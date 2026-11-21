@@ -145,10 +145,15 @@ sets, device pipelines made before the first Metal 4 object) use their own refle
 are otherwise counted as "access unknown" in the summary. Their slots fall back to reads, or to possible writes
 with `FENCEPOST_BIND_MAYWRITE=1`.
 
-A Metal 4 queue supplies no implicit ordering between encoders. Queue barriers order earlier work only for
-the specified producer and consumer stages, across command buffers and commits on the queue. A fence update
-and wait orders covered work on the same queue. Queue events order all covered stages, and commit feedback
-orders completed work before a later submission. Reports name the stages of both accesses.
+A Metal 4 queue supplies no implicit ordering between encoders. A consumer barrier orders the specified
+stages of earlier encoders before matching work after the barrier in its own encoder and in all later
+encoders on the queue. The SDK header describes the current encoder only. Fencepost follows
+[Apple's online documentation](https://developer.apple.com/documentation/metal/mtl4commandencoder/barrierafterqueuestages:beforestages:visibilityoptions:)
+and tests across command buffers and commits. A producer barrier also covers commands encoded before it in
+its own encoder, and gates work in later encoders. Barriers chain through a shared stage only when both
+cover an operation in that stage, including a fence update or wait. Fences order covered work on the same
+queue. Queue events order all covered stages, and commit feedback orders completed work before a later
+submission. Reports name the stages of both accesses.
 
 Render attachments load at the start of the pass and store at its end, both in the Fragment stage. Apple's
 documentation does not say whether a consumer barrier or fence wait inside a render encoder orders the load, so

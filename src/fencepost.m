@@ -2364,6 +2364,7 @@ static struct { uint64_t query; uint32_t epoch; } g_fp4_seen[FP_POOL][FP4_STAGE_
 static void fp4_push_visit(fp_node *n, unsigned mask, uint32_t epoch)
 {
     if (n->kind == FPK_SIGNAL) mask = 1;
+    /* A barrier alone cannot bridge a stage. Visit only recorded work at or before the cut. */
     else mask &= n->mtl4_work;
     while (mask) {
         int stage = __builtin_ctz(mask);
@@ -2468,13 +2469,23 @@ static void fp4_publish_prefixes(fp_queue *q, fp_node *n)
     }
     for (int i = 0; i < n->mtl4_nsync; i++) {
         const fp4_sync *sync = &n->mtl4_sync[i];
-        if (sync->kind != FP4_PRODUCER) continue;
+        fp4_prefix prefix;
+        if (sync->kind == FP4_PRODUCER) prefix = (fp4_prefix){ n->uid, n->queue_seq, sync->epoch };
+        else if (sync->kind == FP4_CONSUMER) {
+            /* Apple's online docs and GPU timing agree that the before stages extend to
+             * later encoders, although the SDK header only says current encoder. */
+            prefix = fp4_previous_prefix(n);
+            if (!prefix.uid) continue;
+        } else continue;
         if (!q->mtl4_prefixes) q->mtl4_prefixes = calloc(1, sizeof *q->mtl4_prefixes);
         if (!q->mtl4_prefixes) continue;
-        for (unsigned after = sync->after; after; after &= after - 1)
-            for (unsigned before = sync->before; before; before &= before - 1)
-                q->mtl4_prefixes->cut[__builtin_ctz(after)][__builtin_ctz(before)] =
-                    (fp4_prefix){ n->uid, n->queue_seq, sync->epoch };
+        for (unsigned after = sync->after; after; after &= after - 1) {
+            for (unsigned before = sync->before; before; before &= before - 1) {
+                fp4_prefix *cut = &q->mtl4_prefixes->cut[__builtin_ctz(after)][__builtin_ctz(before)];
+                /* A producer cut on this encoder already covers the previous prefix. */
+                if (sync->kind == FP4_PRODUCER || cut->uid != n->uid) *cut = prefix;
+            }
+        }
     }
 }
 
@@ -3241,6 +3252,16 @@ static void fp4_note_work(fp_node *n, int stage)
     }
 }
 
+static void fp4_note_attachment_loads(fp_node *n)
+{
+    for (int i = 0; i < n->nacc; i++) {
+        fp_acc *a = &n->acc[i];
+        if (a->via != VIA_ATT_LOAD) continue;
+        a->first_epoch = a->last_epoch = n->mtl4_epoch;
+        fp4_note_work(n, FP4_FRAGMENT);
+    }
+}
+
 static int fp4_record_access(fp_node *n, fp4_resource r, uint64_t off, uint64_t end, uint32_t slice, uint32_t slices,
                              int rw, int stage, int via)
 {
@@ -3257,7 +3278,7 @@ static int fp4_record_access(fp_node *n, fp4_resource r, uint64_t off, uint64_t 
         a.a1 = MIN(a.a1, r.end - r.address);
     }
     if (a.a0 >= a.a1) return -1;
-    fp4_note_work(n, stage);
+    if (via != VIA_ATT_LOAD && via != VIA_ATT && via != VIA_RESOLVE) fp4_note_work(n, stage);
     return push_acc(n, &a);
 }
 
@@ -3558,6 +3579,7 @@ static void fp4_capture_tables(id encoder, unsigned stages)
 {
     fp_node *n = cur_node(encoder);
     if (!n || !n->mtl4) return;
+    if (!n->mtl4_drawn && n->kind == FPK_RENDER) fp4_note_attachment_loads(n);
     n->mtl4_drawn = 1;
     while (stages) {
         int stage = __builtin_ctz(stages);
@@ -5063,16 +5085,20 @@ static unsigned fp4_stage_mask(NSUInteger mask)
  * - a consumer queue barrier or fence wait encoded before the encoder's first draw covers
  *   the attachment loads and stores (in its before stages, attachments being Fragment);
  * - one encoded after a draw does not cover the loads, but does cover the stores.
- * A pre-draw wait gets epoch 0, before the attachments' epoch 1, so it covers all of the
- * encoder's work. At endEncoding the stores become accesses at the encoder's final epoch. */
+ * Loads take the first draw's epoch (the final epoch on a drawless pass). Stores take the
+ * final epoch. Fence operations are also work for chaining through a covered stage. */
 static void fp4_record_sync(id encoder, int kind, id fence, NSUInteger after, NSUInteger before)
 {
     fp_node *n = cur_node(encoder);
     if (!n || !n->mtl4) return;
-    int pass_start = n->kind == FPK_RENDER && !n->mtl4_drawn && (kind == FP4_CONSUMER || kind == FP4_FENCE_WAIT);
-    fp4_sync sync = { (void *)fence, pass_start ? 0 : n->mtl4_epoch++, fp4_stage_mask(after), fp4_stage_mask(before), kind };
+    fp4_sync sync = { (void *)fence, n->mtl4_epoch, fp4_stage_mask(after), fp4_stage_mask(before), kind };
+    if (kind == FP4_FENCE_UPDATE)
+        for (unsigned mask = sync.after; mask; mask &= mask - 1) fp4_note_work(n, __builtin_ctz(mask));
+    n->mtl4_epoch++;
+    if (kind == FP4_FENCE_WAIT)
+        for (unsigned mask = sync.before; mask; mask &= mask - 1) fp4_note_work(n, __builtin_ctz(mask));
     PUSH(n->mtl4_sync, n->mtl4_nsync, n->mtl4_csync, sync);
-    if (!pass_start) memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
+    memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
 }
 
 #define FP4_BARRIER(fn, hook_id, kind) \
@@ -5666,21 +5692,21 @@ static void h_end(id self, SEL _cmd)
     if (!n) return;
     NSString *l = [self label];
     if (n->mtl4) {
+        if (!n->mtl4_drawn && n->kind == FPK_RENDER) fp4_note_attachment_loads(n);
         for (int i = 0, count = n->nacc; i < count; i++) {
             fp_acc *access = &n->acc[i];
             if (access->via != VIA_ATT && access->via != VIA_ATT_LOAD && access->via != VIA_RESOLVE) continue;
-            access->last_epoch = n->mtl4_epoch;
-            fp4_note_work(n, FP4_FRAGMENT);
             if (!(access->rw & FP_WR)) continue;
+            fp4_note_work(n, FP4_FRAGMENT);
             /* The store happens at the end of the pass (see fp4_record_sync). */
             if (access->via == VIA_ATT_LOAD) {
                 fp_acc store = *access;
                 access->rw &= ~FP_WR;
                 store.rw = FP_WR;
                 store.via = VIA_ATT;
-                store.first_epoch = n->mtl4_epoch;
+                store.first_epoch = store.last_epoch = n->mtl4_epoch;
                 push_acc(n, &store);
-            } else access->first_epoch = n->mtl4_epoch;
+            } else access->first_epoch = access->last_epoch = n->mtl4_epoch;
         }
         for (int i = 0; i < FP4_TABLES; i++) {
             [n->mtl4_tables[i] release];

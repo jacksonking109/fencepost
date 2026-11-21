@@ -23,6 +23,9 @@ WHY = {
     "fragment-vertex": "queue barrier Blit -> Vertex does not order Blit -> Fragment",
     "compiler-race": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "load-late": "queue barrier Fragment -> Fragment does not order Fragment -> Fragment",
+    "consumer-intervening": "no Metal 4 ordering covers Dispatch -> Dispatch",
+    "chain-empty": "no Metal 4 ordering covers Dispatch -> Dispatch",
+    "chain-before-blit": "no Metal 4 ordering covers Dispatch -> Dispatch",
 }
 
 
@@ -85,7 +88,8 @@ def check_suite(arch, directory):
     for mode in ("producer", "fence", "fence-missing", "commits", "commits-barrier", "color-fragment",
                  "color-vertex", "mutate", "disjoint", "overlap", "placement", "order", "partial",
                  "const-shared", "fragment-only", "fragment-vertex", "reflect-app", "compiler-race",
-                 "load-early", "load-late"):
+                 "load-early", "load-late", "consumer-buffer", "consumer-buffers", "consumer-commits",
+                 "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence"):
         check_case(arch, directory, "mtl4races", mode, env)
     possible = directory / "rw"
     possible.mkdir()
@@ -107,4 +111,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 26 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 34 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
