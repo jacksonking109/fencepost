@@ -210,6 +210,7 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
     }
 
     __block atomic_int errors = 0, fresh_count = 0, shared_count = 0, added_count = 0, batch_count = 0;
+    __block atomic_int extra_count = 0;
     dispatch_semaphore_t app_feedback = dispatch_semaphore_create(0);
     dispatch_semaphore_t batch_feedback = dispatch_semaphore_create(0);
     MTL4CommitOptions *fresh = [MTL4CommitOptions new];
@@ -234,9 +235,17 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
         }
 
         if (i == 5) {
+            long previous_signals = retired_signals ? retired_signals() : 0;
             [shared addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
                 if (feedback.error) atomic_fetch_add(&errors, 1);
                 atomic_fetch_add(&added_count, 1);
+                dispatch_semaphore_signal(app_feedback);
+            }];
+            [shared addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+                if (feedback.error) atomic_fetch_add(&errors, 1);
+                if (retired_signals && retired_signals() <= previous_signals)
+                    atomic_fetch_add(&errors, 1);
+                atomic_fetch_add(&extra_count, 1);
                 dispatch_semaphore_signal(app_feedback);
             }];
         }
@@ -260,6 +269,9 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
 
         if (i == 1) [producer commit:&compute count:1];
         else [producer commit:&compute count:1 options:i == 2 ? fresh : shared];
+        // Both registrations must belong to this producer, before shared is reused.
+        if (i == 5 && (!wait_cpu(app_feedback) || !wait_cpu(app_feedback)))
+            return fail("expected two feedback handlers for one producer submission");
         // Re-register on the same object while the producer can still be in flight.
         MTL4CommitOptions *batch = i >= 3 ? shared : [MTL4CommitOptions new];
         [batch addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
@@ -290,7 +302,7 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
         if (![done waitUntilSignaledValue:i timeoutMS:3000]) return fail("GPU completion timeout");
         if (dispatch_semaphore_wait(batch_feedback, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)))
             return fail("batch feedback timeout");
-        if ((i == 2 || i == 3 || i == 5) &&
+        if ((i == 2 || i == 3) &&
             dispatch_semaphore_wait(app_feedback, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)))
             return fail("producer feedback timeout");
         for (unsigned k = 0; k < BufferSize; k++)
@@ -332,7 +344,8 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
     }
     int expected_producer_feedback = wait_mode == WaitDefault ? 1 : 0;
     return fresh_total != expected_producer_feedback || shared_total != expected_producer_feedback ||
-           added_total != expected_producer_feedback || batch_total != (int)frames || error_total != 0;
+           added_total != expected_producer_feedback || atomic_load(&extra_count) != expected_producer_feedback ||
+           batch_total != (int)frames || error_total != 0;
 }
 
 /* Under libfencepost-testhooks.dylib, fencepost's own BindingInfo request fails on each
