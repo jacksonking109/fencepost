@@ -452,10 +452,14 @@ static fp_cb *cb_find_open(void *cb)   /* lock held */
     return NULL;
 }
 
-static void cb_close(fp_cb *c)   /* g_lock held; c still owns its open slot */
+static void cb_close(fp_cb *c)   /* g_lock held */
 {
-    g_opencb[c->open_slot].cb = NULL;
-    g_opencb[c->open_slot].uid = 0;
+    /* A full table evicts round-robin, so the slot may now belong to a newer
+     * buffer. Callers find c through cb_find_open, but never clear another's entry. */
+    if (g_opencb[c->open_slot].uid == c->uid) {
+        g_opencb[c->open_slot].cb = NULL;
+        g_opencb[c->open_slot].uid = 0;
+    }
     while (g_opencb_end && !g_opencb[g_opencb_end - 1].cb) g_opencb_end--;
 }
 
@@ -4790,6 +4794,12 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
             pthread_mutex_lock(&g_lock);
             int can_start = !g_capture_mtl4_unsafe;
             pthread_mutex_unlock(&g_lock);
+            /* Known residual window: the check above and startCapture can't be one
+             * atomic step. An end on another thread waits for g_capture_starting, but
+             * only for 3 s; if this thread stalls longer right here, that end proceeds
+             * (and marks the gate unsafe) and this start may still run. Waiting without
+             * a bound would instead let a capture request hang the app, which is worse
+             * than a crash window that needs a >3 s stall between two statements. */
             if (can_start) {
                 started = [manager startCaptureWithDescriptor:desc error:&error];
                 if (started) (void)CAPTURE_TEST("start-recording");
@@ -6502,13 +6512,15 @@ static void trace_mtl4_abandon_samples(id cb)
     for (fp_trace_encoder *e = owner->record->encoders; e; e = e->next) e->sample = -1;
 }
 
-static void mtl4_untracked_commit(const id *buffers, NSUInteger count, int capture_tracked, int trace_samples)
+/* consume_frames: an outer submission whose explicit frame boundaries no
+ * detector pass will see (capture tracking, or the outer call without capture). */
+static void mtl4_untracked_commit(const id *buffers, NSUInteger count, int consume_frames, int trace_samples)
 {
-    if (!capture_tracked && !trace_samples) return;
+    if (!consume_frames && !trace_samples) return;
     pthread_mutex_lock(&g_lock);
     for (NSUInteger i = 0; i < count; i++) {
         if (trace_samples) trace_mtl4_abandon_samples(buffers[i]);
-        if (!capture_tracked || !g_frame_api) continue;
+        if (!consume_frames || !g_frame_api) continue;
         fp_cb *c = cb_find_open((void *)buffers[i]);
         if (!c || !c->mtl4 || c->state != 2) continue;
         /* The detector normally consumes explicit boundaries in phase1.
@@ -6827,7 +6839,7 @@ static void h_mtl4_app_feedback(id self, SEL _cmd, void (^handler)(id))
 
 API_AVAILABLE(macos(26.0))
 static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUInteger count, id app_options,
-                                             uint64_t capture_generation, int capture_tracked)
+                                             uint64_t capture_generation, int consume_frames)
 {
     if (capture_generation && CAPTURE_TEST("mtl4-feedback")) return nil;
     FPMTL4Callbacks *callbacks = app_options ? objc_getAssociatedObject(app_options, &g_mtl4_callbacks_key) : nil;
@@ -6861,7 +6873,7 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
             if (app_handler) app_handler(feedback);
         }];
     }
-    if (!submission) mtl4_untracked_commit(buffers, count, capture_tracked, g_trace_enabled && g_trace_gpu);
+    if (!submission) mtl4_untracked_commit(buffers, count, consume_frames, g_trace_enabled && g_trace_gpu);
     if (first) {
         if (!needs_feedback || rest) [opts addFeedbackHandler:(MTL4CommitFeedbackHandler)first];
         Block_release(first);
@@ -6886,13 +6898,13 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
         if (OUTER) {
             if (@available(macOS 26.0, *)) {
                 if (count && [self respondsToSelector:@selector(commit:count:options:)])
-                    opts = mtl4_submit_options(self, buffers, count, nil, generation, tracked);
+                    opts = mtl4_submit_options(self, buffers, count, nil, generation, capture ? tracked : 1);
                 if (opts)
                     [(id<MTL4CommandQueue>)self commit:(const id<MTL4CommandBuffer> *)buffers count:count options:opts];
             }
         }
         if (!opts) {
-            mtl4_untracked_commit(buffers, count, tracked, OUTER && g_trace_enabled && g_trace_gpu);
+            mtl4_untracked_commit(buffers, count, capture ? tracked : OUTER, OUTER && g_trace_enabled && g_trace_gpu);
             ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
         }
         returned = 1;
@@ -6917,9 +6929,10 @@ static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger 
         if (capture) tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit);
         if (OUTER) (void)CAPTURE_TEST("mtl4-commit");
         if (OUTER && (options || generation)) {
-            if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options, generation, tracked);
+            if (@available(macOS 26.0, *))
+                opts = mtl4_submit_options(self, buffers, count, options, generation, capture ? tracked : 1);
         }
-        if (!opts) mtl4_untracked_commit(buffers, count, tracked, OUTER && g_trace_enabled && g_trace_gpu);
+        if (!opts) mtl4_untracked_commit(buffers, count, capture ? tracked : OUTER, OUTER && g_trace_enabled && g_trace_gpu);
         ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, opts ?: options);
         returned = 1;
     } @finally {

@@ -159,6 +159,10 @@ static bool encode_render(id<MTL4CommandBuffer> cb, id<MTL4CommandAllocator> all
     return true;
 }
 
+/* --nil-options: submit the render batch through commit:count:options: with nil
+ * options, Fencepost's native fallback. Its frame boundaries must still count. */
+static bool g_nil_options;
+
 API_AVAILABLE(macos(26.0))
 static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger, unsigned frames, int wait_mode)
 {
@@ -235,7 +239,16 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
         }
 
         if (i == 5) {
+            /* Earlier frames retire their queue signals from feedback that nothing
+             * here waits for. Let that settle first, so only this producer's own
+             * retirement can move the counter the ordering check below relies on. */
             long previous_signals = retired_signals ? retired_signals() : 0;
+            for (int settle = 0; retired_signals && settle < 200; settle++) {
+                [NSThread sleepForTimeInterval:0.01];
+                long now = retired_signals();
+                if (now == previous_signals && settle >= 5) break;
+                previous_signals = now;
+            }
             [shared addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
                 if (feedback.error) atomic_fetch_add(&errors, 1);
                 atomic_fetch_add(&added_count, 1);
@@ -274,7 +287,7 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
             return fail("expected two feedback handlers for one producer submission");
         // Re-register on the same object while the producer can still be in flight.
         MTL4CommitOptions *batch = i >= 3 ? shared : [MTL4CommitOptions new];
-        [batch addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        if (!g_nil_options) [batch addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
             if (feedback.error) atomic_fetch_add(&errors, 1);
             atomic_fetch_add(&batch_count, 1);
             dispatch_semaphore_signal(batch_feedback);
@@ -293,14 +306,15 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
             [producer signalEvent:produced value:i];
             [consumer waitForEvent:produced value:i];
         }
-        [consumer commit:render count:2 options:batch];
+        [consumer commit:render count:2 options:g_nil_options ? nil : batch];
         if (drawable) {
             [consumer signalDrawable:drawable];
             [drawable present];
         }
         [consumer signalEvent:done value:i];
         if (![done waitUntilSignaledValue:i timeoutMS:3000]) return fail("GPU completion timeout");
-        if (dispatch_semaphore_wait(batch_feedback, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)))
+        if (!g_nil_options &&
+            dispatch_semaphore_wait(batch_feedback, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)))
             return fail("batch feedback timeout");
         if ((i == 2 || i == 3) &&
             dispatch_semaphore_wait(app_feedback, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)))
@@ -345,7 +359,7 @@ static int run(id<MTLDevice> device, bool drawable_mode, bool pause_for_trigger,
     int expected_producer_feedback = wait_mode == WaitDefault ? 1 : 0;
     return fresh_total != expected_producer_feedback || shared_total != expected_producer_feedback ||
            added_total != expected_producer_feedback || atomic_load(&extra_count) != expected_producer_feedback ||
-           batch_total != (int)frames || error_total != 0;
+           batch_total != (g_nil_options ? 0 : (int)frames) || error_total != 0;
 }
 
 /* Under libfencepost-testhooks.dylib, fencepost's own BindingInfo request fails on each
@@ -450,7 +464,9 @@ int main(int argc, const char **argv)
             else if (!strcmp(argv[i], "--long")) frames = 512;
             else if (!strcmp(argv[i], "--self-wait")) wait_mode = WaitSelf;
             else if (!strcmp(argv[i], "--many-waits")) wait_mode = WaitMany;
-            else return fail("usage: mtl4frames [--drawable] [--trigger] [--long] | --threads | --self-wait | --many-waits");
+            else if (!strcmp(argv[i], "--nil-options")) g_nil_options = true;
+            else return fail("usage: mtl4frames [--drawable] [--trigger] [--long] [--nil-options] | --threads | "
+                             "--self-wait | --many-waits");
         }
         if (@available(macOS 26.0, *)) {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();

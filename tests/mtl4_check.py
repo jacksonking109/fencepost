@@ -132,6 +132,13 @@ def run(arch, directory):
         print(injected.strip(), flush=True)
         check_trace(path, list(range(1, 7)))
 
+    # nil commit options take Fencepost's native fallback; frame boundaries must still count.
+    result = subprocess.run(command(arch, injection, "--nil-options"), env=env, capture_output=True, text=True,
+                            check=True, timeout=20)
+    assert result.stdout == "frames=6 boundary=api app_feedback fresh=1 reused=1 added=1 batch=0 errors=0\n", result
+    assert "fencepost:   frames: 6;" in result.stderr, result.stderr
+    print("nil-options fallback: 6 frames counted", flush=True)
+
     path = directory / "self-wait.json"
     subprocess.run(command(arch, dict(injection, FENCEPOST_TRACE=path), "--self-wait"),
                    env=env, check=True, timeout=20)
