@@ -18,7 +18,6 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "out"
 FEEDBACK = "app_feedback fresh=1 reused=1 added=1 batch=6 errors=0"
-CAPTURE_FALLBACK = "fencepost: capture not yet supported for Metal 4"
 
 
 def command(arch, knobs, *flags):
@@ -169,7 +168,6 @@ def run(arch, directory):
             time.sleep(0.3)  # Let the 250 ms file-poll interval elapse before frame 3 submits.
             output, log = app.communicate("\n", timeout=15)
             assert app.returncode == 0 and output == f"frames=6 boundary=api {FEEDBACK}\n", (output, log)
-            assert log.splitlines().count(CAPTURE_FALLBACK) == 1, log
         finally:
             if app.poll() is None:
                 app.kill()

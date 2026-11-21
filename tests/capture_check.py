@@ -3,6 +3,7 @@
 import argparse
 import os
 from pathlib import Path
+import platform
 import re
 import select
 import subprocess
@@ -14,7 +15,7 @@ DISABLED = "fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; 
 
 
 def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_secs=10, max_secs=120,
-             reason=None, message=None, foreign=None, targeted=False):
+             quota=3, cooldown=0, reason=None, message=None, foreign=None, targeted=False, label_frames=1):
     prefix = directory / "capture"
     request = directory / "request"
     if foreign is None:
@@ -30,7 +31,8 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
         "FENCEPOST_CAPTURE_FRAMES": frames,
         "FENCEPOST_CAPTURE_IDLE_SECS": idle_secs,
         "FENCEPOST_CAPTURE_MAX_SECS": max_secs,
-        "FENCEPOST_CAPTURE_COOLDOWN": 0,
+        "FENCEPOST_CAPTURE_MAX": quota,
+        "FENCEPOST_CAPTURE_COOLDOWN": cooldown,
     }
     if enabled:
         knobs["MTL_CAPTURE_ENABLED"] = 1
@@ -42,16 +44,18 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     command = ["arch", "-" + arch]
     for key, value in knobs.items():
         command.extend(["-e", f"{key}={value}"])
-    with subprocess.Popen([*command, ROOT / "out/capturetest", mode], env=env,
+    drawable = mode == "mtl4-drawable"
+    fixture = [ROOT / "out/mtl4frames", "--drawable", "--trigger"] if drawable else [ROOT / "out/capturetest", mode]
+    with subprocess.Popen([*command, *fixture], env=env,
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as test:
         try:
-            if mode in {"file", "no-frame", "empty-file", "wrong-pid"}:
+            if drawable or mode in {"file", "no-frame", "empty-file", "wrong-pid"}:
                 assert select.select([test.stdout], [], [], 15)[0], "capturetest did not become ready"
                 ready = test.stdout.readline()
                 if not ready:
                     _, log = test.communicate(timeout=5)
                     raise AssertionError((test.returncode, log))
-                assert ready == "ready\n", ready
+                assert ready == ("ready for trigger\n" if drawable else "ready\n"), ready
                 if mode == "empty-file":
                     stamp = request.stat().st_mtime_ns + 1_000_000_000
                     request.write_text("")
@@ -111,13 +115,13 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     if reason is None:
         assert not captures and not starts and not stops, (captures, log)
         return
-    frame = {"empty-file": 3, "wrong-pid": 4}.get(mode, 2)
+    frame = {"empty-file": 3, "wrong-pid": 4, "mtl4-defer": 3, "mtl4-drawable": 3}.get(mode, 2)
     expected = directory / f"capture-{test.pid}-f{frame}-{reason}.gputrace"
     assert captures == [expected] and expected.is_dir(), (captures, log)
     size = sum(path.stat().st_size for path in expected.rglob("*") if path.is_file())
     assert size >= 4096, (size, log)
     assert starts == [f"fencepost: capturing frame {frame} ({reason}) -> {expected}"], log
-    suffix = {"idle": r" \(idle limit\)", "hard-limit": r" \(time limit\)"}.get(mode, "")
+    suffix = {"idle": r" \(idle limit\)", "hard-limit": r" \(time limit\)"}.get(mode.removeprefix("mtl4-"), "")
     assert len(stops) == 1 and re.fullmatch(
         rf"fencepost: capture written {re.escape(str(expected))}, \d+\.\d{{2}} MB, \d+\.\d s{suffix}", stops[0]), log
     if mode == "slow-frame":
@@ -127,6 +131,31 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
         assert len(snapshots) == 1, (snapshots, log)
         name = re.fullmatch(r"(MTLBuffer-\d+)-\d+", snapshots[0].name)
         assert name and f"fencepost: largest: {name[1]} 8 MB in 1 snapshots" in log.splitlines(), log
+    if mode.startswith("mtl4-") and not drawable:
+        blobs = [path.read_bytes() for path in expected.rglob("*") if path.is_file()]
+        excluded = [*range(1, frame), 99]
+        if mode != "mtl4-hard-limit":
+            excluded.append(frame + label_frames)
+        for index in [*range(frame, frame + label_frames), *excluded]:
+            for part in range(2):
+                label = f"fp4-capture-frame-{index}-encoder-{part}".encode()
+                assert any(label in blob for blob in blobs) == (index not in excluded), (label, log)
+        if mode == "mtl4-defer":
+            assert log.count("fencepost: capture deferred: Metal 4 command buffers awaiting submission") == 1, log
+
+
+def run_cases(directory, arch, cases, repeats):
+    for run in range(repeats):
+        for index, (mode, label, options) in enumerate(cases):
+            case = directory / f"{run}-{index}"
+            case.mkdir()
+            try:
+                run_case(case, arch, mode, **options)
+            finally:
+                documents = list(case.glob("*.gputrace"))
+                if documents:
+                    subprocess.run(["trash", *documents], check=True)
+            print(f"{arch}: {label} passed ({run + 1}/{repeats})", flush=True)
 
 
 def check_cli(directory, arch):
@@ -140,6 +169,7 @@ def check_cli(directory, arch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("arch", choices=["arm64", "x86_64"])
+    parser.add_argument("--metal", choices=["3", "4"], help="run one Metal version's cases")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as scratch:
         cases = [
@@ -168,13 +198,39 @@ def main():
             cases.append(("file", "foreign-owned request ignored and logged once", {"foreign": foreign}))
         else:
             print(f"{args.arch}: skipped foreign-owned request case (no readable foreign fixture)", flush=True)
-        for index, (mode, label, options) in enumerate(cases):
-            directory = Path(scratch).resolve() / str(index)
-            directory.mkdir()
-            run_case(directory, args.arch, mode, **options)
-            print(f"{args.arch}: {label} passed", flush=True)
-        check_cli(Path(scratch), args.arch)
-    print(f"{args.arch}: capture checks passed (including CLI)")
+        root = Path(scratch).resolve()
+        if args.metal != "4":
+            run_cases(root, args.arch, cases, 1)
+            check_cli(root, args.arch)
+        if args.metal != "3":
+            if int(platform.mac_ver()[0].split(".")[0]) < 26:
+                if args.metal == "4":
+                    parser.error("Metal 4 capture checks require macOS 26 or later")
+                print(f"{args.arch}: skipped Metal 4 capture checks (requires macOS 26 or later)")
+            else:
+                metal4 = root / "metal4"
+                metal4.mkdir()
+                api = {"reason": "api-request"}
+                cases = [
+                    ("mtl4-api", "Metal 4 next-frame encoder labels", api),
+                    ("mtl4-drawable", "Metal 4 file trigger after signalDrawable:", {"reason": "file-request"}),
+                    ("mtl4-defer", "Metal 4 defers across an ended buffer on another thread and queue", api),
+                    ("mtl4-blocked", "Metal 4 gives up after three blocked frame starts", {
+                        "message": "fencepost: capture refused: Metal 4 command buffers still awaiting submission after 3 frame starts"}),
+                    ("mtl4-mixed", "mixed process starts at Metal 4 begin", api),
+                    ("mtl4-quota", "Metal 4 quota refusal", dict(api, quota=1,
+                        message="fencepost: capture refused: capture limit reached")),
+                    ("mtl4-cooldown", "Metal 4 cooldown refusal", dict(api, cooldown=600,
+                        message="fencepost: capture refused: cooldown in effect")),
+                    ("mtl4-space", "Metal 4 disk space refusal", {"min_free": 999999,
+                        "message": "fencepost: capture refused: insufficient free space on output volume"}),
+                    ("mtl4-multi", "Metal 4 two-frame encoder labels", dict(api, frames=2, label_frames=2)),
+                    ("mtl4-idle", "Metal 4 idle watchdog", dict(api, frames=2, idle_secs=1)),
+                    ("mtl4-hard-limit", "Metal 4 hard cap with continuing submissions",
+                     dict(api, frames=1000, idle_secs=2, max_secs=3)),
+                ]
+                run_cases(metal4, args.arch, cases, 3)
+    print(f"{args.arch}: capture checks passed")
 
 
 if __name__ == "__main__":
