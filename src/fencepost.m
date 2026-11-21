@@ -772,6 +772,7 @@ static uint64_t g_capture_boundary, g_capture_durations[120], g_capture_duration
 static char g_capture_reason[33];
 static int g_capture_available;              /* set once before the device hooks are installed */
 static int g_capture_busy;                   /* starting, active or stopping (g_lock) */
+static int g_capture_stopping;               /* allow one request during teardown (g_lock) */
 static unsigned g_capture_commits;           /* tracked commits still in Metal (g_lock) */
 static uint64_t g_capture_last_commit;        /* most recent submission activity (g_lock) */
 static int g_capture_mtl4, g_capture_mtl4_unsafe;  /* Metal 4 observed / tracking lost (g_lock) */
@@ -858,7 +859,7 @@ static int capture_mtl4_tracking_lost(const char *reason)
 /* Called with g_lock held. Keep the first request for the next unopened frame. */
 static void capture_request(const char *reason)
 {
-    if (!g_capture_prefix || g_capture_busy || g_capture_reason[0]) return;
+    if (!g_capture_prefix || (g_capture_busy && !g_capture_stopping) || g_capture_reason[0]) return;
     size_t n = 0;
     for (const unsigned char *p = (const unsigned char *)(reason ?: "");
          *p && *p != '\n' && *p != '\r' && n < sizeof g_capture_reason - 1; p++) {
@@ -4860,8 +4861,13 @@ static void capture_report(NSString *path, NSDictionary<NSString *, NSNumber *> 
 static void capture_stop(const char *limit)
 {
     if (!g_capture_path) return;
+    char reason[sizeof g_capture_reason];
+    /* Acknowledge file triggers from the active capture before accepting any
+     * new requests during stopCapture and the document snapshot. */
+    capture_poll_file(reason);
     pthread_mutex_lock(&g_lock);
     g_capture_generation = 0;
+    g_capture_stopping = 1;
     pthread_mutex_unlock(&g_lock);
     g_capture_deadline = 0;
     NSString *path = g_capture_path;
@@ -4876,9 +4882,10 @@ static void capture_stop(const char *limit)
     }
     uint64_t duration = g_capture_stopped - g_capture_started;
     g_capture_path = nil;
-    char ignored[sizeof g_capture_reason];
-    capture_poll_file(ignored);
+    int changed = capture_poll_file(reason);
     pthread_mutex_lock(&g_lock);
+    if (changed) capture_request(reason);
+    g_capture_stopping = 0;
     g_capture_busy = 0;
     pthread_mutex_unlock(&g_lock);
 
@@ -5004,7 +5011,10 @@ static void capture_before_cb(id owner, int mtl4)
         pthread_mutex_lock(&g_lock);
         if (changed) capture_request(reason);
         memcpy(reason, g_capture_reason, sizeof reason);
-        if (reason[0]) g_capture_busy = 1;
+        if (reason[0]) {
+            g_capture_reason[0] = 0;
+            g_capture_busy = 1;
+        }
         pthread_mutex_unlock(&g_lock);
         if (reason[0]) {
             int deferred = capture_start(owner, frame, reason);
@@ -5017,7 +5027,7 @@ static void capture_before_cb(id owner, int mtl4)
                 fp_log("fencepost: capture deferred: Metal 4 command buffers awaiting submission\n");
             else g_capture_attempts = 0;
             pthread_mutex_lock(&g_lock);
-            if (!deferred) g_capture_reason[0] = 0;
+            if (deferred) memcpy(g_capture_reason, reason, sizeof g_capture_reason);
             if (!g_capture_path) g_capture_busy = 0;
             pthread_mutex_unlock(&g_lock);
         }
@@ -7599,19 +7609,33 @@ static void hook_encoder(Class cls, int kind)
     else install(cls, kind, blit_hooks, N(blit_hooks));
 }
 
+static int capture_lock_at_exit(void)
+{
+    uint64_t deadline = trace_clock() + 100 * NSEC_PER_MSEC;
+    do {
+        int error = pthread_mutex_trylock(&g_capture_lock);
+        if (!error) return 1;
+        if (error != EBUSY) break;
+        usleep(1000);
+    } while (trace_clock() < deadline);
+    return 0;
+}
+
 static void final_summary(void)
 {
     static atomic_int once;
     if (atomic_exchange(&once, 1)) return;
-    if (g_capture_available && !pthread_mutex_trylock(&g_capture_lock)) {
+    size_t length = 0;
+    tl_log_final = open_memstream(&g_log_final, &length);
+    if (g_capture_available && capture_lock_at_exit()) {
         tl_depth++;
         capture_stop(NULL);
         tl_depth--;
         pthread_mutex_unlock(&g_capture_lock);
+    } else if (g_capture_available) {
+        fp_log("fencepost: could not acquire capture lock at exit; capture teardown skipped\n");
     }
     if (g_capture_reporter) dispatch_sync(g_capture_reporter, ^{});
-    size_t length = 0;
-    tl_log_final = open_memstream(&g_log_final, &length);
     if (g_st[ST_NODES] || g_mtl4_gpu_errors ||
         g_st[ST_ABANDONED_ENCODERS] || g_st[ST_NODE_POOL_EXHAUSTED]) summary(1);
     if (g_mtl4_ml_encoders) fp_log("fencepost: Metal 4 machine-learning encoders: %ld\n", g_mtl4_ml_encoders);

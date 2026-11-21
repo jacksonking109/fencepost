@@ -338,7 +338,8 @@ boundary once submission feedback has arrived. If fencepost cannot get feedback 
 that it will stop at the frame boundary. If the app starts another frame while feedback is pending, the
 capture can extend to its end. The idle and hard-cap timers still apply.
 
-Fencepost ignores requests while a capture is active. Open the logged
+Fencepost ignores requests while a capture is active and keeps the first request that arrives during
+teardown for the next eligible frame. The cooldown and capture limit still apply. Open the logged
 `<prefix>-<pid>-f<frame>-<reason>.gputrace` in Xcode with **File → Open**.
 
 ## How Metal 3 analysis works
