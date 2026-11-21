@@ -123,7 +123,7 @@ The median of the three per-run medians fell by 7.3% on arm64 (0.092083 to 0.085
 
 Two limits apply. The workload binds only three resources, so it can't show the per-resource tracking cost that Metal 4 removes. A translation layer with thousands of resources may gain more. The final-pixel check sees only the last draw. A scratch variant that gave each draw its own pixel (1,000 draws, both paths, both slices) found all 256 pixels correct, so Metal 4 captures argument-table bindings per draw and the two paths do the same work.
 
-**For wine-lab:** the Metal calls themselves cost about 0.14 µs per draw under Rosetta. PEAK's D3D12 replay, measured on 2026-10-09, cost about 2.4 µs per draw. So the Metal API is roughly 6% of replay cost. Even a free Metal 4 couldn't remove most of the CPU limit, which sits in the translation layer's own work. A D3D12 port's CPU cost and frame rate on Metal 4 remain unmeasured.
+**For wine-lab:** the probe spends about 0.14 µs per draw under Rosetta issuing three Metal commands. A real replay draw issues 6–12. Recent D3D12 replay measurements range from about 0.7 to 1.5 µs per draw, with PEAK at 1.5 µs. We estimate that Metal calls account for about 20–35% of per-draw replay time. Switching to Metal 4 alone offers little CPU benefit in this probe because it barely changes the cost of those calls. A D3D12 port's CPU cost and frame rate on Metal 4 remain unmeasured.
 
 ## Fencepost coexistence
 
