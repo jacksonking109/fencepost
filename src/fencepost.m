@@ -1773,6 +1773,7 @@ static void trace_recycle_node(uint64_t uid)
     fp_trace_cb *c = e->cb;
     fp_trace_chunk *chunk = e->span.counted ? trace_chunk(e->span.frame) : NULL;
     if (chunk) chunk->outstanding--;
+    g_trace_dropped++;
     trace_discard_encoder(e);
     trace_release_cb(c);
 }
@@ -1921,9 +1922,18 @@ static void trace_cb_finish(fp_trace_cb *c)
     c->encoders = NULL;
     while (e) {
         fp_trace_encoder *next = e->next;
-        if (e->selected && node_get(e->uid)) trace_place_encoder(e);
+        if (e->selected && trace_node(e->uid)) {
+            /* Finished args survive detector-slot reuse. A pending encoder
+             * whose slot is gone cannot ever finish analysis. */
+            if (!e->args && !e->args_dropped && !node_get(e->uid)) {
+                g_trace_dropped++;
+                e->args_dropped = 1;
+            }
+            trace_place_encoder(e);
+        }
         else {
             if (e->selected) {
+                if (!e->args_dropped) g_trace_dropped++;
                 fp_trace_chunk *chunk = e->span.counted ? trace_chunk(e->span.frame) : NULL;
                 if (chunk) chunk->outstanding--;
                 trace_release_cb(c);
