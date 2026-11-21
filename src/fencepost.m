@@ -4685,20 +4685,27 @@ static NSString *capture_resource_name(NSString *entry)
     return [name substringToIndex:prefix + digits];
 }
 
-static void capture_report(NSString *path, uint64_t duration, const char *limit)
+static NSDictionary<NSString *, NSNumber *> *capture_snapshot(NSString *path)
+{
+    NSMutableDictionary<NSString *, NSNumber *> *snapshot = [[NSMutableDictionary alloc] init];
+    NSDirectoryEnumerator *entries = [NSFileManager.defaultManager enumeratorAtPath:path];
+    NSString *entry;
+    while ((entry = [entries nextObject])) {
+        NSDictionary *attrs = entries.fileAttributes;
+        if ([attrs.fileType isEqualToString:NSFileTypeRegular]) snapshot[entry] = @(attrs.fileSize);
+    }
+    return snapshot;
+}
+
+static void capture_report(NSString *path, NSDictionary<NSString *, NSNumber *> *snapshot,
+                           uint64_t duration, const char *limit)
 {
     @autoreleasepool {
-        // Measure files visible when stopCapture returns. Metal may still be writing the document.
         uint64_t size = 0;
-        NSFileManager *files = NSFileManager.defaultManager;
-        NSDirectoryEnumerator *entries = [files enumeratorAtPath:path];
         NSMutableDictionary<NSString *, NSNumber *> *sizes = [NSMutableDictionary dictionary];
         NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
-        NSString *entry;
-        while ((entry = [entries nextObject])) {
-            NSDictionary *attrs = entries.fileAttributes;
-            if (![attrs.fileType isEqualToString:NSFileTypeRegular]) continue;
-            uint64_t bytes = attrs.fileSize;
+        for (NSString *entry in snapshot) {
+            uint64_t bytes = snapshot[entry].unsignedLongLongValue;
             size += bytes;
             NSString *name = capture_resource_name(entry);
             if (name) {
@@ -4733,12 +4740,16 @@ static void capture_stop(const char *limit)
     g_capture_generation = 0;
     pthread_mutex_unlock(&g_lock);
     g_capture_deadline = 0;
+    NSString *path = g_capture_path;
+    NSDictionary *snapshot;
     @autoreleasepool {
         MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
         if (manager.isCapturing) [manager stopCapture];
+        g_capture_stopped = trace_clock();
+        /* Metal may keep writing after stopCapture. Take the visible file
+         * sizes here, while this capture still owns the gate and path. */
+        snapshot = capture_snapshot(path);
     }
-    g_capture_stopped = trace_clock();
-    NSString *path = g_capture_path;
     uint64_t duration = g_capture_stopped - g_capture_started;
     g_capture_path = nil;
     char ignored[sizeof g_capture_reason];
@@ -4748,7 +4759,8 @@ static void capture_stop(const char *limit)
     pthread_mutex_unlock(&g_lock);
 
     /* The queued block owns the snapshot. It never takes the allocation gate. */
-    dispatch_async(g_capture_reporter, ^{ capture_report(path, duration, limit); });
+    dispatch_async(g_capture_reporter, ^{ capture_report(path, snapshot, duration, limit); });
+    [snapshot release];
     [path release];
 }
 
