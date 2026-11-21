@@ -2,9 +2,76 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
+enum gate_case { GATE_NONE, GATE_RACE, GATE_REENTRANT, GATE_FAILED, GATE_TEARDOWN, GATE_TEARDOWN_FILE, GATE_FEEDBACK };
+static struct {
+    enum gate_case mode;
+    dispatch_semaphore_t enter_end, end_tracked, release_end;
+    id nested_end;
+    BOOL replay_pending, replayed, throw_commit, failed_end, requested;
+    void (*capture)(const char *);
+} gate;
+
+static void phase_wait(dispatch_semaphore_t sem)
+{
+    if (!dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC))) return;
+    fputs("capturetest: gate handshake timed out\n", stderr);
+    _exit(4);
+}
+
+static int gate_hook(const char *phase)
+{
+    if (gate.mode == GATE_RACE) {
+        if (!strcmp(phase, "before-start-gate") && !gate.requested) {
+            gate.requested = YES;
+            dispatch_semaphore_signal(gate.enter_end);
+            phase_wait(gate.end_tracked);
+        } else if (!strcmp(phase, "before-native-end") && !pthread_main_np()) {
+            dispatch_semaphore_signal(gate.end_tracked);
+            phase_wait(gate.release_end);
+        }
+    }
+    if (gate.mode == GATE_REENTRANT) {
+        if (!strcmp(phase, "start-reserved") && gate.nested_end) {
+            id cb = gate.nested_end;
+            gate.nested_end = nil;
+            gate.replay_pending = YES;
+            if (@available(macOS 26.0, *)) [(id<MTL4CommandBuffer>)cb endCommandBuffer];
+            // A nested end must unwind before any native capture can start.
+            _exit(4);
+        }
+        if (!strcmp(phase, "before-native-end") && gate.replay_pending) {
+            if (MTLCaptureManager.sharedCaptureManager.isCapturing) _exit(4);
+            gate.replay_pending = NO;
+            gate.replayed = YES;
+        }
+    }
+    if (gate.mode == GATE_FAILED) {
+        if (!strcmp(phase, "mtl4-commit") && gate.throw_commit) {
+            gate.throw_commit = NO;
+            gate.failed_end = YES;
+            @throw [NSException exceptionWithName:@"CaptureTestCommit" reason:@"injected before native commit" userInfo:nil];
+        }
+        if (!strcmp(phase, "start-reserved") && gate.failed_end) _exit(4);
+    }
+    if ((gate.mode == GATE_TEARDOWN || gate.mode == GATE_TEARDOWN_FILE) &&
+        !strcmp(phase, "stop-armed") && !gate.requested) {
+        gate.requested = YES;
+        if (gate.mode == GATE_TEARDOWN) {
+            gate.capture("Teardown Request");
+        } else {
+            FILE *request = fopen(getenv("CAPTURETEST_REQUEST_FILE") ?: "", "w");
+            if (!request) _exit(4);
+            fputs("Teardown Request\n", request);
+            if (fclose(request)) _exit(4);
+        }
+    }
+    return gate.mode == GATE_FEEDBACK && !strcmp(phase, "mtl4-feedback");
+}
 
 static int submit(id<MTLCommandBuffer> cb, id<MTLBuffer> buffer, void (*frame)(id))
 {
@@ -13,8 +80,11 @@ static int submit(id<MTLCommandBuffer> cb, id<MTLBuffer> buffer, void (*frame)(i
     [enc fillBuffer:buffer range:NSMakeRange(0, buffer.length) value:42];
     [enc endEncoding];
     if (frame) frame(cb);
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) { dispatch_semaphore_signal(done); }];
     [cb commit];
-    [cb waitUntilCompleted];
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC))) return 0;
+    dispatch_release(done);
     if (cb.status == MTLCommandBufferStatusCompleted) return 1;
     fprintf(stderr, "capturetest: %s\n", cb.error.localizedDescription.UTF8String ?: "command buffer failed");
     return 0;
@@ -44,7 +114,7 @@ static BOOL mtl4_setup(id<MTLDevice> device, struct mtl4_fixture *f)
 }
 
 API_AVAILABLE(macos(26.0))
-static BOOL mtl4_encode(struct mtl4_fixture f, NSUInteger index, void (*frame)(id))
+static BOOL mtl4_record(struct mtl4_fixture f, NSUInteger index, void (*frame)(id))
 {
     [f.allocator reset];
     if (index % 2) [f.cb beginCommandBufferWithAllocator:f.allocator];
@@ -61,6 +131,13 @@ static BOOL mtl4_encode(struct mtl4_fixture f, NSUInteger index, void (*frame)(i
         [encoder endEncoding];
     }
     if (frame) frame(f.cb);
+    return YES;
+}
+
+API_AVAILABLE(macos(26.0))
+static BOOL mtl4_encode(struct mtl4_fixture f, NSUInteger index, void (*frame)(id))
+{
+    if (!mtl4_record(f, index, frame)) return NO;
     [f.cb endCommandBuffer];
     return YES;
 }
@@ -88,8 +165,75 @@ static BOOL wait_capture_stop(MTLCaptureManager *manager)
 }
 
 API_AVAILABLE(macos(26.0))
+static int run_gate(id<MTLDevice> device, void (*frame)(id), void (*capture)(const char *))
+{
+    struct mtl4_fixture main = {0}, held = {0};
+    if (!mtl4_setup(device, &main) || !mtl4_setup(device, &held) ||
+        !mtl4_record(held, 99, NULL) || !mtl4_encode(main, 1, frame) || !mtl4_submit(main)) return 2;
+    MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
+    dispatch_group_t worker = NULL;
+    if (gate.mode == GATE_RACE) {
+        gate.enter_end = dispatch_semaphore_create(0);
+        gate.end_tracked = dispatch_semaphore_create(0);
+        gate.release_end = dispatch_semaphore_create(0);
+        worker = dispatch_group_create();
+        dispatch_group_async(worker, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            @autoreleasepool {
+                phase_wait(gate.enter_end);
+                [held.cb endCommandBuffer];
+            }
+        });
+    } else if (gate.mode == GATE_REENTRANT) {
+        gate.nested_end = held.cb;
+    } else {
+        [held.cb endCommandBuffer];
+        gate.throw_commit = YES;
+        @try {
+            [held.queue commit:&held.cb count:1];
+            return 3;
+        } @catch (NSException *exception) {
+            if (![exception.name isEqualToString:@"CaptureTestCommit"]) @throw;
+        }
+    }
+    capture("API Request");
+    if (!mtl4_encode(main, 2, frame) || manager.isCapturing || !mtl4_submit(main)) return 3;
+    if (worker) {
+        dispatch_semaphore_signal(gate.release_end);
+        if (dispatch_group_wait(worker, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC))) return 3;
+        dispatch_release(worker);
+        dispatch_release(gate.release_end);
+        dispatch_release(gate.end_tracked);
+        dispatch_release(gate.enter_end);
+    }
+    if (gate.mode == GATE_REENTRANT && !gate.replayed) return 3;
+    if (!mtl4_submit(held)) return 3;
+    gate.failed_end = NO;
+    if (gate.mode == GATE_REENTRANT) capture("API Request");
+    if (!mtl4_encode(main, 3, frame) || !manager.isCapturing || !mtl4_submit(main)) return 3;
+    return wait_capture_stop(manager) ? 0 : 3;
+}
+
+API_AVAILABLE(macos(26.0))
+static int run_mixed_metal3(id<MTLDevice> device, void (*frame)(id), void (*capture)(const char *))
+{
+    id<MTL4CommandQueue> metal4 = [[device newMTL4CommandQueue] autorelease];
+    id<MTLCommandQueue> metal3 = [[device newCommandQueue] autorelease];
+    id<MTLBuffer> buffer = [[device newBufferWithLength:4096 options:MTLResourceStorageModeShared] autorelease];
+    id<MTLCommandBuffer> first = [metal3 commandBuffer];
+    if (!metal4 || !first || !buffer || !submit(first, buffer, frame)) return 2;
+    capture("API Request");
+    id<MTLCommandBuffer> second = [metal3 commandBuffer];
+    MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
+    if (!second || !manager.isCapturing || !submit(second, buffer, frame)) return 3;
+    return wait_capture_stop(manager) ? 0 : 3;
+}
+
+API_AVAILABLE(macos(26.0))
 static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), void (*capture)(const char *))
 {
+    if (gate.mode == GATE_RACE || gate.mode == GATE_REENTRANT || gate.mode == GATE_FAILED)
+        return run_gate(device, frame, capture);
+    if (!strcmp(mode, "mtl4-mixed-metal3")) return run_mixed_metal3(device, frame, capture);
     BOOL discard = !strcmp(mode, "mtl4-discard");
     BOOL defer = !strcmp(mode, "mtl4-defer") || discard, blocked = !strcmp(mode, "mtl4-blocked");
     BOOL mixed = !strcmp(mode, "mtl4-mixed"), quota = !strcmp(mode, "mtl4-quota");
@@ -155,8 +299,15 @@ static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), v
     }
 
     NSUInteger first_frame = defer ? 3 : blocked ? 5 : 2;
-    if (!mtl4_encode(main, first_frame, frame) || manager.isCapturing != !(blocked || space) || !mtl4_submit(main))
+    if (!mtl4_encode(main, first_frame, frame) || manager.isCapturing != !(blocked || space))
         return 3;
+    if (gate.mode == GATE_FEEDBACK) {
+        id<MTLSharedEvent> done = [[device newSharedEvent] autorelease];
+        if (!done) return 2;
+        [main.queue commit:&main.cb count:1];
+        [main.queue signalEvent:done value:1];
+        if (![done waitUntilSignaledValue:1 timeoutMS:5000]) return 3;
+    } else if (!mtl4_submit(main)) return 3;
     if (multi) {
         if (!manager.isCapturing || !mtl4_encode(main, 3, frame) || !mtl4_submit(main)) return 3;
     }
@@ -186,13 +337,26 @@ int main(int argc, char **argv)
         int idle = !strcmp(mode, "idle"), slow = !strcmp(mode, "slow-frame");
         int hardLimit = !strcmp(mode, "hard-limit");
         int mtl4 = !strncmp(mode, "mtl4-", 5);
+        if (!strcmp(mode, "mtl4-end-race")) gate.mode = GATE_RACE;
+        if (!strcmp(mode, "mtl4-reentrant-end")) gate.mode = GATE_REENTRANT;
+        if (!strcmp(mode, "mtl4-failed-commit")) gate.mode = GATE_FAILED;
+        if (!strcmp(mode, "mtl4-feedback-fallback")) gate.mode = GATE_FEEDBACK;
+        if (!strcmp(mode, "teardown-api")) gate.mode = GATE_TEARDOWN;
+        if (!strcmp(mode, "teardown-file")) gate.mode = GATE_TEARDOWN_FILE;
+        BOOL teardown = gate.mode == GATE_TEARDOWN || gate.mode == GATE_TEARDOWN_FILE;
         if (!mtl4 && !file && !emptyFile && !wrongPid && !noFrame && !api && !exitActive && !appCapture &&
-            !multi && !idle && !slow && !hardLimit) return 2;
+            !multi && !idle && !slow && !hardLimit && !teardown) return 2;
 
         void (*frame)(id) = dlsym(RTLD_DEFAULT, "fencepost_frame");
         void (*capture)(const char *) = dlsym(RTLD_DEFAULT, "fencepost_capture");
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device || !frame || !capture) return 2;
+        if (gate.mode != GATE_NONE) {
+            void (*set_hook)(int (*)(const char *)) = dlsym(RTLD_DEFAULT, "fencepost_test_capture_hook");
+            if (!set_hook) return 2;
+            gate.capture = capture;
+            set_hook(gate_hook);
+        }
         if (mtl4) {
             if (@available(macOS 26.0, *)) return run_mtl4(mode, device, frame, capture);
             return 2;
@@ -236,6 +400,12 @@ int main(int argc, char **argv)
             capture("Ignore While Active");
         }
         if (!submit(second, buffer, noFrame || slow ? NULL : frame)) return 1;
+        if (teardown) {
+            if (!gate.requested || manager.isCapturing) return 3;
+            id<MTLCommandBuffer> third = [queue commandBuffer];
+            if (!third || !manager.isCapturing || !submit(third, buffer, frame) || manager.isCapturing) return 3;
+            return 0;
+        }
         if (slow) {
             /* Frame 2 takes more than 2 s, but commits arrive every 750 ms. */
             for (int i = 0; i < 4; i++) @autoreleasepool {

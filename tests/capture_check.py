@@ -15,7 +15,8 @@ DISABLED = "fencepost: FENCEPOST_CAPTURE needs MTL_CAPTURE_ENABLED=1 at launch; 
 
 
 def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_secs=10, max_secs=120,
-             quota=3, cooldown=0, reason=None, message=None, foreign=None, targeted=False, label_frames=1):
+             quota=3, cooldown=0, reason=None, message=None, foreign=None, targeted=False, label_frames=1,
+             hooks=False):
     prefix = directory / "capture"
     request = directory / "request"
     if foreign is None:
@@ -24,7 +25,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
         request.symlink_to(foreign)
         message = f"fencepost: ignoring request file owned by another user: {request}"
     knobs = {
-        "DYLD_INSERT_LIBRARIES": ROOT / "out/libfencepost.dylib",
+        "DYLD_INSERT_LIBRARIES": ROOT / "out" / ("libfencepost-testhooks.dylib" if hooks else "libfencepost.dylib"),
         "FENCEPOST_CAPTURE": prefix,
         "FENCEPOST_CAPTURE_FILE": request,
         "FENCEPOST_CAPTURE_MIN_FREE_GB": min_free,
@@ -39,6 +40,8 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     app_trace = directory / "application.gputrace"
     if mode == "app-capture":
         knobs["CAPTURETEST_APP_TRACE"] = app_trace
+    if mode == "teardown-file":
+        knobs["CAPTURETEST_REQUEST_FILE"] = request
     env = {key: value for key, value in os.environ.items()
            if key != "MTL_CAPTURE_ENABLED" and not key.startswith(("FENCEPOST_", "DYLD_"))}
     command = ["arch", "-" + arch]
@@ -69,7 +72,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
                 elif targeted or mode == "wrong-pid":
                     cli = ["arch", "-" + arch, ROOT / "out/fencepost-trigger", "--capture", "--file", request]
                     pid = test.pid if targeted else 1
-                    subprocess.run([*cli, "File Request", "--pid", str(pid)], env=env, check=True)
+                    subprocess.run([*cli, "File Request", "--pid", str(pid)], env=env, check=True, timeout=15)
                     if mode == "wrong-pid":
                         stamp = request.stat().st_mtime_ns
                         test.stdin.write("\n")
@@ -77,13 +80,13 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
                         assert select.select([test.stdout], [], [], 15)[0], "targeted request was not polled"
                         assert test.stdout.readline() == "request polled\n"
                         # A broadcast at the ignored PID request's mtime must also be ignored.
-                        subprocess.run([*cli, "Same Stamp"], env=env, check=True)
+                        subprocess.run([*cli, "Same Stamp"], env=env, check=True, timeout=15)
                         os.utime(request, ns=(stamp, stamp))
                         test.stdin.write("\n")
                         test.stdin.flush()
                         assert select.select([test.stdout], [], [], 15)[0], "same-mtime request was not polled"
                         assert test.stdout.readline() == "same mtime polled\n"
-                        subprocess.run([*cli, "Later Broadcast"], env=env, check=True)
+                        subprocess.run([*cli, "Later Broadcast"], env=env, check=True, timeout=15)
                 elif foreign is None:
                     stamp = request.stat().st_mtime_ns
                     request.write_text("File Request\nignored second line\n")
@@ -103,7 +106,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
         finally:
             if test.poll() is None:
                 test.kill()
-                test.wait()
+                test.wait(timeout=5)
 
     captures = list(directory.glob("capture-*.gputrace"))
     if mode == "app-capture":
@@ -115,15 +118,25 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
     if reason is None:
         assert not captures and not starts and not stops, (captures, log)
         return
-    frame = {"empty-file": 3, "wrong-pid": 4, "mtl4-defer": 3, "mtl4-discard": 3, "mtl4-drawable": 3}.get(mode, 2)
-    expected = directory / f"capture-{test.pid}-f{frame}-{reason}.gputrace"
-    assert captures == [expected] and expected.is_dir(), (captures, log)
-    size = sum(path.stat().st_size for path in expected.rglob("*") if path.is_file())
-    assert size >= 4096, (size, log)
-    assert starts == [f"fencepost: capturing frame {frame} ({reason}) -> {expected}"], log
+    next_frame = {"empty-file", "mtl4-defer", "mtl4-discard", "mtl4-drawable", "mtl4-end-race",
+                  "mtl4-reentrant-end", "mtl4-failed-commit"}
+    frame = 4 if mode == "wrong-pid" else 3 if mode in next_frame else 2
+    recordings = [(frame, reason)]
+    if mode.startswith("teardown-"):
+        recordings.append((3, "teardown-request"))
+    documents = [directory / f"capture-{test.pid}-f{number}-{label}.gputrace" for number, label in recordings]
+    assert set(captures) == set(documents), (captures, log)
+    assert starts == [f"fencepost: capturing frame {number} ({label}) -> {doc}"
+                      for (number, label), doc in zip(recordings, documents)], log
     suffix = {"idle": r" \(idle limit\)", "hard-limit": r" \(time limit\)"}.get(mode.removeprefix("mtl4-"), "")
-    assert len(stops) == 1 and re.fullmatch(
-        rf"fencepost: capture written {re.escape(str(expected))}, \d+\.\d{{2}} MB, \d+\.\d s{suffix}", stops[0]), log
+    assert len(stops) == len(documents), log
+    for doc, stop in zip(documents, stops):
+        assert doc.is_dir(), (doc, log)
+        size = sum(path.stat().st_size for path in doc.rglob("*") if path.is_file())
+        assert size >= 4096, (size, log)
+        assert re.fullmatch(
+            rf"fencepost: capture written {re.escape(str(doc))}, \d+\.\d{{2}} MB, \d+\.\d s{suffix}", stop), log
+    expected = documents[0]
     if mode == "slow-frame":
         assert "fencepost:   frames: 2;" in log, log
     if mode == "api":
@@ -131,7 +144,7 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
         assert len(snapshots) == 1, (snapshots, log)
         name = re.fullmatch(r"(MTLBuffer-\d+)-\d+", snapshots[0].name)
         assert name and f"fencepost: largest: {name[1]} 8 MB in 1 snapshots" in log.splitlines(), log
-    if mode.startswith("mtl4-") and not drawable:
+    if mode.startswith("mtl4-") and not drawable and mode != "mtl4-mixed-metal3":
         blobs = [path.read_bytes() for path in expected.rglob("*") if path.is_file()]
         excluded = [*range(1, frame), 99]
         if mode != "mtl4-hard-limit":
@@ -140,8 +153,10 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
             for part in range(2):
                 label = f"fp4-capture-frame-{index}-encoder-{part}".encode()
                 assert any(label in blob for blob in blobs) == (index not in excluded), (label, log)
-        if mode in {"mtl4-defer", "mtl4-discard"}:
+        if mode in {"mtl4-defer", "mtl4-discard", "mtl4-end-race", "mtl4-failed-commit"}:
             assert log.count("fencepost: capture deferred: Metal 4 command buffers awaiting submission") == 1, log
+    if mode == "mtl4-failed-commit":
+        assert log.count("fencepost: Metal 4 commit failed; capture gate held until pending buffers drain") == 1, log
 
 
 def run_cases(directory, arch, cases, repeats):
@@ -154,7 +169,7 @@ def run_cases(directory, arch, cases, repeats):
             finally:
                 documents = list(case.glob("*.gputrace"))
                 if documents:
-                    subprocess.run(["trash", *documents], check=True)
+                    subprocess.run(["trash", *documents], check=True, timeout=15)
             print(f"{arch}: {label} passed ({run + 1}/{repeats})", flush=True)
 
 
@@ -162,7 +177,8 @@ def check_cli(directory, arch):
     request = directory / "capture.request"
     timeline = directory / "timeline.request"
     env = dict(os.environ, FENCEPOST_CAPTURE_FILE=str(request), FENCEPOST_TRIGGER_FILE=str(timeline))
-    subprocess.run(["arch", "-" + arch, ROOT / "out/fencepost-trigger", "--capture", "cli"], env=env, check=True)
+    subprocess.run(["arch", "-" + arch, ROOT / "out/fencepost-trigger", "--capture", "cli"],
+                   env=env, check=True, timeout=15)
     assert request.read_bytes() == b"cli\n" and not timeline.exists()
 
 
@@ -190,6 +206,10 @@ def main():
             ("hard-limit", "hard cap stops capture while frames continue",
              {"reason": "api-request", "frames": 1000, "idle_secs": 2, "max_secs": 3}),
             ("exit-active", "exit during a multi-frame capture", {"reason": "api-request", "frames": 3}),
+            ("teardown-api", "API request during teardown is captured on the next frame",
+             {"reason": "api-request", "hooks": True}),
+            ("teardown-file", "file request during teardown is captured on the next frame",
+             {"reason": "api-request", "hooks": True}),
             ("app-capture", "app-owned capture left running", {
                 "message": "fencepost: capture refused: Metal capture already running"}),
         ]
@@ -211,14 +231,23 @@ def main():
                 metal4 = root / "metal4"
                 metal4.mkdir()
                 api = {"reason": "api-request"}
+                gate = dict(api, hooks=True)
                 cases = [
                     ("mtl4-api", "Metal 4 next-frame encoder labels", api),
                     ("mtl4-drawable", "Metal 4 file trigger after signalDrawable:", {"reason": "file-request"}),
                     ("mtl4-defer", "Metal 4 defers across an ended buffer on another thread and queue", api),
                     ("mtl4-discard", "Metal 4 starts after an ended buffer is discarded", api),
+                    ("mtl4-end-race", "end registers while a capture start approaches the gate", gate),
+                    ("mtl4-reentrant-end", "same-thread Metal 4 end interrupts start before entering Metal", dict(gate,
+                        message="fencepost: capture refused: Metal 4 end reentered capture start")),
+                    ("mtl4-failed-commit", "Metal 4 commit exception holds the gate until successful retry", dict(gate,
+                        message="fencepost: Metal 4 capture gate recovered after failed commit")),
                     ("mtl4-blocked", "Metal 4 gives up after three blocked frame starts", {
                         "message": "fencepost: capture refused: Metal 4 command buffers still awaiting submission after 3 frame starts"}),
                     ("mtl4-mixed", "mixed process starts at Metal 4 begin", api),
+                    ("mtl4-mixed-metal3", "mixed process starts at Metal 3 allocation", api),
+                    ("mtl4-feedback-fallback", "missing Metal 4 feedback stops at the frame boundary", dict(gate,
+                        message="fencepost: capture feedback unavailable for a submission; stopping at the frame boundary")),
                     ("mtl4-quota", "Metal 4 quota refusal", dict(api, quota=1,
                         message="fencepost: capture refused: capture limit reached")),
                     ("mtl4-cooldown", "Metal 4 cooldown refusal", dict(api, cooldown=600,

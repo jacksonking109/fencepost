@@ -793,6 +793,17 @@ static dispatch_queue_t g_capture_reporter;
 static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 static void capture_feedback_done(uint64_t generation, int failed);
 
+#ifdef FENCEPOST_TEST_HOOKS
+static int (*g_capture_test_hook)(const char *phase);
+__attribute__((visibility("default"))) void fencepost_test_capture_hook(int (*hook)(const char *))
+{
+    g_capture_test_hook = hook;
+}
+#define CAPTURE_TEST(phase) (g_capture_test_hook ? g_capture_test_hook(phase) : 0)
+#else
+#define CAPTURE_TEST(phase) 0
+#endif
+
 typedef struct {
     NSMutableArray *ends;
     const char *refusal;
@@ -4722,6 +4733,7 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
         /* Reserve the transition under the same lock as end and commit.
          * A commit removes ended identities at entry but holds the in-Metal
          * count until it returns. End cannot enter Metal during this start. */
+        (void)CAPTURE_TEST("before-start-gate");
         pthread_mutex_lock(&g_lock);
         int unsafe = g_capture_mtl4_unsafe;
         int blocked = g_capture_mtl4_ended || (g_capture_mtl4 && g_capture_commits);
@@ -4739,6 +4751,7 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
         int depth = tl_depth;
         @try {
             tl_capture_start = &start;
+            (void)CAPTURE_TEST("start-reserved");
             started = [manager startCaptureWithDescriptor:desc error:&error];
         } @catch (NSException *exception) {
             threw = YES;
@@ -4869,6 +4882,7 @@ static void capture_stop(const char *limit)
     g_capture_generation = 0;
     g_capture_stopping = 1;
     pthread_mutex_unlock(&g_lock);
+    (void)CAPTURE_TEST("stop-armed");
     g_capture_deadline = 0;
     NSString *path = g_capture_path;
     NSDictionary *snapshot;
@@ -5369,13 +5383,16 @@ static void h_mtl4_end(id self, SEL _cmd)
              * but unwind before native end: Metal may still be activating the
              * capture layer. If Metal catches this exception and starts anyway,
              * capture_start stops it before replaying any native ends. */
+            const char *reason = "Metal 4 end reentered capture start";
+            tl_capture_start->refusal = reason;
             if (!tl_capture_start->ends) tl_capture_start->ends = [[NSMutableArray alloc] init];
             if ([tl_capture_start->ends indexOfObjectIdenticalTo:self] == NSNotFound)
                 [tl_capture_start->ends addObject:self];
             LEAVE;
-            capture_interrupt_start("Metal 4 end reentered capture start");
+            capture_interrupt_start(reason);
         }
     }
+    (void)CAPTURE_TEST("before-native-end");
     ORIG(H_4_END, void (*)(id, SEL))(self, _cmd);
     LEAVE;
     if (!OUTER) return;
@@ -6401,10 +6418,26 @@ static void trace_mtl4_abandon_samples(id cb)
     for (fp_trace_encoder *e = owner->record->encoders; e; e = e->next) e->sample = -1;
 }
 
-static void trace_mtl4_untracked_commit(const id *buffers, NSUInteger count)
+static void mtl4_untracked_commit(const id *buffers, NSUInteger count, int capture_tracked, int trace_samples)
 {
+    if (!capture_tracked && !trace_samples) return;
     pthread_mutex_lock(&g_lock);
-    for (NSUInteger i = 0; i < count; i++) trace_mtl4_abandon_samples(buffers[i]);
+    for (NSUInteger i = 0; i < count; i++) {
+        if (trace_samples) trace_mtl4_abandon_samples(buffers[i]);
+        if (!capture_tracked || !g_frame_api) continue;
+        fp_cb *c = cb_find_open((void *)buffers[i]);
+        if (!c || !c->mtl4 || c->state != 2) continue;
+        /* The detector normally consumes explicit boundaries in phase1.
+         * Preserve them on the native fallback and remove them so forwarding
+         * or a retry cannot count them again. Capture publishes after commit. */
+        int kept = 0;
+        for (int j = 0; j < c->nit; j++) {
+            fp_item item = c->it[j];
+            if (item.type == 4) frame_boundary(item.val, NULL);
+            else c->it[kept++] = item;
+        }
+        c->nit = kept;
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -6623,6 +6656,9 @@ typedef struct {
 static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, uint64_t *generation,
                                fp_capture_submit *submit)
 {
+    /* A caller that catches the interruption cannot submit a deferred end
+     * while Metal is still inside startCapture. */
+    if (tl_capture_start && tl_capture_start->refusal) capture_interrupt_start(tl_capture_start->refusal);
     if (!g_capture_available || !buffers || !count) return 0;
     pthread_mutex_lock(&g_lock);
     int tracked = outer;
@@ -6692,8 +6728,9 @@ static void h_mtl4_app_feedback(id self, SEL _cmd, void (^handler)(id))
 
 API_AVAILABLE(macos(26.0))
 static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUInteger count, id app_options,
-                                             uint64_t capture_generation)
+                                             uint64_t capture_generation, int capture_tracked)
 {
+    if (capture_generation && CAPTURE_TEST("mtl4-feedback")) return nil;
     FPMTL4Callbacks *callbacks = app_options ? objc_getAssociatedObject(app_options, &g_mtl4_callbacks_key) : nil;
     if (app_options && !callbacks) return nil;
     MTL4CommitOptions *opts = [[g_mtl4_options_class alloc] init];
@@ -6717,7 +6754,7 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
             if (capture_generation || (g_capture_on & CAP_GPU_ERROR))
                 capture_feedback_done(capture_generation, feedback.error != nil);
         }];
-    if (!submission && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
+    if (!submission) mtl4_untracked_commit(buffers, count, capture_tracked, g_trace_enabled && g_trace_gpu);
     for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
     [blocks release];
     capture_feedback_attached(capture_generation);
@@ -6729,19 +6766,21 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
     ENTER;
     uint64_t generation = 0;
     fp_capture_submit submit = {0};
-    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit), returned = 0;
+    int tracked = 0, returned = 0;
     id opts = nil;
     @try {
+        tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit);
+        if (OUTER) (void)CAPTURE_TEST("mtl4-commit");
         if (OUTER) {
             if (@available(macOS 26.0, *)) {
                 if (count && [self respondsToSelector:@selector(commit:count:options:)])
-                    opts = mtl4_submit_options(self, buffers, count, nil, generation);
+                    opts = mtl4_submit_options(self, buffers, count, nil, generation, tracked);
                 if (opts)
                     [(id<MTL4CommandQueue>)self commit:(const id<MTL4CommandBuffer> *)buffers count:count options:opts];
             }
         }
         if (!opts) {
-            if (OUTER && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
+            mtl4_untracked_commit(buffers, count, tracked, OUTER && g_trace_enabled && g_trace_gpu);
             ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
         }
         returned = 1;
@@ -6759,13 +6798,15 @@ static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger 
     ENTER;
     uint64_t generation = 0;
     fp_capture_submit submit = {0};
-    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit), returned = 0;
+    int tracked = 0, returned = 0;
     id opts = nil;
     @try {
+        tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit);
+        if (OUTER) (void)CAPTURE_TEST("mtl4-commit");
         if (OUTER && (options || generation)) {
-            if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options, generation);
+            if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options, generation, tracked);
         }
-        if (OUTER && !opts && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
+        if (!opts) mtl4_untracked_commit(buffers, count, tracked, OUTER && g_trace_enabled && g_trace_gpu);
         ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, opts ?: options);
         returned = 1;
     } @finally {
