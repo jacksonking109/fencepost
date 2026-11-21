@@ -24,6 +24,8 @@ WHY = {
     "compiler-race": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "load-late": "queue barrier Fragment -> Fragment does not order Fragment -> Fragment",
     "load-fence-late": "no Metal 4 ordering covers Fragment -> Fragment",
+    "load-fence-before": "no Metal 4 ordering covers Fragment -> Fragment",
+    "load-producer-before": "queue barrier Fragment -> Fragment does not order Fragment -> Fragment",
     "consumer-intervening": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-empty": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-before-blit": "no Metal 4 ordering covers Dispatch -> Dispatch",
@@ -82,7 +84,7 @@ def check_run(arch, directory, program, mode, env, run_index, baseline, **extra)
         assert summary["accesses"] == 4, summary
     if mode == "placement":
         assert summary["accesses"] == 3, summary
-    if mode in ("load-late", "load-fence-late"):
+    if mode in ("load-late", "load-fence-late", "load-fence-before", "load-producer-before"):
         assert "  second: " in result.stderr and "attachment load" in result.stderr, result.stderr
     if mode == "order":
         assert "Blit -> Blit is unordered" in result.stderr, result.stderr
@@ -101,7 +103,8 @@ def check_suite(arch, directory):
                  "color-vertex", "mutate", "disjoint", "overlap", "placement", "order", "partial",
                  "const-shared", "fragment-only", "fragment-vertex", "reflect-app", "compiler-race",
                  "load-early", "load-late", "load-fence-early", "load-fence-late", "load-fence-drawless",
-                 "load-fence-multiple", "load-producer", "consumer-buffer", "consumer-buffers", "consumer-commits",
+                 "load-fence-multiple", "load-fence-before", "load-producer", "load-producer-before",
+                 "consumer-buffer", "consumer-buffers", "consumer-commits",
                  "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence",
                  "copy-compute", "copy-compute-async", "copy-render", "copy-render-async", "rw-texture"):
         check_case(arch, directory, "mtl4races", mode, env)
@@ -126,4 +129,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 45 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 47 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")

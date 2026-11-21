@@ -136,7 +136,7 @@ typedef struct fp_node {
     int bar_idx;
     uint64_t frame, queue_seq, chain_prev;   /* chain_prev: earlier node on the longest ordered chain */
     uint32_t depth;                 /* encoders on that chain within the frame, this one included */
-    uint32_t mtl4_epoch, mtl4_work, mtl4_store_epoch;
+    uint32_t mtl4_epoch, mtl4_work, mtl4_store_epoch, mtl4_draw_epoch;
     uint32_t mtl4_first[FP4_STAGE_COUNT], mtl4_last[FP4_STAGE_COUNT];
     uint64_t mtl4_previous;
     fp4_sync *mtl4_sync; int mtl4_nsync, mtl4_csync;
@@ -279,7 +279,7 @@ static fp_node *node_new(int kind)   /* lock held */
     memset(n->mtl4_tables, 0, sizeof n->mtl4_tables);
     n->mtl4_pipeline = nil; n->mtl4_pipeline_object = NULL; n->mtl4_pipeline_serial = 0;
     memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
-    n->mtl4_epoch = 1; n->mtl4_work = 0; n->mtl4_store_epoch = 0;
+    n->mtl4_epoch = 1; n->mtl4_work = 0; n->mtl4_store_epoch = 0; n->mtl4_draw_epoch = 0;
     n->mtl4_previous = 0; n->mtl4_nsync = 0; n->mtl4_nwork_epochs = 0;
     free(n->mtl4_prefixes); n->mtl4_prefixes = NULL;
     memset(n->mtl4_first, 0, sizeof n->mtl4_first);
@@ -2446,6 +2446,14 @@ static uint32_t fp4_last_work_before(const fp_node *n, int stage, uint32_t epoch
     return 0;
 }
 
+/* A Fragment update or producer barrier covers a render pass's attachment stores only
+ * when no draw is encoded after it: the stores run at the end of the pass. Sync
+ * operations are work for chaining, so only draws set mtl4_draw_epoch. */
+static int fp4_store_after(const fp_node *n, uint32_t epoch)
+{
+    return n->mtl4_store_epoch > epoch && n->mtl4_draw_epoch <= epoch;
+}
+
 static void fp4_push_visit(fp_node *n, unsigned mask, uint32_t epoch, int include_stores)
 {
     if (n->kind == FPK_SIGNAL) {
@@ -2456,7 +2464,7 @@ static void fp4_push_visit(fp_node *n, unsigned mask, uint32_t epoch, int includ
     mask &= n->mtl4_work;
     /* A render update/producer barrier covers attachment stores at pass end without
      * moving its cutoff for ordinary commands encoded after it. */
-    if (include_stores && (mask & FP4_STAGE(FP4_FRAGMENT)) && n->mtl4_store_epoch > epoch)
+    if (include_stores && (mask & FP4_STAGE(FP4_FRAGMENT)) && fp4_store_after(n, epoch))
         fp4_visit_work(n, FP4_FRAGMENT, n->mtl4_store_epoch, 1);
     while (mask) {
         int stage = __builtin_ctz(mask);
@@ -2472,7 +2480,8 @@ static int fp4_walk_prefix(const fp_node *dst, fp4_prefix prefix, unsigned after
     if (!prefix.uid) return 0;
     if (dst->req_q == from->req_q && (after & FP4_STAGE(from_stage)) &&
         (from->queue_seq < prefix.seq || (from->queue_seq == prefix.seq &&
-         (from_epoch <= prefix.epoch || (from_stage == FP4_FRAGMENT && from_epoch == from->mtl4_store_epoch)))))
+         (from_epoch <= prefix.epoch || (from_stage == FP4_FRAGMENT &&
+          from_epoch == from->mtl4_store_epoch && fp4_store_after(from, prefix.epoch))))))
         return 1;
 
     uint32_t epoch = prefix.epoch;
@@ -3667,6 +3676,7 @@ static void fp4_capture_tables(id encoder, unsigned stages)
     if (!n || !n->mtl4) return;
     if (!n->mtl4_drawn && n->kind == FPK_RENDER) fp4_note_attachment_loads(n);
     n->mtl4_drawn = 1;
+    if (n->kind == FPK_RENDER) n->mtl4_draw_epoch = n->mtl4_epoch;   /* the last draw, not sync work */
     while (stages) {
         int stage = __builtin_ctz(stages);
         unsigned together = FP4_STAGE(stage);
@@ -5335,7 +5345,9 @@ static unsigned fp4_stage_mask(NSUInteger mask)
  *   the attachment loads and stores (in its before stages, attachments being Fragment);
  * - one encoded after a draw does not cover the loads, but does cover the stores.
  * Loads take the first draw's epoch (the final epoch on a drawless pass). Stores take the
- * final epoch. Fence operations are also work for chaining through a covered stage. */
+ * final epoch. A Fragment update or producer barrier covers the stores only when it is
+ * encoded after the pass's last draw; one before or between draws covers neither them nor
+ * later draws. Fence operations are also work for chaining through a covered stage. */
 static void fp4_record_sync(id encoder, int kind, id fence, NSUInteger after, NSUInteger before)
 {
     fp_node *n = cur_node(encoder);
