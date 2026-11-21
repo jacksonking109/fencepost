@@ -476,6 +476,7 @@ static fp_frame *frame_get(uint64_t f);
 /* ---------------------------------------------------------------- timeline (lock held unless noted) */
 
 #define FP_TRACE_SAMPLES 4096     /* 32 KiB of timestamps, the Apple GPU limit */
+#define FP_TRACE_GPU_SLACK_NS 1000000
 #define FP_TRACE_MARKERS 20000
 #define FP_TRACE_RESERVE 4096
 #define FP_TRACE_ATTACHMENTS 4
@@ -1238,9 +1239,38 @@ static void trace_resolve(fp_trace_encoder *e)
     double start = d->first.cpu + ((int64_t)r[0].timestamp - (int64_t)d->first.gpu) * scale;
     double end = d->first.cpu + ((int64_t)r[1].timestamp - (int64_t)d->first.gpu) * scale;
     /* Reject stale samples and counter clock discontinuities. Leave room for calibration error. */
-    if (start < (double)e->cb->gpu_start - 1000000 || end > (double)e->cb->gpu_end + 1000000
+    if (start < (double)e->cb->gpu_start - FP_TRACE_GPU_SLACK_NS
+            || end > (double)e->cb->gpu_end + FP_TRACE_GPU_SLACK_NS
             || start <= 0 || end <= start || !e->cb->gpu_start) return;
     e->gpu_start = (uint64_t)start; e->gpu_end = (uint64_t)end;
+}
+
+API_AVAILABLE(macos(26.0))
+static void trace_mtl4_resolve(fp_trace_encoder *e)
+{
+    fp_trace_cb *c = e->cb;
+    if (!e->sample_ended || c->gpu_end <= c->gpu_start) return;
+    id<MTL4CounterHeap> heap = c->device->heap;
+    NSData *data = [heap resolveCounterRange:NSMakeRange((NSUInteger)e->sample, 2)];
+    if (data.length != 2 * sizeof(MTL4TimestampHeapEntry)) return;
+    const MTL4TimestampHeapEntry *r = data.bytes;
+    if (!r[0].timestamp || r[1].timestamp == MTLCounterErrorValue || r[1].timestamp <= r[0].timestamp) return;
+
+    /* The heap ticks share the commit feedback clock. A recycled pair can
+     * contain old writes if this pass failed to produce either endpoint.
+     * Those writes predate CPU encoding. Don't invalidate a heap that may
+     * still be in use by another submission. */
+    double ns_per_tick = 1e9 / (double)c->device->frequency;
+    double start = (double)r[0].timestamp * ns_per_tick;
+    double end = (double)r[1].timestamp * ns_per_tick;
+    if (start < (double)e->start - ns_per_tick
+            || start < (double)c->gpu_start - FP_TRACE_GPU_SLACK_NS
+            || end > (double)c->gpu_end + FP_TRACE_GPU_SLACK_NS) return;
+    uint64_t clipped_start = (uint64_t)MAX(start, (double)c->gpu_start);
+    uint64_t clipped_end = (uint64_t)MIN(end, (double)c->gpu_end);
+    if (clipped_end <= clipped_start) return;
+    e->gpu_start = clipped_start;
+    e->gpu_end = clipped_end;
 }
 
 static void trace_discard_cb(fp_trace_cb *c);
@@ -1368,7 +1398,8 @@ static void trace_encoder_end(const fp_node *n)
     if (e) e->end = trace_clock();
 }
 
-/* Lay out the selected encoders in encode order before any links are settled. */
+/* Lay out estimates in encode order before any links are settled. Keep
+ * sampled spans at their measured times so overlapping work gets extra lanes. */
 static void trace_layout_encoders(fp_trace_cb *c)
 {
     if (!c->gpu_start || c->gpu_end <= c->gpu_start) return;
@@ -5698,7 +5729,13 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
             trace->gpu_start = (uint64_t)(start * 1e9);
             trace->gpu_end = (uint64_t)(end * 1e9);
         }
-        for (fp_trace_encoder *e = trace->encoders; e; e = e->next) trace_release_sample(e);
+        @autoreleasepool {
+            for (fp_trace_encoder *e = trace->encoders; e; e = e->next) {
+                if (e->sample < 0) continue;
+                if (e->selected && !g_trace_stopped) trace_mtl4_resolve(e);
+                trace_release_sample(e);
+            }
+        }
         trace->completed = 1;
         trace_cb_finish(trace);
     }
