@@ -275,14 +275,75 @@ static void bits_or_shift(fp_bits *dst, const fp_bits *src, uint64_t sh)
     }
 }
 
+/* Producers can hold g_lock. Only the drain touches the output fd, and it
+ * never holds the log mutex while writing. Keep the amount of queued data bounded. */
+#define FP_LOG_LINES 2048
+#define FP_LOG_LINE_BYTES 1536
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static dispatch_queue_t g_log_queue;
+static dispatch_group_t g_log_group;
+static char g_log_lines[FP_LOG_LINES][FP_LOG_LINE_BYTES];
+static unsigned g_log_head, g_log_count;
+static unsigned long long g_log_dropped;
+static int g_log_active, g_log_fd = STDERR_FILENO;
+
+static void fp_log_drain(void *unused)
+{
+    for (;;) {
+        char line[FP_LOG_LINE_BYTES];
+        pthread_mutex_lock(&g_log_lock);
+        if (g_log_count) {
+            memcpy(line, g_log_lines[g_log_head], sizeof line);
+            g_log_head = (g_log_head + 1) % FP_LOG_LINES;
+            g_log_count--;
+        } else if (g_log_dropped) {
+            snprintf(line, sizeof line, "fencepost: %llu log lines dropped while output was backed up\n", g_log_dropped);
+            g_log_dropped = 0;
+        } else {
+            g_log_active = 0;
+            dispatch_group_leave(g_log_group);
+            pthread_mutex_unlock(&g_log_lock);
+            return;
+        }
+        pthread_mutex_unlock(&g_log_lock);
+        const char *next = line;
+        size_t left = strlen(line);
+        while (left) {
+            ssize_t written = write(g_log_fd, next, left);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) break;
+            next += written;
+            left -= (size_t)written;
+        }
+    }
+}
+
 static void fp_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void fp_log(const char *fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(g_out ? g_out : stderr, fmt, ap);
-    va_end(ap);
-    fflush(g_out ? g_out : stderr);
+    pthread_mutex_lock(&g_log_lock);
+    if (g_log_count == FP_LOG_LINES) g_log_dropped++;
+    else {
+        char *line = g_log_lines[(g_log_head + g_log_count) % FP_LOG_LINES];
+        va_list ap;
+        va_start(ap, fmt);
+        int length = vsnprintf(line, FP_LOG_LINE_BYTES, fmt, ap);
+        va_end(ap);
+        if (length >= FP_LOG_LINE_BYTES) line[FP_LOG_LINE_BYTES - 2] = '\n';
+        if (length >= 0) g_log_count++;
+    }
+    if (!g_log_active && g_log_count) {
+        g_log_active = 1;
+        dispatch_group_enter(g_log_group);
+        dispatch_async_f(g_log_queue, NULL, fp_log_drain);
+    }
+    pthread_mutex_unlock(&g_log_lock);
+}
+
+static void fp_log_finish(void)
+{
+    /* Give the final report time to reach a healthy sink without waiting forever on a pipe. */
+    dispatch_group_wait(g_log_group, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
 }
 
 static fp_node *node_get(uint64_t uid)
@@ -7081,6 +7142,13 @@ static void trace_init(const char *path)
 
 __attribute__((constructor)) static void fp_init(void)
 {
+    const char *p = getenv("FENCEPOST_LOG");
+    if (p && *p) g_out = fp_open_path(p, "a");
+    if (g_out) g_log_fd = fileno(g_out);
+    g_log_queue = dispatch_queue_create("fencepost.log", DISPATCH_QUEUE_SERIAL);
+    g_log_group = dispatch_group_create();
+    atexit(fp_log_finish);
+
 #ifdef FENCEPOST_TEST_HOOKS
     g_mtl4_test_error_commit = trace_unsigned("FENCEPOST_MTL4_TEST_ERROR_COMMIT", 0);
     g_mtl4_test_reflection_fail = trace_unsigned("FENCEPOST_MTL4_TEST_REFLECTION_FAIL", 0);
@@ -7095,8 +7163,6 @@ __attribute__((constructor)) static void fp_init(void)
         }
     }
     g_spike_enabled = strcmp(getenv("FENCEPOST_SPIKE") ?: "", "0") != 0;
-    const char *p = getenv("FENCEPOST_LOG");
-    if (p && *p) g_out = fp_open_path(p, "a");
     if ((p = getenv("FENCEPOST_CAPTURE")) && *p) capture_init(p);
     if ((p = getenv("FENCEPOST_TRACE")) && *p) trace_init(p);
     if ((p = getenv("FENCEPOST_MAX_REPORTS"))) g_max_reports = atol(p);
