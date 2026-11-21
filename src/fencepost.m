@@ -725,6 +725,7 @@ static int g_capture_busy;                   /* starting, active or stopping (g_
 static unsigned g_capture_commits;           /* tracked commits still in Metal (g_lock) */
 static uint64_t g_capture_last_commit;        /* most recent submission activity (g_lock) */
 static NSString *g_capture_path;
+static dispatch_queue_t g_capture_reporter;
 /* Gate command-buffer entry during capture transitions, with tl_depth set so
  * Metal's nested hooks pass through. Never hold this across allocation or
  * commit: a full command queue can make allocation wait for another commit.
@@ -4422,20 +4423,13 @@ static NSString *capture_resource_name(NSString *entry)
     return [name substringToIndex:prefix + digits];
 }
 
-/* Keep command-buffer allocation gated until Metal has stopped recording.
- * A buffer allocated during this transition can enter the preceding capture. */
-static void capture_stop(const char *limit)
+static void capture_report(NSString *path, uint64_t duration, const char *limit)
 {
-    if (!g_capture_path) return;
-    g_capture_deadline = 0;
     @autoreleasepool {
-        MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
-        if (manager.isCapturing) [manager stopCapture];
-        g_capture_stopped = trace_clock();
         // Measure files visible when stopCapture returns. Metal may still be writing the document.
         uint64_t size = 0;
         NSFileManager *files = NSFileManager.defaultManager;
-        NSDirectoryEnumerator *entries = [files enumeratorAtPath:g_capture_path];
+        NSDirectoryEnumerator *entries = [files enumeratorAtPath:path];
         NSMutableDictionary<NSString *, NSNumber *> *sizes = [NSMutableDictionary dictionary];
         NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
         NSString *entry;
@@ -4450,8 +4444,8 @@ static void capture_stop(const char *limit)
                 counts[name] = @(counts[name].unsignedLongLongValue + 1);
             }
         }
-        fp_log("fencepost: capture written %s, %.2f MB, %.1f s%s\n", g_capture_path.fileSystemRepresentation,
-               size / 1048576.0, (g_capture_stopped - g_capture_started) / 1e9,
+        fp_log("fencepost: capture written %s, %.2f MB, %.1f s%s\n", path.fileSystemRepresentation,
+               size / 1048576.0, duration / 1e9,
                limit ?: "");
         NSArray<NSString *> *largest = [[sizes allKeys] sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
             NSComparisonResult order = [sizes[b] compare:sizes[a]];
@@ -4465,14 +4459,32 @@ static void capture_stop(const char *limit)
         if (size > 2 * 1073741824ULL)
             fp_log("fencepost: big captures come from large buffers the frame touches. "
                    "A timeline dump (⌃⌥⌘F) is the cheap alternative.\n");
-        [g_capture_path release];
-        g_capture_path = nil;
-        char ignored[sizeof g_capture_reason];
-        capture_poll_file(ignored);
-        pthread_mutex_lock(&g_lock);
-        g_capture_busy = 0;
-        pthread_mutex_unlock(&g_lock);
     }
+}
+
+/* Keep command-buffer allocation gated until Metal has stopped recording.
+ * A buffer allocated during this transition can enter the preceding capture. */
+static void capture_stop(const char *limit)
+{
+    if (!g_capture_path) return;
+    g_capture_deadline = 0;
+    @autoreleasepool {
+        MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
+        if (manager.isCapturing) [manager stopCapture];
+    }
+    g_capture_stopped = trace_clock();
+    NSString *path = g_capture_path;
+    uint64_t duration = g_capture_stopped - g_capture_started;
+    g_capture_path = nil;
+    char ignored[sizeof g_capture_reason];
+    capture_poll_file(ignored);
+    pthread_mutex_lock(&g_lock);
+    g_capture_busy = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    /* The queued block owns the snapshot. It never takes the allocation gate. */
+    dispatch_async(g_capture_reporter, ^{ capture_report(path, duration, limit); });
+    [path release];
 }
 
 /* Keep one timer per capture. Commits refresh the idle deadline without
@@ -6946,6 +6958,7 @@ static void final_summary(void)
         tl_depth--;
         pthread_mutex_unlock(&g_capture_lock);
     }
+    if (g_capture_reporter) dispatch_sync(g_capture_reporter, ^{});
     if (g_st[ST_NODES] || g_mtl4_gpu_errors) summary(1);   /* helper processes that never encoded: quiet */
     if (g_mtl4_ml_encoders) fp_log("fencepost: Metal 4 machine-learning encoders: %ld\n", g_mtl4_ml_encoders);
     if (g_trace_enabled) {
@@ -7039,6 +7052,7 @@ static void capture_init(const char *prefix)
             return;
         }
         g_capture_prefix = strdup(prefix);
+        g_capture_reporter = dispatch_queue_create("fencepost.capture-reporter", DISPATCH_QUEUE_SERIAL);
         const char *file = getenv("FENCEPOST_CAPTURE_FILE");
         char default_path[64];
         if (!file) file = capture_default_path(default_path);
