@@ -2731,14 +2731,21 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
     if (g_trace_enabled) trace_analyse(y);
 }
 
-static fp_node *first_event_signal(const fp_ev *ev, const fp_queue *queue, fp_evwait wait)
+/* The earliest signal in event history order whose value satisfies the wait. A signal
+ * whose node was recycled from the pool is at least FP_POOL nodes old, so it finished long
+ * ago: it settles the wait without an edge (*gone), like an event fencepost never saw. It
+ * must not hand the wait to a later signal, which would order the waiter after work the
+ * real (earlier) signal never covered. */
+static fp_node *first_event_signal(const fp_ev *ev, const fp_queue *queue, fp_evwait wait, int *gone)
 {
+    *gone = 0;
     if (!ev || !ev->known) return NULL;
     unsigned first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
     for (unsigned k = first; k < ev->nh; k++) {
         if (ev->h[k % FP_EVHIST].val < wait.val) continue;
         fp_node *signal = node_get(ev->h[k % FP_EVHIST].uid);
-        if (signal && (signal->req_q != queue || signal->queue_seq < wait.queue_seq)) return signal;
+        if (!signal) { *gone = 1; return NULL; }
+        if (signal->req_q != queue || signal->queue_seq < wait.queue_seq) return signal;
     }
     return NULL;
 }
@@ -2754,8 +2761,10 @@ static int ready(fp_node *n, int force)
         int done = 0;
         if (!ev || !ev->known) done = 1;   /* event made outside our view (e.g. from a mach port): CPU-side */
         else {
-            fp_node *signal = first_event_signal(ev, n->req_q, w);
+            int gone;
+            fp_node *signal = first_event_signal(ev, n->req_q, w, &gone);
             int pending_signal = signal && !signal->aseq;
+            if (gone) done = 1;
             if (signal && !pending_signal) {
                 fp_edge e = { signal->uid, 1, w.before };
                 PUSH(n->ed, n->ned, n->ced, e);
@@ -5377,7 +5386,8 @@ static void mtl4_retire_waits(fp_queue *q, uint64_t limit)
         fp_evwait wait = q->mtl4_waits[retired++];
         fp_ev *event = ev_get(wait.ev, 0);
         if (event && event->cpu_max >= wait.val) continue;
-        fp_node *signal = first_event_signal(event, q, wait);
+        int gone;
+        fp_node *signal = first_event_signal(event, q, wait, &gone);
         if (!signal || !signal->mtl4) continue;
         fp_queue *producer = signal->req_q;
         for (fp_node *p = signal; p && p->queue_seq >= producer->mtl4_event_completed_through;
@@ -6570,6 +6580,32 @@ __attribute__((visibility("default"))) int fencepost_test_wait_source(void)
     first->state = second->state = waiter->state = 0;
     pthread_mutex_unlock(&g_lock);
     return pending && selected;
+}
+
+/* The earliest satisfying signal's node was recycled: the wait settles with no edge,
+ * not with an edge to the later, analysed signal. */
+__attribute__((visibility("default"))) int fencepost_test_recycled_signal(void)
+{
+    pthread_mutex_lock(&g_lock);
+    static fp_queue producer, consumer;
+    static char event_key;
+    fp_node *later = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
+    later->req_q = &producer;
+    later->aseq = 1;
+    waiter->req_q = &consumer;
+    uint64_t recycled = later->uid > FP_POOL ? later->uid - FP_POOL : later->uid + FP_POOL;
+    fp_ev *event = ev_get(&event_key, 1);
+    event->known = event->gpu = 1;
+    event->h[0].uid = recycled; event->h[0].val = 1;
+    event->h[1].uid = later->uid; event->h[1].val = 2;
+    event->nh = 2;
+    fp_evwait wait = { &event_key, 1, 0, 0, 0 };
+    PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
+    int settled = !node_get(recycled) && ready(waiter, 0) && !waiter->ned && !waiter->nev;
+    memset(event, 0, sizeof *event);
+    later->state = waiter->state = 0;
+    pthread_mutex_unlock(&g_lock);
+    return settled;
 }
 
 __attribute__((visibility("default"))) long fencepost_test_trace_cbs(long *peak)

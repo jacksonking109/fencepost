@@ -86,7 +86,7 @@ def check_threads(arch):
 
 def check_testhooks(arch, directory, env):
     injection = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost-testhooks.dylib"}
-    for scenario in ("--wait-source", "--signal-window"):
+    for scenario in ("--wait-source", "--recycled-signal", "--signal-window"):
         subprocess.run(command(arch, injection, scenario), env=env, check=True, timeout=20)
     path = directory / "long.json"
     result = subprocess.check_output(command(arch, dict(injection, FENCEPOST_TRACE=path), "--long"),

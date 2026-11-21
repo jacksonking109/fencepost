@@ -348,6 +348,12 @@ int main(int argc, const char **argv)
             puts("cross-queue wait selected the first signal");
             return 0;
         }
+        if (argc == 2 && !strcmp(argv[1], "--recycled-signal")) {
+            int (*test_recycled)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_recycled_signal");
+            if (!test_recycled || !test_recycled()) return fail("a recycled first signal fell through to a later one");
+            puts("a recycled first signal settled the wait without an edge");
+            return 0;
+        }
         if (argc == 2 && !strcmp(argv[1], "--signal-window")) {
             int (*test_window)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_signal_window");
             if (!test_window || !test_window()) return fail("signal outside recent queue entries did not retire");
