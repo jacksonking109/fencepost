@@ -139,8 +139,8 @@ conflicts as possible races instead. fencepost requests the reflection itself wh
 
 What the app can see: a Metal 4 compiler pipeline has a non-nil `reflection` even if the app asked for none, and
 a pipeline data-set serializer records the copy's reflection option. A device-path app that asked for
-reflection without binding information also gets the bindings. A synchronous build that fails with the
-reflection request is retried as the app asked. Pipelines fencepost did not see built (binary archives, data
+reflection without binding information also gets the bindings. If the added reflection causes a build to fail,
+fencepost retries the original request for both synchronous and asynchronous calls. Pipelines fencepost did not see built (binary archives, data
 sets, device pipelines made before the first Metal 4 object) use their own reflection when Metal kept one, and
 are otherwise counted as "access unknown" in the summary. Their slots fall back to reads, or to possible writes
 with `FENCEPOST_BIND_MAYWRITE=1`.

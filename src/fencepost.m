@@ -4642,7 +4642,11 @@ static id fp4_device_sync(int h, id self, SEL cmd, id desc, NSUInteger options, 
     id local = nil, *out = reflection ? reflection : want ? &local : NULL;
     id pipeline = orig(self, cmd, desc, want ? options | MTLPipelineOptionBindingInfo : options, out, error);
     if (want && pipeline) fp4_attach_reflection(pipeline, *out);
-    else if (want) pipeline = orig(self, cmd, desc, options, reflection, error);   /* fail only as the app's call would */
+    else if (want && !(options & MTLPipelineOptionBindingInfo)) {
+        if (error) *error = nil;
+        if (reflection) *reflection = nil;
+        pipeline = orig(self, cmd, desc, options, reflection, error);
+    }
     LEAVE;
     return pipeline;
 }
@@ -4656,6 +4660,7 @@ static id fp4_device_plain(int h, id self, SEL cmd, SEL with_reflection, id desc
         pipeline = ((fp4_reflect_imp)objc_msgSend)(self, with_reflection, desc, MTLPipelineOptionBindingInfo,
                                                    &reflection, error);
         fp4_attach_reflection(pipeline, reflection);
+        if (!pipeline && error) *error = nil;
     }
     if (!pipeline) pipeline = ((id (*)(id, SEL, id, NSError **))orig_imp(h, self))(self, cmd, desc, error);
     LEAVE;
@@ -4668,6 +4673,12 @@ static void fp4_device_async(int h, id self, SEL cmd, id desc, NSUInteger option
     void (*orig)(id, SEL, id, NSUInteger, fp4_reflection_handler) = (void *)orig_imp(h, self);
     if (OUTER && handler && fp4_reflect_device(options)) {
         orig(self, cmd, desc, options | MTLPipelineOptionBindingInfo, ^(id pipeline, id reflection, NSError *error) {
+            if (!pipeline && !(options & MTLPipelineOptionBindingInfo)) {
+                tl_depth++;
+                orig(self, cmd, desc, options, handler);
+                tl_depth--;
+                return;
+            }
             fp4_attach_reflection(pipeline, reflection);
             handler(pipeline, reflection, error);
         });
@@ -4678,13 +4689,20 @@ static void fp4_device_async(int h, id self, SEL cmd, id desc, NSUInteger option
 static void fp4_device_async_plain(int h, id self, SEL cmd, SEL with_reflection, id desc, fp4_pipeline_handler handler)
 {
     ENTER;
+    void (*orig)(id, SEL, id, fp4_pipeline_handler) = (void *)orig_imp(h, self);
     if (OUTER && handler && fp4_reflect_device(0)) {
         ((void (*)(id, SEL, id, NSUInteger, fp4_reflection_handler))objc_msgSend)(self, with_reflection, desc,
             MTLPipelineOptionBindingInfo, ^(id pipeline, id reflection, NSError *error) {
+                if (!pipeline) {
+                    tl_depth++;
+                    orig(self, cmd, desc, handler);
+                    tl_depth--;
+                    return;
+                }
                 fp4_attach_reflection(pipeline, reflection);
                 handler(pipeline, error);
             });
-    } else ((void (*)(id, SEL, id, fp4_pipeline_handler))orig_imp(h, self))(self, cmd, desc, handler);
+    } else orig(self, cmd, desc, handler);
     LEAVE;
 }
 
@@ -4770,7 +4788,10 @@ static id fp4_compile(int h, id self, SEL cmd, id desc, id x, id y, NSError **er
     if (OUTER) {
         id mine = fp4_reflect_descriptor(desc);
         pipeline = FP4_CALL(mine);
-        if (!pipeline && mine != desc) pipeline = FP4_CALL(desc);
+        if (!pipeline && mine != desc) {
+            if (error) *error = nil;
+            pipeline = FP4_CALL(desc);
+        }
         [mine release];
         fp4_compiled(pipeline, specialize ? x : nil);
     } else pipeline = FP4_CALL(desc);
@@ -4779,6 +4800,67 @@ static id fp4_compile(int h, id self, SEL cmd, id desc, id x, id y, NSError **er
     return pipeline;
 }
 
+/* Both Metal tasks belong to one app request. A waiter must stay blocked through a retry. */
+API_AVAILABLE(macos(26.0))
+@interface FP4CompilerTask : NSObject <MTL4CompilerTask> {
+    id<MTL4Compiler> _compiler;
+    id<MTL4CompilerTask> _initial;
+    dispatch_group_t _pending;
+    os_unfair_lock _lock;
+}
+- (instancetype)initWithCompiler:(id<MTL4Compiler>)compiler;
+- (void)setInitialTask:(id<MTL4CompilerTask>)task;
+- (void)finish;
+@end
+
+@implementation FP4CompilerTask
+- (instancetype)initWithCompiler:(id<MTL4Compiler>)compiler
+{
+    if (!(self = [super init])) return nil;
+    _compiler = [compiler retain];
+    _pending = dispatch_group_create();
+    dispatch_group_enter(_pending);
+    _lock = OS_UNFAIR_LOCK_INIT;
+    return self;
+}
+- (void)dealloc
+{
+    [_initial release];
+    [_compiler release];
+    dispatch_release(_pending);
+    [super dealloc];
+}
+- (id<MTL4Compiler>)compiler { return _compiler; }
+- (void)setInitialTask:(id<MTL4CompilerTask>)task
+{
+    os_unfair_lock_lock(&_lock);
+    if (dispatch_group_wait(_pending, DISPATCH_TIME_NOW)) _initial = [task retain];
+    os_unfair_lock_unlock(&_lock);
+}
+- (void)finish
+{
+    os_unfair_lock_lock(&_lock);
+    id initial = _initial;
+    _initial = nil;
+    dispatch_group_leave(_pending);
+    os_unfair_lock_unlock(&_lock);
+    [initial release];
+}
+- (MTL4CompilerTaskStatus)status
+{
+    os_unfair_lock_lock(&_lock);
+    id<MTL4CompilerTask> initial = [_initial retain];
+    BOOL pending = dispatch_group_wait(_pending, DISPATCH_TIME_NOW) != 0;
+    os_unfair_lock_unlock(&_lock);
+    MTL4CompilerTaskStatus status = initial ? initial.status : MTL4CompilerTaskStatusScheduled;
+    [initial release];
+    if (!pending) return MTL4CompilerTaskStatusFinished;
+    return status == MTL4CompilerTaskStatusFinished ? MTL4CompilerTaskStatusCompiling : status;
+}
+- (void)waitUntilCompleted { dispatch_group_wait(_pending, DISPATCH_TIME_FOREVER); }
+@end
+
+API_AVAILABLE(macos(26.0))
 static id fp4_compile_async(int h, id self, SEL cmd, id desc, id x, id y, fp4_pipeline_handler handler,
                             int four, int specialize)
 {
@@ -4789,10 +4871,33 @@ static id fp4_compile_async(int h, id self, SEL cmd, id desc, id x, id y, fp4_pi
     id task;
     if (OUTER && handler) {
         id mine = fp4_reflect_descriptor(desc), base = specialize ? x : nil;
-        task = FP4_CALL(mine, ^(id pipeline, NSError *error) {
-            fp4_compiled(pipeline, base);
-            handler(pipeline, error);
-        });
+        if (mine != desc) {
+            FP4CompilerTask *request = [[FP4CompilerTask alloc] initWithCompiler:self];
+            id initial = FP4_CALL(mine, ^(id pipeline, NSError *error) {
+                if (pipeline) {
+                    fp4_compiled(pipeline, base);
+                    [request finish];
+                    handler(pipeline, error);
+                } else {
+                    tl_depth++;
+                    id retry = FP4_CALL(desc, ^(id plain, NSError *plainError) {
+                        fp4_compiled(plain, base);
+                        [request finish];
+                        handler(plain, plainError);
+                    });
+                    tl_depth--;
+                    [retry release];
+                }
+            });
+            [request setInitialTask:initial];
+            [initial release];
+            task = request;
+        } else {
+            task = FP4_CALL(mine, ^(id pipeline, NSError *error) {
+                fp4_compiled(pipeline, base);
+                handler(pipeline, error);
+            });
+        }
         [mine release];
     } else task = FP4_CALL(desc, handler);
 #undef FP4_CALL
@@ -4810,14 +4915,19 @@ static id h_c4_render_link(id self, SEL _cmd, id desc, id link, id task, NSError
 { return fp4_compile(H_C4_RENDER_LINK, self, _cmd, desc, link, task, error, 1, 0); }
 static id h_c4_specialize(id self, SEL _cmd, id desc, id pipeline, NSError **error)
 { return fp4_compile(H_C4_SPECIALIZE, self, _cmd, desc, pipeline, nil, error, 0, 1); }
+API_AVAILABLE(macos(26.0))
 static id h_c4_compute_a(id self, SEL _cmd, id desc, id task, fp4_pipeline_handler handler)
 { return fp4_compile_async(H_C4_COMPUTE_A, self, _cmd, desc, task, nil, handler, 0, 0); }
+API_AVAILABLE(macos(26.0))
 static id h_c4_compute_link_a(id self, SEL _cmd, id desc, id link, id task, fp4_pipeline_handler handler)
 { return fp4_compile_async(H_C4_COMPUTE_LINK_A, self, _cmd, desc, link, task, handler, 1, 0); }
+API_AVAILABLE(macos(26.0))
 static id h_c4_render_a(id self, SEL _cmd, id desc, id task, fp4_pipeline_handler handler)
 { return fp4_compile_async(H_C4_RENDER_A, self, _cmd, desc, task, nil, handler, 0, 0); }
+API_AVAILABLE(macos(26.0))
 static id h_c4_render_link_a(id self, SEL _cmd, id desc, id link, id task, fp4_pipeline_handler handler)
 { return fp4_compile_async(H_C4_RENDER_LINK_A, self, _cmd, desc, link, task, handler, 1, 0); }
+API_AVAILABLE(macos(26.0))
 static id h_c4_specialize_a(id self, SEL _cmd, id desc, id pipeline, fp4_pipeline_handler handler)
 { return fp4_compile_async(H_C4_SPECIALIZE_A, self, _cmd, desc, pipeline, nil, handler, 0, 1); }
 
