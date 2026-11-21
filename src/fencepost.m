@@ -726,6 +726,7 @@ static const char g_trace_owner_key;
 static uint64_t trace_clock(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
 enum { CAP_RACE = 1, CAP_GPU_ERROR = 2, CAP_SPIKE = 4 };
+enum { CAP_MTL4_ATTEMPTS = 3 };
 static const char *g_capture_prefix, *g_capture_file;
 static struct timespec g_capture_mtime;
 static int g_capture_owner_warned;
@@ -740,13 +741,21 @@ static int g_capture_available;              /* set once before the device hooks
 static int g_capture_busy;                   /* starting, active or stopping (g_lock) */
 static unsigned g_capture_commits;           /* tracked commits still in Metal (g_lock) */
 static uint64_t g_capture_last_commit;        /* most recent submission activity (g_lock) */
+static int g_capture_mtl4, g_capture_mtl4_unsafe;  /* Metal 4 observed / tracking lost (g_lock) */
+static CFMutableSetRef g_capture_mtl4_ended;       /* raw buffer identities, independent of detector (g_lock) */
+static int g_capture_starting, g_capture_stop_queued;
+static uint64_t g_capture_generation, g_capture_feedback;
+static unsigned g_capture_attempts;          /* first begins tried for this request (capture lock) */
+static pthread_cond_t g_capture_started_cond = PTHREAD_COND_INITIALIZER;
 static NSString *g_capture_path;
 static dispatch_queue_t g_capture_reporter;
 /* Gate command-buffer entry during capture transitions, with tl_depth set so
  * Metal's nested hooks pass through. Never hold this across allocation or
  * commit: a full command queue can make allocation wait for another commit.
- * Lock order is capture lock then detector lock. */
+ * Lock order is capture lock then detector lock. Metal 4 end only waits for
+ * start, via the condition under g_lock, so stop cannot block an end hook. */
 static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static void capture_feedback_done(uint64_t generation, int failed);
 
 /* Called with g_lock held. Keep the first request for the next unopened frame. */
 static void capture_request(const char *reason)
@@ -3377,7 +3386,7 @@ static void cb_mark_done(uint64_t uid)
         }
 }
 
-static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
+static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b, uint64_t capture_generation)
 {
     MTLCommandBufferStatus status = MTLCommandBufferStatusNotEnqueued;
     double start = 0, end = 0;
@@ -3413,6 +3422,7 @@ static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
     if (g_ring) ring_update(0);
     if (g_trace) trace_stream_flush();
     pthread_mutex_unlock(&g_lock);
+    if (capture_generation) capture_feedback_done(capture_generation, 0);
 }
 
 /* ---------------------------------------------------------------- recording */
@@ -4242,6 +4252,7 @@ static void hook_queue(Class cls);
 static void hook_cb(Class cls);
 static void hook_encoder(Class cls, int kind);
 static void hook_event(Class cls);
+static void h_mtl4_end(id self, SEL _cmd);
 static void hook_mtl4_cb(Class cls);
 static void hook_mtl4_encoder(Class cls, int kind);
 static void hook_mtl4_argument(Class cls);
@@ -4506,7 +4517,8 @@ static int capture_poll_file(char reason[static sizeof g_capture_reason])
 
 static void capture_watchdog(uint64_t check_at);
 
-static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char *reason)
+/* 0 consumes the request, 1 defers it to another unopened frame. */
+static int capture_start(id owner, uint64_t frame, const char *reason)
 {
     @autoreleasepool {
         NSString *prefix = [NSFileManager.defaultManager stringWithFileSystemRepresentation:g_capture_prefix
@@ -4518,12 +4530,12 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
         const char *refusal = NULL;
         uint64_t now = trace_clock();
         struct statfs volume;
-        id<MTLDevice> device = queue.device;
+        id<MTLDevice> device = [owner device];
         MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
         if (g_capture_count >= g_capture_max) refusal = "capture limit reached";
         else if (g_capture_stopped && (now - g_capture_stopped) / 1e9 < g_capture_cooldown)
             refusal = "cooldown in effect";
-        else if (!device) refusal = "command queue has no Metal device";
+        else if (!device) refusal = "command buffer or queue has no Metal device";
         else if (!path.fileSystemRepresentation) refusal = "invalid output path";
         else if (manager.isCapturing) refusal = "Metal capture already running";
         else if (statfs(path.stringByDeletingLastPathComponent.fileSystemRepresentation, &volume))
@@ -4532,7 +4544,7 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
             refusal = "insufficient free space on output volume";
         if (refusal) {
             fp_log("fencepost: capture refused: %s\n", refusal);
-            return;
+            return 0;
         }
 
         MTLCaptureDescriptor *desc = [[[MTLCaptureDescriptor alloc] init] autorelease];
@@ -4540,22 +4552,50 @@ static void capture_start(id<MTLCommandQueue> queue, uint64_t frame, const char 
         desc.destination = MTLCaptureDestinationGPUTraceDocument;
         desc.outputURL = [NSURL fileURLWithPath:path];
         NSError *error = nil;
-        if (![manager startCaptureWithDescriptor:desc error:&error]) {
-            fp_log("fencepost: capture failed: %s\n", error.localizedDescription.UTF8String ?: "unknown error");
-            return;
+
+        /* Reserve the transition under the same lock as end and commit.
+         * A commit removes ended identities at entry but holds the in-Metal
+         * count until it returns. End cannot enter Metal during this start. */
+        pthread_mutex_lock(&g_lock);
+        int unsafe = g_capture_mtl4_unsafe;
+        int blocked = (g_capture_mtl4_ended && CFSetGetCount(g_capture_mtl4_ended)) ||
+                      (g_capture_mtl4 && g_capture_commits);
+        if (!unsafe && !blocked) g_capture_starting = 1;
+        pthread_mutex_unlock(&g_lock);
+        if (unsafe) {
+            fp_log("fencepost: capture refused: Metal 4 command buffer tracking unavailable\n");
+            return 0;
+        }
+        if (blocked) return 1;
+
+        BOOL started = NO;
+        @try {
+            started = [manager startCaptureWithDescriptor:desc error:&error];
+        } @catch (NSException *exception) {
+            fp_log("fencepost: capture failed: %s\n", exception.reason.UTF8String ?: exception.name.UTF8String);
+        } @finally {
+            pthread_mutex_lock(&g_lock);
+            if (started) {
+                g_capture_started = g_capture_last_commit = trace_clock();
+                g_capture_until = frame + g_capture_frames;
+                g_capture_generation = ++g_capture_count;
+                g_capture_feedback = 0;
+            }
+            g_capture_starting = 0;
+            pthread_cond_broadcast(&g_capture_started_cond);
+            pthread_mutex_unlock(&g_lock);
+        }
+        if (!started) {
+            if (error) fp_log("fencepost: capture failed: %s\n", error.localizedDescription.UTF8String ?: "unknown error");
+            return 0;
         }
 
         g_capture_path = [path copy];
-        g_capture_started = trace_clock();
-        pthread_mutex_lock(&g_lock);
-        g_capture_last_commit = g_capture_started;
-        pthread_mutex_unlock(&g_lock);
-        g_capture_until = frame + g_capture_frames;
-        g_capture_count++;
         g_capture_deadline = g_capture_started + (uint64_t)g_capture_max_secs * NSEC_PER_SEC;
         uint64_t idle_deadline = g_capture_started + (uint64_t)g_capture_idle_secs * NSEC_PER_SEC;
         capture_watchdog(MIN(g_capture_deadline, idle_deadline));
         fp_log("fencepost: capturing frame %llu (%s) -> %s\n", frame + 1, reason, path.fileSystemRepresentation);
+        return 0;
     }
 }
 
@@ -4619,6 +4659,9 @@ static void capture_report(NSString *path, uint64_t duration, const char *limit)
 static void capture_stop(const char *limit)
 {
     if (!g_capture_path) return;
+    pthread_mutex_lock(&g_lock);
+    g_capture_generation = 0;
+    pthread_mutex_unlock(&g_lock);
     g_capture_deadline = 0;
     @autoreleasepool {
         MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
@@ -4666,54 +4709,124 @@ static void capture_watchdog(uint64_t check_at)
     });
 }
 
-static void capture_before_cb(id queue)
+/* g_lock held. The boundary must have reached Metal, and in a Metal 4
+ * process every observed submission in this capture must have feedback. */
+static int capture_ready(void)
+{
+    return g_capture_generation && !g_capture_commits && g_capture_frame >= g_capture_until &&
+           (!g_capture_mtl4 || !g_capture_feedback);
+}
+
+/* Called under the capture lock, never from Metal's feedback callback. */
+static void capture_stop_at_boundary(void)
+{
+    pthread_mutex_lock(&g_lock);
+    int ready = capture_ready();
+    if (ready) g_capture_generation = 0;
+    pthread_mutex_unlock(&g_lock);
+    if (g_capture_path && trace_clock() >= g_capture_deadline) capture_stop(" (time limit)");
+    else if (ready) capture_stop(NULL);
+}
+
+/* g_lock held. Feedback must never wait for stopCapture or the entry gate. */
+static void capture_schedule_stop(void)
+{
+    if (!g_capture_mtl4 || g_capture_stop_queued || !capture_ready()) return;
+    g_capture_stop_queued = 1;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        pthread_mutex_lock(&g_capture_lock);
+        pthread_mutex_lock(&g_lock);
+        g_capture_stop_queued = 0;
+        pthread_mutex_unlock(&g_lock);
+        tl_depth++;
+        capture_stop_at_boundary();
+        tl_depth--;
+        pthread_mutex_unlock(&g_capture_lock);
+    });
+}
+
+static void capture_feedback_done(uint64_t generation, int failed)
+{
+    pthread_mutex_lock(&g_lock);
+    if (failed && (g_capture_on & CAP_GPU_ERROR)) capture_request("gpu-error");
+    if (generation && generation == g_capture_generation) {
+        g_capture_feedback--;
+        g_capture_last_commit = trace_clock();
+        capture_schedule_stop();
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void capture_before_cb(id owner, int mtl4)
 {
     pthread_mutex_lock(&g_capture_lock);
+    capture_stop_at_boundary();
+    pthread_mutex_lock(&g_lock);
     uint64_t frame = g_capture_frame;
-    if (frame > g_capture_opened) {
+    int new_frame = frame > g_capture_opened && mtl4 == g_capture_mtl4;
+    /* A boundary whose submission has not returned is also too late if a
+     * concurrent begin has already started encoding the following frame. */
+    if (mtl4 && g_frame_cur > frame) {
+        g_capture_opened = MAX(g_capture_opened, g_frame_cur);
+        new_frame = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (new_frame) {
         g_capture_opened = frame;
         char reason[sizeof g_capture_reason];
         int changed = capture_poll_file(reason);
         pthread_mutex_lock(&g_lock);
         if (changed) capture_request(reason);
         memcpy(reason, g_capture_reason, sizeof reason);
-        g_capture_reason[0] = 0;
         if (reason[0]) g_capture_busy = 1;
         pthread_mutex_unlock(&g_lock);
         if (reason[0]) {
-            capture_start(queue, frame, reason);
-            if (!g_capture_path) {
-                pthread_mutex_lock(&g_lock);
-                g_capture_busy = 0;
-                pthread_mutex_unlock(&g_lock);
+            int deferred = capture_start(owner, frame, reason);
+            if (deferred && ++g_capture_attempts >= CAP_MTL4_ATTEMPTS) {
+                fp_log("fencepost: capture refused: Metal 4 command buffers still awaiting submission after %u frame starts\n",
+                       g_capture_attempts);
+                deferred = 0;
             }
+            if (deferred)
+                fp_log("fencepost: capture deferred: Metal 4 command buffers awaiting submission\n");
+            else g_capture_attempts = 0;
+            pthread_mutex_lock(&g_lock);
+            if (!deferred) g_capture_reason[0] = 0;
+            if (!g_capture_path) g_capture_busy = 0;
+            pthread_mutex_unlock(&g_lock);
         }
     }
     pthread_mutex_unlock(&g_capture_lock);
 }
 
-static void capture_after_commit(void)
+/* g_lock held. Explicit markers and presents can be processed before native
+ * submission. Publish them only after the last native operation returns. */
+static void capture_publish_frame(void)
 {
-    pthread_mutex_lock(&g_capture_lock);
+    if (!g_capture_commits) g_capture_frame = g_frame_cur;
+    capture_schedule_stop();
+}
+
+static void capture_after_commit(int mtl4, int submitted)
+{
     pthread_mutex_lock(&g_lock);
-    /* Phase 1 can advance across enqueue-held buffers. Publish the new frame
-     * only after those Metal commits have returned, so the ending submission
-     * is inside the capture and the next allocation sees the transition. */
-    if (--g_capture_commits == 0) g_capture_frame = g_frame_cur;
-    uint64_t now = g_capture_path ? trace_clock() : 0;
-    if (now) g_capture_last_commit = now;
+    if (mtl4 && !submitted) g_capture_mtl4_unsafe = 1;
+    g_capture_commits--;
+    if (g_capture_generation) g_capture_last_commit = trace_clock();
+    capture_publish_frame();
+    int synchronous = !g_capture_mtl4;
     pthread_mutex_unlock(&g_lock);
-    if (g_capture_path) {
-        if (now >= g_capture_deadline) capture_stop(" (time limit)");
-        else if (g_capture_frame >= g_capture_until) capture_stop(NULL);
+    if (synchronous) {
+        pthread_mutex_lock(&g_capture_lock);
+        capture_stop_at_boundary();
+        pthread_mutex_unlock(&g_capture_lock);
     }
-    pthread_mutex_unlock(&g_capture_lock);
 }
 
 static id h_q_cb(id self, SEL _cmd)
 {
     ENTER;
-    if (OUTER && g_capture_available) capture_before_cb(self);
+    if (OUTER && g_capture_available) capture_before_cb(self, 0);
     id cb = ORIG(H_Q_CB, id (*)(id, SEL))(self, _cmd);
     LEAVE;
     if (OUTER) on_cb(self, cb);
@@ -4722,7 +4835,7 @@ static id h_q_cb(id self, SEL _cmd)
 static id h_q_cbu(id self, SEL _cmd)
 {
     ENTER;
-    if (OUTER && g_capture_available) capture_before_cb(self);
+    if (OUTER && g_capture_available) capture_before_cb(self, 0);
     id cb = ORIG(H_Q_CBU, id (*)(id, SEL))(self, _cmd);
     LEAVE;
     if (OUTER) on_cb(self, cb);
@@ -4731,7 +4844,7 @@ static id h_q_cbu(id self, SEL _cmd)
 static id h_q_cbd(id self, SEL _cmd, id d)
 {
     ENTER;
-    if (OUTER && g_capture_available) capture_before_cb(self);
+    if (OUTER && g_capture_available) capture_before_cb(self, 0);
     id cb = ORIG(H_Q_CBD, id (*)(id, SEL, id))(self, _cmd, d);
     LEAVE;
     if (OUTER) on_cb(self, cb);
@@ -4920,13 +5033,9 @@ static void on_mtl4_queue(id queue)
 {
     atomic_store_explicit(&g_fp4_active, 1, memory_order_relaxed);
     if (!queue) return;
-    /* A Metal 4 buffer has no queue during encoding. The Metal 3 capture
-     * path starts on the intended queue before a command buffer is opened. */
-    static atomic_int capture_warned;
-    if (g_capture_prefix && !atomic_exchange(&capture_warned, 1))
-        fp_log("fencepost: capture not yet supported for Metal 4\n");
     const char *label = [[queue label] UTF8String];
     pthread_mutex_lock(&g_lock);
+    if (g_capture_available) g_capture_mtl4 = 1;
     fp_queue *q = queue_get_kind((void *)queue, 1);
     if (q) {
         snprintf(g_trace_queue_labels[q->idx], sizeof g_trace_queue_labels[0], "MTL4%s%s",
@@ -4954,7 +5063,20 @@ static id h_mtl4_dev_cb(id self, SEL _cmd)
 {
     atomic_store_explicit(&g_fp4_active, 1, memory_order_relaxed);
     ENTER; id cb = ORIG(H_4_DEV_CB, id (*)(id, SEL))(self, _cmd); LEAVE;
-    if (OUTER && cb) hook_mtl4_cb(object_getClass(cb));
+    if (cb && (OUTER || g_capture_available)) {
+        Class cls = object_getClass(cb);
+        hook_mtl4_cb(cls);
+        if (g_capture_available) {
+            IMP end = class_getMethodImplementation(cls, sel_registerName("endCommandBuffer"));
+            pthread_mutex_lock(&g_lock);
+            g_capture_mtl4 = 1;
+            if (end != (IMP)h_mtl4_end) {
+                g_capture_mtl4_unsafe = 1;
+                while (g_capture_starting) pthread_cond_wait(&g_capture_started_cond, &g_lock);
+            }
+            pthread_mutex_unlock(&g_lock);
+        }
+    }
     return cb;
 }
 
@@ -4968,19 +5090,35 @@ static void on_mtl4_begin(id cb)
 
 static void h_mtl4_begin(id self, SEL _cmd, id allocator)
 {
-    ENTER; ORIG(H_4_BEGIN, void (*)(id, SEL, id))(self, _cmd, allocator); LEAVE;
+    ENTER;
+    if (OUTER && g_capture_available) capture_before_cb(self, 1);
+    ORIG(H_4_BEGIN, void (*)(id, SEL, id))(self, _cmd, allocator);
+    LEAVE;
     if (OUTER) on_mtl4_begin(self);
 }
 
 static void h_mtl4_begin_opts(id self, SEL _cmd, id allocator, id options)
 {
-    ENTER; ORIG(H_4_BEGIN_OPTS, void (*)(id, SEL, id, id))(self, _cmd, allocator, options); LEAVE;
+    ENTER;
+    if (OUTER && g_capture_available) capture_before_cb(self, 1);
+    ORIG(H_4_BEGIN_OPTS, void (*)(id, SEL, id, id))(self, _cmd, allocator, options);
+    LEAVE;
     if (OUTER) on_mtl4_begin(self);
 }
 
 static void h_mtl4_end(id self, SEL _cmd)
 {
-    ENTER; ORIG(H_4_END, void (*)(id, SEL))(self, _cmd); LEAVE;
+    ENTER;
+    if (g_capture_available) {
+        pthread_mutex_lock(&g_lock);
+        while (g_capture_starting) pthread_cond_wait(&g_capture_started_cond, &g_lock);
+        if (!g_capture_mtl4_ended) g_capture_mtl4_ended = CFSetCreateMutable(NULL, 0, NULL);
+        if (g_capture_mtl4_ended) CFSetAddValue(g_capture_mtl4_ended, self);
+        else g_capture_mtl4_unsafe = 1;
+        pthread_mutex_unlock(&g_lock);
+    }
+    ORIG(H_4_END, void (*)(id, SEL))(self, _cmd);
+    LEAVE;
     if (!OUTER) return;
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)self);
@@ -5890,6 +6028,7 @@ static void h_cb_commit(id self, SEL _cmd)
 {
     ENTER;
     int capture_commit = 0;
+    uint64_t capture_generation = 0;
     if (OUTER) {
         uint64_t uid = 0;
         fp_trace_cb *trace = NULL;
@@ -5911,6 +6050,8 @@ static void h_cb_commit(id self, SEL _cmd)
             if (g_capture_available) {
                 g_capture_commits++;
                 capture_commit = 1;
+                capture_generation = g_capture_generation;
+                if (capture_generation) g_capture_feedback++;
             }
             memcpy(c->label, cb_label, sizeof c->label);
             if (g_trace_enabled && (trace = c->trace)) {
@@ -5937,12 +6078,14 @@ static void h_cb_commit(id self, SEL _cmd)
         }
         pthread_mutex_unlock(&g_lock);
         if (uid) {
-            [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> b) { cb_done(uid, trace, b); }];
+            [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                cb_done(uid, trace, b, capture_generation);
+            }];
             maybe_summary();
         }
     }
     ORIG(H_CB_COMMIT, void (*)(id, SEL))(self, _cmd);
-    if (capture_commit) capture_after_commit();
+    if (capture_commit) capture_after_commit(0, 1);
     LEAVE;
 }
 
@@ -6207,6 +6350,29 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
 static Class g_mtl4_options_class;
 static char g_mtl4_callbacks_key;
 
+static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, uint64_t *generation)
+{
+    if (!g_capture_available || !buffers || !count) return 0;
+    pthread_mutex_lock(&g_lock);
+    int tracked = outer;
+    if (g_capture_mtl4_ended) {
+        for (NSUInteger i = 0; i < count; i++) {
+            if (!buffers[i] || !CFSetContainsValue(g_capture_mtl4_ended, buffers[i])) continue;
+            CFSetRemoveValue(g_capture_mtl4_ended, buffers[i]);
+            tracked = 1;
+        }
+    }
+    if (tracked) {
+        g_capture_mtl4 = 1;
+        g_capture_commits++;
+        *generation = g_capture_generation;
+        /* A submission we cannot attach feedback to will drain by watchdog. */
+        if (*generation) g_capture_feedback++;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return tracked;
+}
+
 static id h_mtl4_options_init(id self, SEL _cmd)
 {
     id options = ORIG(H_4_OPTIONS_INIT, id (*)(id, SEL))(self, _cmd);
@@ -6234,7 +6400,8 @@ static void h_mtl4_app_feedback(id self, SEL _cmd, void (^handler)(id))
 }
 
 API_AVAILABLE(macos(26.0))
-static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUInteger count, id app_options)
+static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUInteger count, id app_options,
+                                             uint64_t capture_generation)
 {
     FPMTL4Callbacks *callbacks = app_options ? objc_getAssociatedObject(app_options, &g_mtl4_callbacks_key) : nil;
     if (app_options && !callbacks) return nil;
@@ -6253,11 +6420,13 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
     }
     fp_mtl4_submission *submission = mtl4_record_commit(queue, buffers, count);
     /* Record completion before an app handler can submit dependent work. */
-    if (submission)
+    if (submission || capture_generation || (g_capture_on & CAP_GPU_ERROR))
         [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-            mtl4_completed(submission, feedback);
+            if (submission) mtl4_completed(submission, feedback);
+            if (capture_generation || (g_capture_on & CAP_GPU_ERROR))
+                capture_feedback_done(capture_generation, feedback.error != nil);
         }];
-    else if (g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
+    if (!submission && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
     for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
     [blocks release];
     return opts;
@@ -6266,38 +6435,49 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
 static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count)
 {
     ENTER;
-    int submitted = 0;
-    if (OUTER) {
-        if (@available(macOS 26.0, *)) {
-            if (count && [self respondsToSelector:@selector(commit:count:options:)]) {
-                MTL4CommitOptions *opts = mtl4_submit_options(self, buffers, count, nil);
-                if (opts) {
+    uint64_t generation = 0;
+    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation), returned = 0;
+    id opts = nil;
+    @try {
+        if (OUTER) {
+            if (@available(macOS 26.0, *)) {
+                if (count && [self respondsToSelector:@selector(commit:count:options:)])
+                    opts = mtl4_submit_options(self, buffers, count, nil, generation);
+                if (opts)
                     [(id<MTL4CommandQueue>)self commit:(const id<MTL4CommandBuffer> *)buffers count:count options:opts];
-                    submitted = 1;
-                    [opts release];
-                }
             }
         }
+        if (!opts) {
+            if (OUTER && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
+            ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
+        }
+        returned = 1;
+    } @finally {
+        [opts release];
+        if (tracked) capture_after_commit(1, returned);
+        LEAVE;
     }
-    if (!submitted) {
-        if (OUTER && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
-        ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
-    }
-    LEAVE;
-    if (submitted) maybe_summary();
+    if (opts) maybe_summary();
 }
 
 static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger count, id options)
 {
     ENTER;
+    uint64_t generation = 0;
+    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation), returned = 0;
     id opts = nil;
-    if (OUTER && options) {
-        if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options);
+    @try {
+        if (OUTER && (options || generation)) {
+            if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options, generation);
+        }
+        if (OUTER && !opts && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
+        ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, opts ?: options);
+        returned = 1;
+    } @finally {
+        [opts release];
+        if (tracked) capture_after_commit(1, returned);
+        LEAVE;
     }
-    if (OUTER && !opts && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
-    ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, opts ?: options);
-    [opts release];
-    LEAVE;
     if (opts) maybe_summary();
 }
 
@@ -6378,15 +6558,17 @@ static void h_mtl4_wait(id self, SEL _cmd, id event, uint64_t value)
 static void h_mtl4_drawable_signal(id self, SEL _cmd, id drawable)
 {
     ENTER;
+    uint64_t timestamp = OUTER && g_trace_enabled ? trace_clock() : 0;
+    ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
     if (OUTER) {
         pthread_mutex_lock(&g_lock);
         if (!g_frame_api) {
-            frame_boundary(g_trace_enabled ? trace_clock() : 0, NULL);
+            frame_boundary(timestamp, NULL);
             process_pending(0);
+            if (g_capture_available) capture_publish_frame();
         }
         pthread_mutex_unlock(&g_lock);
     }
-    ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
     LEAVE;
 }
 
