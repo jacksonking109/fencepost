@@ -3550,7 +3550,7 @@ static int fp4_slot_access(const fp_node *n, const FP4ArgumentState *state, NSUI
     if (index >= count) return 0;
     int access = table->access[stage][index + (texture ? table->buffers[stage] : 0)];
     /* A non-const device pointer reflects as read-write even when the shader only reads it. */
-    if (access == (FP_RD | FP_WR) && g_mtl4_rw_possible) return FP_RD | FP_MAYBE;
+    if (!texture && access == (FP_RD | FP_WR) && g_mtl4_rw_possible) return FP_RD | FP_MAYBE;
     return access;
 }
 

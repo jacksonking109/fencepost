@@ -64,6 +64,9 @@ static NSString *const kernels =
     "kernel void texel(texture2d<float, access::read> src [[texture(0)]], device uint *dst [[buffer(0)]]) {\n"
     "    *dst = uint(src.read(uint2(0)).r * 255.0f);\n"
     "}\n"
+    "kernel void rwtexel(texture2d<uint, access::read_write> tex [[texture(0)]]) {\n"
+    "    tex.write(tex.read(uint2(0)) + 1u, uint2(0));\n"
+    "}\n"
     "struct VOut { float4 position [[position]]; };\n"
     "vertex VOut vtx(uint vid [[vertex_id]]) {\n"
     "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
@@ -452,6 +455,50 @@ static int run_reflection(id<MTLDevice> device, NSString *mode)
 }
 
 API_AVAILABLE(macos(26.0))
+static int run_rw_texture(id<MTLDevice> device)
+{
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    id<MTL4CommandBuffer> cb = [device newCommandBuffer];
+    if (!queue || !allocator || !cb) return fail("command setup failed");
+
+    NSError *error = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:kernels options:nil error:&error];
+    id<MTLFunction> function = [lib newFunctionWithName:@"rwtexel"];
+    __attribute__((objc_precise_lifetime)) id<MTLComputePipelineState> pipeline = function
+        ? [device newComputePipelineStateWithFunction:function error:&error] : nil;
+    if (!pipeline) return fail(error.localizedDescription.UTF8String ?: "texture shader setup failed");
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+        width:1 height:1 mipmapped:NO];
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    __attribute__((objc_precise_lifetime)) id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
+    id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    MTL4ArgumentTableDescriptor *layout = [MTL4ArgumentTableDescriptor new];
+    layout.maxTextureBindCount = 1;
+    id<MTL4ArgumentTable> table = [device newArgumentTableWithDescriptor:layout error:NULL];
+    if (!texture || !residency || !table) return fail("texture work setup failed");
+
+    uint32_t initial = 0;
+    [texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&initial bytesPerRow:sizeof initial];
+    [table setTexture:texture.gpuResourceID atIndex:0];
+    [residency addAllocation:texture];
+    [residency commit];
+    [queue addResidencySet:residency];
+    [cb beginCommandBufferWithAllocator:allocator];
+    for (int pass = 0; pass < 2; pass++) {
+        id<MTL4ComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+        if (!encoder) return fail("texture encoder creation failed");
+        [encoder setComputePipelineState:pipeline];
+        [encoder setArgumentTable:table];
+        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+    }
+    [cb endCommandBuffer];
+    return commit_and_wait(queue, cb);
+}
+
+API_AVAILABLE(macos(26.0))
 static int run(id<MTLDevice> device, NSString *mode)
 {
     BOOL split = [mode hasPrefix:@"commits"];
@@ -465,6 +512,7 @@ static int run(id<MTLDevice> device, NSString *mode)
     if ([@[@"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race"] containsObject:mode])
         return run_reflection(device, mode);
     if ([mode hasPrefix:@"copy-"]) return run_reflection(device, mode);
+    if ([mode isEqualToString:@"rw-texture"]) return run_rw_texture(device);
     if ([mode hasPrefix:@"load-"]) return run_attachments(device, mode);
     if ([mode hasPrefix:@"consumer-"] || [mode hasPrefix:@"chain-"]) return run_consumer_barriers(device, mode);
 
@@ -624,7 +672,7 @@ int main(int argc, const char **argv)
                         @"load-early", @"load-late", @"load-fence-early", @"load-fence-late", @"load-fence-drawless",
                         @"load-fence-multiple", @"load-producer", @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
                         @"consumer-intervening", @"chain-empty", @"chain-before-blit", @"chain-blit", @"chain-fence",
-                        @"copy-compute", @"copy-compute-async", @"copy-render", @"copy-render-async"]
+                        @"copy-compute", @"copy-compute-async", @"copy-render", @"copy-render-async", @"rw-texture"]
                        containsObject:mode])
             return fail("expected a named Metal 4 race case");
         if (@available(macOS 26.0, *)) {

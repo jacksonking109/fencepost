@@ -31,6 +31,7 @@ WHY = {
     "copy-compute-async": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "copy-render": "no Metal 4 ordering covers Fragment -> Dispatch",
     "copy-render-async": "no Metal 4 ordering covers Fragment -> Dispatch",
+    "rw-texture": "no Metal 4 ordering covers Dispatch -> Dispatch",
 }
 
 
@@ -63,8 +64,8 @@ def check_run(arch, directory, program, mode, env, run_index, baseline, **extra)
     assert len(races) == expected, (mode, result.stderr)
     events = json.loads(path.read_text())
     summary = events[-1]["args"]
-    # Pipeline reflection makes shader writes definite; FENCEPOST_MTL4_RW=possible downgrades read-write slots.
-    certain = expected and "FENCEPOST_MTL4_RW" not in extra
+    # FENCEPOST_MTL4_RW=possible downgrades only read-write buffers.
+    certain = expected and not (mode == "nobarrier" and extra.get("FENCEPOST_MTL4_RW") == "possible")
     assert summary["race_hits"] == certain and summary["possible_hits"] == expected - certain, (mode, summary)
     assert summary["order_hits"] == int(mode == "order") and summary["partial_hits"] == int(mode == "partial"), summary
     assert not summary.get("mtl4_address_misses") and not summary.get("mtl4_resource_id_misses"), summary
@@ -102,11 +103,12 @@ def check_suite(arch, directory):
                  "load-early", "load-late", "load-fence-early", "load-fence-late", "load-fence-drawless",
                  "load-fence-multiple", "load-producer", "consumer-buffer", "consumer-buffers", "consumer-commits",
                  "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence",
-                 "copy-compute", "copy-compute-async", "copy-render", "copy-render-async"):
+                 "copy-compute", "copy-compute-async", "copy-render", "copy-render-async", "rw-texture"):
         check_case(arch, directory, "mtl4races", mode, env)
     possible = directory / "rw"
     possible.mkdir()
     check_case(arch, possible, "mtl4test", "nobarrier", env, FENCEPOST_MTL4_RW="possible")
+    check_case(arch, possible, "mtl4races", "rw-texture", env, FENCEPOST_MTL4_RW="possible")
 
     run(arch, "mtl4races", "fence-missing", env, FENCEPOST_TRACE=directory / "ring",
         FENCEPOST_RING=3, FENCEPOST_RING_AFTER=0, FENCEPOST_TRIGGER_FILE="")
@@ -124,4 +126,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 43 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 45 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")

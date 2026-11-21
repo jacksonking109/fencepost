@@ -128,8 +128,9 @@ Argument-table slots take their read/write access from the bound pipeline's bind
 slot that a stage's shader does not declare or use has no access in that stage, so a table bound at
 Vertex|Fragment counts a buffer only in the stage that reads it. `const` buffers and read textures are reads,
 write-only textures are writes, and read-write bindings are definite writes. Metal reflects every non-`const`
-`device` pointer as read-write, even when the shader only reads it; `FENCEPOST_MTL4_RW=possible` reports those
-conflicts as possible races instead. fencepost requests the reflection itself when pipelines are built:
+`device` pointer as read-write, even when the shader only reads it. `FENCEPOST_MTL4_RW=possible` reports those
+buffer conflicts as possible races. Read-write textures remain definite writes. Fencepost requests reflection
+when pipelines are built:
 - through the device (`newComputePipelineStateWith…`, `newRenderPipelineStateWith…`, tile and mesh variants,
   synchronous and asynchronous), once the process has made a Metal 4 queue, command buffer, argument table or
   compiler, so programs that use only Metal 3 build their pipelines unchanged. It adds
@@ -325,7 +326,7 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
 | `FENCEPOST_CHAIN` | 0 | list the longest ordered chain of this frame (counted from 1) |
 | `FENCEPOST_BIND_MAYWRITE` | 0 | 1 counts unknown writes as possible in Metal 3 compute bindings and in Metal 4 argument tables bound with an access-unknown pipeline |
-| `FENCEPOST_MTL4_RW` | write | `possible` reports conflicts through read-write Metal 4 bindings (any non-`const` `device` pointer) as possible races |
+| `FENCEPOST_MTL4_RW` | write | `possible` reports conflicts through read-write Metal 4 buffer bindings (non-`const` `device` pointers) as possible races |
 | `FENCEPOST_TRACE` | unset | stream to this JSON file (`%p` expands to the process id), or use this literal prefix for ring dumps |
 | `FENCEPOST_TRACE_FRAMES` | all | capture frames `a:b`, inclusive and counted from 1 |
 | `FENCEPOST_TRACE_MB` | 512 | stop streaming when the file reaches this size in MiB |
