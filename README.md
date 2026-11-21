@@ -496,15 +496,20 @@ The frame workload and the 10,000-draw benchmark produced zero race reports.
 
 ### Overhead
 
-The table gives median Metal 4 CPU times from three runs per configuration on Apple silicon. The draw workload changes a buffer address and
-a texture binding on every draw. The commit workload encodes four draws per submission.
+Median CPU times from three runs per configuration on Apple silicon. The draw workload changes a buffer address and
+a texture binding on every draw. The commit workload encodes four draws per submission. Pipeline builds use a warm
+shader cache. The x86_64 slice runs under Rosetta.
 
-| Slice | Measure | Without fencepost | With fencepost | Overhead |
+| Slice | CPU measure | Without fencepost | With fencepost | Overhead |
 |---|---|---:|---:|---:|
-| arm64 | µs/draw | 0.0858 | 0.1059 | +23.4% |
-| arm64 | µs/commit | 5.000 | 8.458 | +69.2% |
-| x86_64 (Rosetta) | µs/draw | 0.1371 | 0.1762 | +28.5% |
-| x86_64 (Rosetta) | µs/commit | 8.041 | 12.958 | +61.1% |
+| arm64 | µs/draw | 0.0861 | 0.1057 | +23% |
+| arm64 | µs/commit | 4.9583 | 8.3750 | +69% |
+| arm64 | ms/pipeline (MTL4Compiler) | 0.0192 | 0.0219 | +14% |
+| arm64 | ms/pipeline (device) | 0.0132 | 0.0152 | +15% |
+| x86_64 | µs/draw | 0.1391 | 0.1812 | +30% |
+| x86_64 | µs/commit | 8.0830 | 13.0840 | +62% |
+| x86_64 | ms/pipeline (MTL4Compiler) | 0.0390 | 0.0444 | +14% |
+| x86_64 | ms/pipeline (device) | 0.0319 | 0.0351 | +10% |
 
 ### Earlier Metal 3 results
 
