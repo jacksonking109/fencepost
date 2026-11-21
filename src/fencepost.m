@@ -643,12 +643,15 @@ typedef struct {
     int n, cap;
 } fp_trace_track;
 
+typedef struct { uint64_t cpu, gpu; } fp_trace_clock_pair;
+typedef struct { fp_trace_clock_pair pair; uint64_t at; } fp_trace_calibration;
+
 typedef struct fp_trace_device {
     id<MTLDevice> device;
     id<MTLCounterSampleBuffer> buffer;
     id heap;                       /* MTL4CounterHeap, initialized only on Metal 4 */
     uint64_t frequency;
-    struct { uint64_t cpu, gpu; } first, last;
+    fp_trace_clock_pair first, last;
     uint64_t calibration;
     uint64_t previous_end[FP_TRACE_SAMPLES / 2];
     unsigned free_slots[FP_TRACE_SAMPLES / 2], nfree;
@@ -661,6 +664,7 @@ typedef struct fp_trace_encoder {
     struct fp_trace_encoder *next;
     struct fp_trace_cb *cb;
     uint64_t uid, start, end, thread, gpu_start, gpu_end;
+    uint64_t first_sample, last_sample;  /* written by the completion callback before it takes g_lock */
     int sample, sample_ended, selected, kind, args_dropped;
     char label[64], mtl4_cb_label[48];
     char *args;
@@ -1291,19 +1295,23 @@ static void trace_diagnostic(unsigned kind, uint64_t from, uint64_t to, const ch
     trace_link_settle(link);
 }
 
-static fp_trace_device *trace_device(id<MTLDevice> device, int mtl4)
+static fp_trace_device *trace_find_device(id<MTLDevice> device, int mtl4)   /* g_lock held */
 {
     for (fp_trace_device *d = g_trace_devices; d; d = d->next)
         if (d->device == device && d->mtl4 == mtl4) return d;
-    fp_trace_device *d = calloc(1, sizeof *d);
-    if (!d) return NULL;
-    d->device = [device retain]; d->mtl4 = mtl4; d->next = g_trace_devices; g_trace_devices = d;
+    return NULL;
+}
+
+static void trace_init_device(fp_trace_device *d, id<MTLDevice> device, int mtl4)
+{
+    d->device = [device retain];
+    d->mtl4 = mtl4;
     if (mtl4) {
         if (@available(macOS 26.0, *)) {
             if ([device sizeOfCounterHeapEntry:MTL4CounterHeapTypeTimestamp] != sizeof(MTL4TimestampHeapEntry))
-                return d;
+                return;
             d->frequency = [device queryTimestampFrequency];
-            if (!d->frequency) return d;
+            if (!d->frequency) return;
             MTL4CounterHeapDescriptor *desc = [[MTL4CounterHeapDescriptor alloc] init];
             desc.type = MTL4CounterHeapTypeTimestamp;
             desc.count = FP_TRACE_SAMPLES;
@@ -1324,32 +1332,77 @@ static fp_trace_device *trace_device(id<MTLDevice> device, int mtl4)
             break;
         }
     }
-    if (d->buffer || d->heap) {
-        g_trace_sampling_supported = 1;
+    if (d->buffer || d->heap)
         for (unsigned i = 0; i < FP_TRACE_SAMPLES / 2; i++) d->free_slots[d->nfree++] = FP_TRACE_SAMPLES - 2 - 2 * i;
-    }
-    return d;
 }
 
-static void trace_calibrate(fp_trace_device *d)
+static fp_trace_device *trace_cb_device(id cb, int mtl4)
+{
+    if (!g_trace_enabled || !g_trace_gpu) return NULL;
+    @autoreleasepool {
+        id<MTLDevice> device = [cb device];
+        pthread_mutex_lock(&g_lock);
+        int stopped = g_trace_stopped || g_frame_cur >= g_trace_last;
+        fp_trace_device *d = stopped ? NULL : trace_find_device(device, mtl4);
+        pthread_mutex_unlock(&g_lock);
+        if (stopped || d) return d;
+
+        fp_trace_device *candidate = calloc(1, sizeof *candidate);
+        if (!candidate) return NULL;
+        trace_init_device(candidate, device, mtl4);
+
+        /* First buffers can arrive on several threads. Publish one fully initialized
+         * set of counters, and release any duplicate Metal objects off the lock. */
+        pthread_mutex_lock(&g_lock);
+        d = trace_find_device(device, mtl4);
+        if (!d) {
+            d = candidate;
+            candidate = NULL;
+            d->next = g_trace_devices;
+            g_trace_devices = d;
+            if (d->buffer || d->heap) g_trace_sampling_supported = 1;
+        }
+        pthread_mutex_unlock(&g_lock);
+        if (candidate) {
+            [candidate->buffer release];
+            [candidate->heap release];
+            [candidate->device release];
+            free(candidate);
+        }
+        return d;
+    }
+}
+
+static int trace_calibration_due(const fp_trace_device *d)   /* g_lock held */
+{
+    return d && d->buffer && (!d->last.cpu || trace_clock() - d->calibration >= 250000000);
+}
+
+static fp_trace_calibration trace_read_calibration(const fp_trace_device *d)
 {
     uint64_t before = trace_clock();
-    if (d->first.cpu && before - d->calibration < (d->last.cpu ? 250000000 : 0)) return;
     MTLTimestamp cpu = 0, gpu = 0;
     [d->device sampleTimestamps:&cpu gpuTimestamp:&gpu];
     uint64_t after = trace_clock(), middle = before + (after - before) / 2;
-    if (!cpu || !gpu || gpu == MTLCounterErrorValue) return;
+    if (!cpu || !gpu || gpu == MTLCounterErrorValue) return (fp_trace_calibration){0};
     mach_timebase_info_data_t timebase;
     mach_timebase_info(&timebase);
     uint64_t scaled = (uint64_t)((long double)cpu * timebase.numer / timebase.denom);
     if (llabs((int64_t)scaled - (int64_t)middle) < llabs((int64_t)cpu - (int64_t)middle)) cpu = scaled;
-    if (d->first.cpu && (cpu <= d->first.cpu || gpu <= d->first.gpu)) return;
-    if (!d->first.cpu) { d->first.cpu = cpu; d->first.gpu = gpu; }
-    else if (cpu - d->first.cpu >= 10000) {
+    return (fp_trace_calibration){ { cpu, gpu }, before };
+}
+
+static void trace_record_calibration(fp_trace_device *d, fp_trace_calibration value)   /* g_lock held */
+{
+    fp_trace_clock_pair pair = value.pair;
+    const fp_trace_clock_pair newest = d->last.cpu ? d->last : d->first;
+    if (value.at <= d->calibration || pair.cpu <= newest.cpu || pair.gpu <= newest.gpu) return;
+    if (!d->first.cpu) d->first = pair;
+    else if (pair.cpu - d->first.cpu >= 10000) {
         if (d->last.cpu) d->first = d->last;
-        d->last.cpu = cpu; d->last.gpu = gpu;
+        d->last = pair;
     }
-    d->calibration = before;
+    d->calibration = value.at;
 }
 
 static void trace_release_sample(fp_trace_encoder *e)
@@ -1360,20 +1413,49 @@ static void trace_release_sample(fp_trace_encoder *e)
     e->sample = -1;
 }
 
-static void trace_resolve(fp_trace_encoder *e)
+/* The committed list and sample indices are stable through feedback. The slots
+ * stay reserved until the locked completion publishes or discards these results. */
+static void trace_read_samples(fp_trace_cb *c)
+{
+    if (!c->device) return;
+    for (fp_trace_encoder *e = c->encoders; e; e = e->next) {
+        if (e->sample < 0) continue;
+        NSRange range = NSMakeRange((NSUInteger)e->sample, 2);
+        if (c->mtl4) {
+            if (@available(macOS 26.0, *)) {
+                if (!e->selected || !e->sample_ended) continue;
+                NSData *data = [(id<MTL4CounterHeap>)c->device->heap resolveCounterRange:range];
+                if (data.length != 2 * sizeof(MTL4TimestampHeapEntry)) continue;
+                const MTL4TimestampHeapEntry *r = data.bytes;
+                e->first_sample = r[0].timestamp;
+                e->last_sample = r[1].timestamp;
+            }
+        } else {
+            NSData *data = [c->device->buffer resolveCounterRange:range];
+            if (data.length != 2 * sizeof(MTLCounterResultTimestamp)) continue;
+            const MTLCounterResultTimestamp *r = data.bytes;
+            e->first_sample = r[0].timestamp;
+            e->last_sample = r[1].timestamp;
+        }
+    }
+}
+
+static int trace_valid_samples(const fp_trace_encoder *e)
+{
+    return e->first_sample && e->last_sample != MTLCounterErrorValue && e->last_sample > e->first_sample;
+}
+
+static void trace_resolve(fp_trace_encoder *e)   /* g_lock held */
 {
     fp_trace_device *d = e->cb->device;
-    NSData *data = [d->buffer resolveCounterRange:NSMakeRange((NSUInteger)e->sample, 2)];
-    if (data.length != 2 * sizeof(MTLCounterResultTimestamp)) return;
-    const MTLCounterResultTimestamp *r = data.bytes;
-    if (!r[0].timestamp || r[1].timestamp == MTLCounterErrorValue || r[1].timestamp <= r[0].timestamp) return;
+    if (!trace_valid_samples(e)) return;
     uint64_t *previous = &d->previous_end[e->sample / 2];
-    if (r[0].timestamp < *previous) return;   /* an empty pass can leave old slot contents untouched */
-    *previous = r[1].timestamp;
+    if (e->first_sample < *previous) return;  /* an empty pass can leave old slot contents untouched */
+    *previous = e->last_sample;
     if (!d->last.cpu) return;
     double scale = (double)(d->last.cpu - d->first.cpu) / (double)(d->last.gpu - d->first.gpu);
-    double start = d->first.cpu + ((int64_t)r[0].timestamp - (int64_t)d->first.gpu) * scale;
-    double end = d->first.cpu + ((int64_t)r[1].timestamp - (int64_t)d->first.gpu) * scale;
+    double start = d->first.cpu + ((int64_t)e->first_sample - (int64_t)d->first.gpu) * scale;
+    double end = d->first.cpu + ((int64_t)e->last_sample - (int64_t)d->first.gpu) * scale;
     /* Reject stale samples and counter clock discontinuities. Leave room for calibration error. */
     if (start < (double)e->cb->gpu_start - FP_TRACE_GPU_SLACK_NS
             || end > (double)e->cb->gpu_end + FP_TRACE_GPU_SLACK_NS
@@ -1381,24 +1463,18 @@ static void trace_resolve(fp_trace_encoder *e)
     e->gpu_start = (uint64_t)start; e->gpu_end = (uint64_t)end;
 }
 
-API_AVAILABLE(macos(26.0))
-static void trace_mtl4_resolve(fp_trace_encoder *e)
+static void trace_mtl4_resolve(fp_trace_encoder *e)   /* g_lock held */
 {
     fp_trace_cb *c = e->cb;
-    if (!e->sample_ended || c->gpu_end <= c->gpu_start) return;
-    id<MTL4CounterHeap> heap = c->device->heap;
-    NSData *data = [heap resolveCounterRange:NSMakeRange((NSUInteger)e->sample, 2)];
-    if (data.length != 2 * sizeof(MTL4TimestampHeapEntry)) return;
-    const MTL4TimestampHeapEntry *r = data.bytes;
-    if (!r[0].timestamp || r[1].timestamp == MTLCounterErrorValue || r[1].timestamp <= r[0].timestamp) return;
+    if (!trace_valid_samples(e) || c->gpu_end <= c->gpu_start) return;
 
     /* The heap ticks share the commit feedback clock. A recycled pair can
      * contain old writes if this pass failed to produce either endpoint.
      * Those writes predate CPU encoding. Don't invalidate a heap that may
      * still be in use by another submission. */
     double ns_per_tick = 1e9 / (double)c->device->frequency;
-    double start = (double)r[0].timestamp * ns_per_tick;
-    double end = (double)r[1].timestamp * ns_per_tick;
+    double start = (double)e->first_sample * ns_per_tick;
+    double end = (double)e->last_sample * ns_per_tick;
     if (start < (double)e->start - ns_per_tick
             || start < (double)c->gpu_start - FP_TRACE_GPU_SLACK_NS
             || end > (double)c->gpu_end + FP_TRACE_GPU_SLACK_NS) return;
@@ -1411,7 +1487,7 @@ static void trace_mtl4_resolve(fp_trace_encoder *e)
 
 static void trace_discard_cb(fp_trace_cb *c);
 
-static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4)
+static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4, fp_trace_device *device)
 {
     FPTraceOwner *owner = mtl4 ? objc_getAssociatedObject(cb, &g_trace_owner_key) : nil;
     if (owner && owner->record) {
@@ -1427,7 +1503,7 @@ static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4)
         g_mtl4_trace_peak = MAX(g_mtl4_trace_peak, g_mtl4_trace_live);
     }
 #endif
-    if (g_trace_gpu) c->device = trace_device([cb device], mtl4);
+    c->device = device;
     if (!g_trace_origin) trace_start();
     if (!owner) {
         owner = [[FPTraceOwner alloc] init];
@@ -1495,15 +1571,22 @@ static fp_trace_encoder *trace_encoder_begin(id cb)
 
 static int trace_take_sample(fp_trace_encoder *e)
 {
-    pthread_mutex_lock(&g_lock);
     fp_trace_device *d = e->cb->device;
+    int calibrate = 0;
+    pthread_mutex_lock(&g_lock);
     if (!g_trace_stopped) {
         if (d->nfree) {
-            if (!d->mtl4 && !d->first.cpu) trace_calibrate(d);
+            calibrate = !d->mtl4 && !d->first.cpu;
             e->sample = (int)d->free_slots[--d->nfree];
         } else g_trace_pool_exhausted++;
     }
     pthread_mutex_unlock(&g_lock);
+    if (calibrate) {
+        fp_trace_calibration value = trace_read_calibration(d);
+        pthread_mutex_lock(&g_lock);
+        trace_record_calibration(d, value);
+        pthread_mutex_unlock(&g_lock);
+    }
     return e->sample >= 0;
 }
 
@@ -1841,25 +1924,21 @@ static void trace_cb_finish(fp_trace_cb *c)
     trace_release_cb(c);
 }
 
-static void trace_cb_completed(fp_trace_cb *c, id<MTLCommandBuffer> cb)
+static void trace_cb_completed(fp_trace_cb *c, double start, double end, char *error,
+                               fp_trace_calibration calibration)
 {
-    if (!c) return;
-    @autoreleasepool {
-        if (g_ring && g_ring_gpuerr && (cb.status == MTLCommandBufferStatusError || cb.error != nil)) {
-            c->error_time = trace_clock();
-            c->gpu_error = strdup(cb.error.localizedDescription.UTF8String ?: "command buffer error");
-        }
-        double start = cb.GPUStartTime, end = cb.GPUEndTime;
-        if (cb.status == MTLCommandBufferStatusCompleted && start > 0 && end >= start
-                && end <= (double)trace_clock() / 1e9 + 1) {
-            c->gpu_start = (uint64_t)(start * 1e9); c->gpu_end = (uint64_t)(end * 1e9);
-        }
-        if (c->device && c->device->buffer) trace_calibrate(c->device);
-        for (fp_trace_encoder *e = c->encoders; e; e = e->next) {
-            if (e->sample < 0) continue;
-            if (!g_trace_stopped) trace_resolve(e);
-            trace_release_sample(e);
-        }
+    if (error) {
+        c->error_time = trace_clock();
+        c->gpu_error = error;
+    }
+    if (start > 0 && end >= start && end <= (double)trace_clock() / 1e9 + 1) {
+        c->gpu_start = (uint64_t)(start * 1e9); c->gpu_end = (uint64_t)(end * 1e9);
+    }
+    if (calibration.at) trace_record_calibration(c->device, calibration);
+    for (fp_trace_encoder *e = c->encoders; e; e = e->next) {
+        if (e->sample < 0) continue;
+        if (!g_trace_stopped) trace_resolve(e);
+        trace_release_sample(e);
     }
     c->completed = 1;
     trace_cb_finish(c);
@@ -3300,12 +3379,37 @@ static void cb_mark_done(uint64_t uid)
 
 static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b)
 {
+    MTLCommandBufferStatus status = MTLCommandBufferStatusNotEnqueued;
+    double start = 0, end = 0;
+    char *error = NULL;
+    fp_trace_calibration calibration = {0};
+    if (trace || (g_capture_on & CAP_GPU_ERROR)) @autoreleasepool {
+        status = b.status;
+        if (trace) {
+            if (g_ring && g_ring_gpuerr) {
+                NSError *failure = b.error;
+                if (status == MTLCommandBufferStatusError || failure)
+                    error = strdup(failure.localizedDescription.UTF8String ?: "command buffer error");
+            }
+            if (status == MTLCommandBufferStatusCompleted) {
+                start = b.GPUStartTime; end = b.GPUEndTime;
+            }
+            if (trace->device && trace->device->buffer) {
+                pthread_mutex_lock(&g_lock);
+                int calibrate = trace_calibration_due(trace->device);
+                int sample = !g_trace_stopped;
+                pthread_mutex_unlock(&g_lock);
+                if (calibrate) calibration = trace_read_calibration(trace->device);
+                if (sample) trace_read_samples(trace);
+            }
+        }
+    }
     pthread_mutex_lock(&g_lock);
     g_inflight--;
     cb_mark_done(uid);
-    if ((g_capture_on & CAP_GPU_ERROR) && b.status == MTLCommandBufferStatusError)
+    if ((g_capture_on & CAP_GPU_ERROR) && status == MTLCommandBufferStatusError)
         capture_request("gpu-error");
-    if (trace) trace_cb_completed(trace, b);
+    if (trace) trace_cb_completed(trace, start, end, error, calibration);
     if (g_ring) ring_update(0);
     if (g_trace) trace_stream_flush();
     pthread_mutex_unlock(&g_lock);
@@ -4315,13 +4419,13 @@ static id h_dev_newev(id self, SEL _cmd)
 
 /* queue */
 
-static fp_cb *cb_record_new(id cb, fp_queue *q, int mtl4)   /* g_lock held */
+static fp_cb *cb_record_new(id cb, fp_queue *q, int mtl4, fp_trace_device *device)   /* g_lock held */
 {
     uint64_t uid = ++g_cbuid;
     fp_cb *c = &g_cbs[uid % FP_CBPOOL];
     c->uid = uid; c->cb = (void *)cb; c->q = q; c->state = 1; c->nenc = 0; c->nit = 0; c->mtl4 = mtl4; c->mtl4_resident = 0;
     c->enq = 0; c->commit_tick = 0; c->label[0] = 0;
-    c->trace = g_trace_enabled ? trace_cb_new(cb, uid, q ? q->idx : -1, mtl4) : NULL;
+    c->trace = g_trace_enabled ? trace_cb_new(cb, uid, q ? q->idx : -1, mtl4, device) : NULL;
     unsigned slot = FP_OPENCB;
     for (unsigned i = 0; i < FP_OPENCB; i++) {
         if (g_opencb[i].cb == (void *)cb) { slot = i; break; }   /* stale entry for a reused address */
@@ -4335,9 +4439,10 @@ static fp_cb *cb_record_new(id cb, fp_queue *q, int mtl4)   /* g_lock held */
 static void on_cb(id q, id cb)
 {
     if (!cb) return;
+    fp_trace_device *device = trace_cb_device(cb, 0);
     pthread_mutex_lock(&g_lock);
     fp_queue *fq = queue_get((void *)q);
-    if (fq) cb_record_new(cb, fq, 0);
+    if (fq) cb_record_new(cb, fq, 0, device);
     pthread_mutex_unlock(&g_lock);
     hook_cb(object_getClass(cb));
 }
@@ -4855,8 +4960,9 @@ static id h_mtl4_dev_cb(id self, SEL _cmd)
 
 static void on_mtl4_begin(id cb)
 {
+    fp_trace_device *device = trace_cb_device(cb, 1);
     pthread_mutex_lock(&g_lock);
-    cb_record_new(cb, NULL, 1);
+    cb_record_new(cb, NULL, 1, device);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -5787,7 +5893,16 @@ static void h_cb_commit(id self, SEL _cmd)
     if (OUTER) {
         uint64_t uid = 0;
         fp_trace_cb *trace = NULL;
-        NSString *l = [self label];
+        char cb_label[sizeof ((fp_cb *)0)->label] = "";
+        char queue_label[sizeof g_trace_queue_labels[0]] = "";
+        @autoreleasepool {
+            const char *label = [[self label] UTF8String];
+            if (label) snprintf(cb_label, sizeof cb_label, "%s", label);
+            if (g_trace_enabled) {
+                label = [(id<MTLCommandBuffer>)self commandQueue].label.UTF8String;
+                if (label) snprintf(queue_label, sizeof queue_label, "%s", label);
+            }
+        }
         pthread_mutex_lock(&g_lock);
         if (g_capture_busy) g_capture_last_commit = trace_clock();
         fp_cb *c = cb_find_open((void *)self);
@@ -5797,16 +5912,14 @@ static void h_cb_commit(id self, SEL _cmd)
                 g_capture_commits++;
                 capture_commit = 1;
             }
-            if (l) snprintf(c->label, sizeof c->label, "%s", l.UTF8String);
+            memcpy(c->label, cb_label, sizeof c->label);
             if (g_trace_enabled && (trace = c->trace)) {
                 trace->owner->record = NULL;
                 memcpy(trace->label, c->label, sizeof trace->label);
                 trace->completed_before = malloc(sizeof g_trace_completed);
                 memcpy(trace->completed_before, g_trace_completed, sizeof g_trace_completed);
-                if (!g_trace_tracks[c->q->idx][TR_CB].n) {
-                    const char *label = [(id<MTLCommandBuffer>)self commandQueue].label.UTF8String;
-                    if (label) snprintf(g_trace_queue_labels[c->q->idx], sizeof g_trace_queue_labels[0], "%s", label);
-                }
+                if (!g_trace_tracks[c->q->idx][TR_CB].n && queue_label[0])
+                    memcpy(g_trace_queue_labels[c->q->idx], queue_label, sizeof queue_label);
             }
             cb_close((void *)self);
             c->state = 2;
@@ -6024,16 +6137,27 @@ static void mtl4_retire_waits(fp_queue *q, uint64_t limit)
 API_AVAILABLE(macos(26.0))
 static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback> feedback)
 {
-    NSError *error = feedback.error;
-    double start = feedback.GPUStartTime, end = feedback.GPUEndTime;
-    int failed = error != nil;
-#ifdef FENCEPOST_TEST_HOOKS
-    failed |= submission->inject_error;
-#endif
+    fp_trace_cb *trace = submission->trace;
+    double start, end;
+    int failed;
     char *message = NULL;
-    if (failed && g_ring && g_ring_gpuerr) @autoreleasepool {
-        message = strdup(error ? (error.localizedDescription.UTF8String ?: "Metal 4 commit error")
-                               : "debug-only simulated Metal 4 feedback error");
+    @autoreleasepool {
+        NSError *error = feedback.error;
+        start = feedback.GPUStartTime; end = feedback.GPUEndTime;
+        failed = error != nil;
+#ifdef FENCEPOST_TEST_HOOKS
+        failed |= submission->inject_error;
+#endif
+        if (failed && g_ring && g_ring_gpuerr) {
+            message = strdup(error ? (error.localizedDescription.UTF8String ?: "Metal 4 commit error")
+                                   : "debug-only simulated Metal 4 feedback error");
+        }
+        if (trace && trace->device && trace->device->heap && !failed && start > 0 && end > start) {
+            pthread_mutex_lock(&g_lock);
+            int sample = !g_trace_stopped;
+            pthread_mutex_unlock(&g_lock);
+            if (sample) trace_read_samples(trace);
+        }
     }
     pthread_mutex_lock(&g_lock);
     g_inflight--;
@@ -6046,18 +6170,15 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
         mtl4_retire_signals(submission->queue, submission->signal_limit);
         mtl4_retire_waits(submission->queue, submission->wait_limit);
     }
-    fp_trace_cb *trace = submission->trace;
     if (trace) {
         if (!failed && start > 0 && end >= start && end <= (double)trace_clock() / 1e9 + 1) {
             trace->gpu_start = (uint64_t)(start * 1e9);
             trace->gpu_end = (uint64_t)(end * 1e9);
         }
-        @autoreleasepool {
-            for (fp_trace_encoder *e = trace->encoders; e; e = e->next) {
-                if (e->sample < 0) continue;
-                if (e->selected && !g_trace_stopped) trace_mtl4_resolve(e);
-                trace_release_sample(e);
-            }
+        for (fp_trace_encoder *e = trace->encoders; e; e = e->next) {
+            if (e->sample < 0) continue;
+            if (e->selected && !g_trace_stopped) trace_mtl4_resolve(e);
+            trace_release_sample(e);
         }
         trace->completed = 1;
         trace_cb_finish(trace);
@@ -6332,7 +6453,6 @@ static void h_end(id self, SEL _cmd)
         record_attachment(n, deferred->desc.texture, deferred->desc, deferred->layers, deferred->action);
     }
     clear_deferred_attachments(n);
-    NSString *l = [self label];
     if (n->mtl4) {
         if (!n->mtl4_drawn && n->kind == FPK_RENDER) fp4_note_attachment_loads(n);
         if (n->kind == FPK_RENDER) n->mtl4_epoch++;   /* distinguish stores from the last ordinary commands */
@@ -6360,9 +6480,13 @@ static void h_end(id self, SEL _cmd)
         n->mtl4_pipeline = nil;
         n->mtl4_pipeline_object = NULL;
     }
+    @autoreleasepool {
+        NSString *label = [self label];
+        if (n->mtl4)
+            snprintf(n->label, sizeof n->label, "MTL4 %s", label.length ? label.UTF8String : kind_name[n->kind]);
+        else if (label) snprintf(n->label, sizeof n->label, "%s", label.UTF8String);
+    }
     pthread_mutex_lock(&g_lock);
-    if (n->mtl4) snprintf(n->label, sizeof n->label, "MTL4 %s", l.length ? l.UTF8String : kind_name[n->kind]);
-    else if (l) snprintf(n->label, sizeof n->label, "%s", l.UTF8String);
     if (g_trace_enabled) trace_encoder_end(n);
     n->state = 2;
     fp_node **link = &g_open_encoders;
