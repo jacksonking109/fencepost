@@ -6470,7 +6470,7 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
     if (!labels) { free(submission); return NULL; }
     for (NSUInteger i = 0; i < count; i++) {
         const char *label = [[buffers[i] label] UTF8String];
-        snprintf(labels[i], sizeof labels[i], "%s", label ?: "");
+        strlcpy(labels[i], label ?: "", sizeof labels[i]);
     }
     pthread_mutex_lock(&g_lock);
     fp_queue *q = queue_get_kind((void *)queue, 1);
@@ -6491,7 +6491,7 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
                 if (g_trace_enabled && g_trace_gpu) trace_mtl4_abandon_samples(cb);
                 continue;
             }
-            snprintf(c->label, sizeof c->label, "%s", labels[i]);
+            strlcpy(c->label, labels[i], sizeof c->label);
             c->q = q;
             c->commit_tick = tick;
             submission->cbs[submission->ncbs++] = c->uid;
