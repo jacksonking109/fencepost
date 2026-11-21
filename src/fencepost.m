@@ -775,6 +775,7 @@ static int g_capture_busy;                   /* starting, active or stopping (g_
 static unsigned g_capture_commits;           /* tracked commits still in Metal (g_lock) */
 static uint64_t g_capture_last_commit;        /* most recent submission activity (g_lock) */
 static int g_capture_mtl4, g_capture_mtl4_unsafe;  /* Metal 4 observed / tracking lost (g_lock) */
+static int g_capture_mtl4_failed;            /* a failed commit left tracked buffers (g_lock) */
 static unsigned g_capture_mtl4_ended;       /* ended, unsubmitted buffers (g_lock) */
 static int g_capture_starting, g_capture_stop_queued;
 static uint64_t g_capture_generation, g_capture_feedback;
@@ -792,6 +793,7 @@ static void capture_feedback_done(uint64_t generation, int failed);
 
 typedef struct {
     NSMutableArray *ends;
+    const char *refusal;
 } fp_capture_start;
 static _Thread_local fp_capture_start *tl_capture_start;
 
@@ -803,25 +805,53 @@ static _Thread_local fp_capture_start *tl_capture_start;
 
 static char g_capture_buffer_key;
 
+/* g_lock held. A failed submission can recover because its identities are
+ * known. Lost hooks or ownership are process-wide: their lifetimes are unknown. */
+static void capture_mtl4_recovered(void)
+{
+    if (!g_capture_mtl4_failed || g_capture_mtl4_unsafe || g_capture_mtl4_ended || g_capture_commits) return;
+    g_capture_mtl4_failed = 0;
+    fp_log("fencepost: Metal 4 capture gate recovered after failed commit\n");
+}
+
+static void capture_mtl4_mark_untracked(const char *reason)
+{
+    if (g_capture_mtl4_unsafe) return;
+    g_capture_mtl4_unsafe = 1;
+    fp_log("fencepost: Metal 4 capture disabled for this process: %s\n", reason);
+}
+
 @implementation FPCaptureBufferOwner
 - (void)dealloc
 {
     if (atomic_load_explicit(&ended, memory_order_relaxed)) {
         pthread_mutex_lock(&g_lock);
         g_capture_mtl4_ended--;
+        capture_mtl4_recovered();
         pthread_mutex_unlock(&g_lock);
     }
     [super dealloc];
 }
 @end
 
-static void capture_mtl4_tracking_lost(void)
+static void capture_interrupt_start(const char *reason)
+{
+    tl_capture_start->refusal = reason;
+    @throw [NSException exceptionWithName:@"FencepostCaptureStartInterrupted"
+                                   reason:[NSString stringWithUTF8String:reason] userInfo:nil];
+}
+
+/* Returns true on the starting thread, where the caller must unwind instead
+ * of waiting or allowing an unhooked object to escape the factory. */
+static int capture_mtl4_tracking_lost(const char *reason)
 {
     pthread_mutex_lock(&g_lock);
-    g_capture_mtl4_unsafe = 1;
+    capture_mtl4_mark_untracked(reason);
     /* A factory must finish the transition before returning an unhooked object. */
-    while (g_capture_starting) pthread_cond_wait(&g_capture_started_cond, &g_lock);
+    while (g_capture_starting && !tl_capture_start)
+        pthread_cond_wait(&g_capture_started_cond, &g_lock);
     pthread_mutex_unlock(&g_lock);
+    return tl_capture_start != NULL;
 }
 
 /* Called with g_lock held. Keep the first request for the next unopened frame. */
@@ -4710,13 +4740,13 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
             started = [manager startCaptureWithDescriptor:desc error:&error];
         } @catch (NSException *exception) {
             threw = YES;
-            if (!start.ends)
+            if (!start.refusal)
                 fp_log("fencepost: capture failed: %s\n", exception.reason.UTF8String ?: exception.name.UTF8String);
         } @finally {
             tl_capture_start = NULL;
             tl_depth = depth;
             pthread_mutex_lock(&g_lock);
-            if (started && !start.ends) {
+            if (started && !start.refusal) {
                 g_capture_started = g_capture_last_commit = trace_clock();
                 g_capture_until = frame + g_capture_frames;
                 g_capture_generation = ++g_capture_count;
@@ -4726,8 +4756,8 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
             pthread_cond_broadcast(&g_capture_started_cond);
             pthread_mutex_unlock(&g_lock);
         }
-        if (start.ends) {
-            fp_log("fencepost: capture refused: Metal 4 end reentered capture start\n");
+        if (start.refusal) {
+            fp_log("fencepost: capture refused: %s\n", start.refusal);
             if (started || manager.isCapturing) {
                 g_capture_started = trace_clock();
                 g_capture_count++;
@@ -4979,11 +5009,11 @@ static void capture_publish_frame(void)
     capture_schedule_stop();
 }
 
-static void capture_after_commit(int mtl4, int submitted)
+static void capture_after_commit(void)
 {
     pthread_mutex_lock(&g_lock);
-    if (mtl4 && !submitted) g_capture_mtl4_unsafe = 1;
     g_capture_commits--;
+    capture_mtl4_recovered();
     if (g_capture_generation) g_capture_last_commit = trace_clock();
     capture_publish_frame();
     int synchronous = !g_capture_mtl4;
@@ -5245,7 +5275,10 @@ static id h_mtl4_dev_cb(id self, SEL _cmd)
         hook_mtl4_cb(cls);
         if (g_capture_available) {
             IMP end = class_getMethodImplementation(cls, sel_registerName("endCommandBuffer"));
-            if (end != (IMP)h_mtl4_end) capture_mtl4_tracking_lost();
+            if (end != (IMP)h_mtl4_end && capture_mtl4_tracking_lost("Metal 4 command buffer end hook unavailable")) {
+                [cb release];
+                capture_interrupt_start("Metal 4 command buffer tracking lost during capture start");
+            }
             pthread_mutex_lock(&g_lock);
             g_capture_mtl4 = 1;
             pthread_mutex_unlock(&g_lock);
@@ -5295,7 +5328,7 @@ static void h_mtl4_end(id self, SEL _cmd)
             pthread_cond_wait(&g_capture_started_cond, &g_lock);
         if (owner)
             g_capture_mtl4_ended += !atomic_exchange_explicit(&owner->ended, 1, memory_order_relaxed);
-        else g_capture_mtl4_unsafe = 1;
+        else capture_mtl4_mark_untracked("could not track an ended Metal 4 command buffer");
         pthread_mutex_unlock(&g_lock);
         if (tl_capture_start) {
             /* The starting thread cannot wait for itself. Record the end above,
@@ -5303,10 +5336,10 @@ static void h_mtl4_end(id self, SEL _cmd)
              * capture layer. If Metal catches this exception and starts anyway,
              * capture_start stops it before replaying any native ends. */
             if (!tl_capture_start->ends) tl_capture_start->ends = [[NSMutableArray alloc] init];
-            [tl_capture_start->ends addObject:self];
+            if ([tl_capture_start->ends indexOfObjectIdenticalTo:self] == NSNotFound)
+                [tl_capture_start->ends addObject:self];
             LEAVE;
-            @throw [NSException exceptionWithName:@"FencepostCaptureStartInterrupted"
-                                           reason:@"Metal 4 end reentered capture start" userInfo:nil];
+            capture_interrupt_start("Metal 4 end reentered capture start");
         }
     }
     ORIG(H_4_END, void (*)(id, SEL))(self, _cmd);
@@ -6277,7 +6310,7 @@ static void h_cb_commit(id self, SEL _cmd)
         }
     }
     ORIG(H_CB_COMMIT, void (*)(id, SEL))(self, _cmd);
-    if (capture_commit) capture_after_commit(0, 1);
+    if (capture_commit) capture_after_commit();
     LEAVE;
 }
 
@@ -6542,15 +6575,24 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
 static Class g_mtl4_options_class;
 static char g_mtl4_callbacks_key;
 
-static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, uint64_t *generation)
+typedef struct {
+    FPCaptureBufferOwner **owners;
+    NSUInteger count;
+} fp_capture_submit;
+
+static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, uint64_t *generation,
+                               fp_capture_submit *submit)
 {
     if (!g_capture_available || !buffers || !count) return 0;
     pthread_mutex_lock(&g_lock);
     int tracked = outer;
     if (g_capture_mtl4_ended) {
-        for (NSUInteger i = 0; i < count; i++) {
+        submit->owners = calloc(MIN(count, g_capture_mtl4_ended), sizeof *submit->owners);
+        /* Allocation failure leaves all ended identities registered. */
+        for (NSUInteger i = 0; submit->owners && i < count; i++) {
             FPCaptureBufferOwner *owner = objc_getAssociatedObject(buffers[i], &g_capture_buffer_key);
             if (!owner || !atomic_exchange_explicit(&owner->ended, 0, memory_order_relaxed)) continue;
+            submit->owners[submit->count++] = [owner retain];
             g_capture_mtl4_ended--;
             tracked = 1;
         }
@@ -6564,6 +6606,24 @@ static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, u
     }
     pthread_mutex_unlock(&g_lock);
     return tracked;
+}
+
+static void capture_mtl4_submit_done(fp_capture_submit *submit, int tracked, int returned)
+{
+    /* Restore only the identities this call removed, before unblocking starts.
+     * Keep any newer end of a reused buffer registered as well. */
+    if (!returned && submit->count) {
+        pthread_mutex_lock(&g_lock);
+        if (!g_capture_mtl4_failed)
+            fp_log("fencepost: Metal 4 commit failed; capture gate held until pending buffers drain\n");
+        g_capture_mtl4_failed = 1;
+        for (NSUInteger i = 0; i < submit->count; i++)
+            g_capture_mtl4_ended += !atomic_exchange_explicit(&submit->owners[i]->ended, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&g_lock);
+    }
+    for (NSUInteger i = 0; i < submit->count; i++) [submit->owners[i] release];
+    free(submit->owners);
+    if (tracked) capture_after_commit();
 }
 
 static id h_mtl4_options_init(id self, SEL _cmd)
@@ -6629,7 +6689,8 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
 {
     ENTER;
     uint64_t generation = 0;
-    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation), returned = 0;
+    fp_capture_submit submit = {0};
+    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit), returned = 0;
     id opts = nil;
     @try {
         if (OUTER) {
@@ -6647,7 +6708,7 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
         returned = 1;
     } @finally {
         [opts release];
-        if (tracked) capture_after_commit(1, returned);
+        capture_mtl4_submit_done(&submit, tracked, returned);
         LEAVE;
     }
     if (opts) maybe_summary();
@@ -6657,7 +6718,8 @@ static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger 
 {
     ENTER;
     uint64_t generation = 0;
-    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation), returned = 0;
+    fp_capture_submit submit = {0};
+    int tracked = capture_mtl4_submit(buffers, count, OUTER, &generation, &submit), returned = 0;
     id opts = nil;
     @try {
         if (OUTER && (options || generation)) {
@@ -6668,7 +6730,7 @@ static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger 
         returned = 1;
     } @finally {
         [opts release];
-        if (tracked) capture_after_commit(1, returned);
+        capture_mtl4_submit_done(&submit, tracked, returned);
         LEAVE;
     }
     if (opts) maybe_summary();
@@ -6751,7 +6813,7 @@ static void h_mtl4_wait(id self, SEL _cmd, id event, uint64_t value)
 static void h_mtl4_drawable_signal(id self, SEL _cmd, id drawable)
 {
     ENTER;
-    int capture_boundary = 0, returned = 0;
+    int capture_boundary = 0;
     if (OUTER) {
         pthread_mutex_lock(&g_lock);
         if (!g_frame_api) {
@@ -6766,9 +6828,8 @@ static void h_mtl4_drawable_signal(id self, SEL _cmd, id drawable)
     }
     @try {
         ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
-        returned = 1;
     } @finally {
-        if (capture_boundary) capture_after_commit(1, returned);
+        if (capture_boundary) capture_after_commit();
         LEAVE;
     }
 }
@@ -7466,8 +7527,9 @@ static void hook_device(Class cls)
         install(cls, 104, mtl4_device_hooks, N(mtl4_device_hooks));
         if (g_capture_available) {
             Method factory = class_getInstanceMethod(cls, sel_registerName("newCommandBuffer"));
-            if (factory && method_getImplementation(factory) != (IMP)h_mtl4_dev_cb)
-                capture_mtl4_tracking_lost();
+            if (factory && method_getImplementation(factory) != (IMP)h_mtl4_dev_cb &&
+                capture_mtl4_tracking_lost("Metal 4 command buffer factory hook unavailable"))
+                capture_interrupt_start("Metal 4 command buffer tracking lost during capture start");
         }
     }
 }
