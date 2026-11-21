@@ -3678,6 +3678,15 @@ static void fp4_capture_tables(id encoder, unsigned stages)
     if (!n->mtl4_drawn && n->kind == FPK_RENDER) fp4_note_attachment_loads(n);
     n->mtl4_drawn = 1;
     if (n->kind == FPK_RENDER) n->mtl4_draw_epoch = n->mtl4_epoch;   /* the last draw, not sync work */
+    if (stages == (FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT))) {
+        FP4ArgumentState *shared = n->mtl4_tables[FP4_VERTEX];
+        if (shared == n->mtl4_tables[FP4_FRAGMENT]) {
+            if (n->mtl4_last[FP4_VERTEX] != n->mtl4_epoch) fp4_note_work(n, FP4_VERTEX);
+            if (n->mtl4_last[FP4_FRAGMENT] != n->mtl4_epoch) fp4_note_work(n, FP4_FRAGMENT);
+            if (shared) fp4_sample_table(n, shared, stages);
+            return;
+        }
+    }
     while (stages) {
         int stage = __builtin_ctz(stages);
         unsigned together = FP4_STAGE(stage);
