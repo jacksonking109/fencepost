@@ -779,7 +779,7 @@ static const char g_trace_owner_key;
 static uint64_t trace_clock(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
 enum { CAP_RACE = 1, CAP_GPU_ERROR = 2, CAP_SPIKE = 4 };
-enum { CAP_MTL4_ATTEMPTS = 3 };
+enum { CAP_MTL4_ATTEMPTS = 3, CAP_MTL4_END_WAIT_SECS = 3 };
 static const char *g_capture_prefix, *g_capture_file;
 static struct timespec g_capture_mtime;
 static int g_capture_owner_warned;
@@ -4766,7 +4766,8 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
 
         /* Reserve the transition under the same lock as end and commit.
          * A commit removes ended identities at entry but holds the in-Metal
-         * count until it returns. End cannot enter Metal during this start. */
+         * count until it returns. End waits for this start to finish, with
+         * a timeout that disables capture if Metal depends on that end. */
         (void)CAPTURE_TEST("before-start-gate");
         pthread_mutex_lock(&g_lock);
         int unsafe = g_capture_mtl4_unsafe;
@@ -4786,8 +4787,13 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
         @try {
             tl_capture_start = &start;
             (void)CAPTURE_TEST("start-reserved");
-            started = [manager startCaptureWithDescriptor:desc error:&error];
-            if (started) (void)CAPTURE_TEST("start-recording");
+            pthread_mutex_lock(&g_lock);
+            int can_start = !g_capture_mtl4_unsafe;
+            pthread_mutex_unlock(&g_lock);
+            if (can_start) {
+                started = [manager startCaptureWithDescriptor:desc error:&error];
+                if (started) (void)CAPTURE_TEST("start-recording");
+            }
         } @catch (NSException *exception) {
             threw = YES;
             if (!start.refusal)
@@ -4796,6 +4802,8 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
             tl_capture_start = NULL;
             tl_depth = depth;
             pthread_mutex_lock(&g_lock);
+            if (!start.refusal && g_capture_mtl4_unsafe)
+                start.refusal = "Metal 4 command buffer tracking lost during capture start";
             if (started && !start.refusal) {
                 g_capture_started = g_capture_last_commit = trace_clock();
                 g_capture_until = frame + g_capture_frames;
@@ -5396,6 +5404,21 @@ static void h_mtl4_begin_opts(id self, SEL _cmd, id allocator, id options)
     if (OUTER) on_mtl4_begin(self);
 }
 
+/* g_lock held. Keep the same deadline across spurious wakeups. */
+static void capture_mtl4_wait_for_start(void)
+{
+    uint64_t deadline = trace_clock() + CAP_MTL4_END_WAIT_SECS * NSEC_PER_SEC;
+    while (g_capture_starting) {
+        uint64_t now = trace_clock();
+        if (now >= deadline) break;
+        uint64_t remaining = deadline - now;
+        struct timespec timeout = {remaining / NSEC_PER_SEC, remaining % NSEC_PER_SEC};
+        if (pthread_cond_timedwait_relative_np(&g_capture_started_cond, &g_lock, &timeout)) break;
+    }
+    if (g_capture_starting)
+        capture_mtl4_mark_untracked("timed out waiting to end a Metal 4 command buffer during capture start");
+}
+
 static void h_mtl4_end(id self, SEL _cmd)
 {
     ENTER;
@@ -5407,8 +5430,7 @@ static void h_mtl4_end(id self, SEL _cmd)
             [owner release];
         }
         pthread_mutex_lock(&g_lock);
-        while (g_capture_starting && !tl_capture_start)
-            pthread_cond_wait(&g_capture_started_cond, &g_lock);
+        if (g_capture_starting && !tl_capture_start) capture_mtl4_wait_for_start();
         if (owner)
             g_capture_mtl4_ended += !atomic_exchange_explicit(&owner->ended, 1, memory_order_relaxed);
         else capture_mtl4_mark_untracked("could not track an ended Metal 4 command buffer");

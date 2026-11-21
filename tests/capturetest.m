@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 enum gate_case {
-    GATE_NONE, GATE_RACE, GATE_REENTRANT, GATE_REENTRANT_RECORDING, GATE_FAILED,
+    GATE_NONE, GATE_RACE, GATE_REENTRANT, GATE_REENTRANT_RECORDING, GATE_TIMEOUT, GATE_FAILED,
     GATE_TEARDOWN, GATE_TEARDOWN_FILE, GATE_FEEDBACK
 };
 static struct {
@@ -33,6 +33,10 @@ static BOOL reentrant_end(void)
 
 static int gate_hook(const char *phase)
 {
+    if (gate.mode == GATE_TIMEOUT && !strcmp(phase, "start-reserved")) {
+        dispatch_semaphore_signal(gate.enter_end);
+        phase_wait(gate.end_tracked);
+    }
     if (gate.mode == GATE_RACE) {
         if (!strcmp(phase, "before-start-gate") && !gate.requested) {
             gate.requested = YES;
@@ -182,15 +186,16 @@ static int run_gate(id<MTLDevice> device, void (*frame)(id), void (*capture)(con
         !mtl4_record(held, 99, NULL) || !mtl4_encode(main, 1, frame) || !mtl4_submit(main)) return 2;
     MTLCaptureManager *manager = MTLCaptureManager.sharedCaptureManager;
     dispatch_group_t worker = NULL;
-    if (gate.mode == GATE_RACE) {
+    if (gate.mode == GATE_RACE || gate.mode == GATE_TIMEOUT) {
         gate.enter_end = dispatch_semaphore_create(0);
         gate.end_tracked = dispatch_semaphore_create(0);
-        gate.release_end = dispatch_semaphore_create(0);
+        if (gate.mode == GATE_RACE) gate.release_end = dispatch_semaphore_create(0);
         worker = dispatch_group_create();
         dispatch_group_async(worker, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             @autoreleasepool {
                 phase_wait(gate.enter_end);
                 [held.cb endCommandBuffer];
+                if (gate.mode == GATE_TIMEOUT) dispatch_semaphore_signal(gate.end_tracked);
             }
         });
     } else if (reentrant_end()) {
@@ -208,15 +213,19 @@ static int run_gate(id<MTLDevice> device, void (*frame)(id), void (*capture)(con
     capture("API Request");
     if (!mtl4_encode(main, 2, frame) || manager.isCapturing || !mtl4_submit(main)) return 3;
     if (worker) {
-        dispatch_semaphore_signal(gate.release_end);
+        if (gate.release_end) dispatch_semaphore_signal(gate.release_end);
         if (dispatch_group_wait(worker, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC))) return 3;
         dispatch_release(worker);
-        dispatch_release(gate.release_end);
+        if (gate.release_end) dispatch_release(gate.release_end);
         dispatch_release(gate.end_tracked);
         dispatch_release(gate.enter_end);
     }
     if (reentrant_end() && !gate.replayed) return 3;
     if (!mtl4_submit(held)) return 3;
+    if (gate.mode == GATE_TIMEOUT) {
+        capture("API Request");
+        return mtl4_encode(main, 3, frame) && !manager.isCapturing && mtl4_submit(main) ? 0 : 3;
+    }
     gate.failed_end = NO;
     if (reentrant_end()) capture("API Request");
     if (!mtl4_encode(main, 3, frame) || !manager.isCapturing || !mtl4_submit(main)) return 3;
@@ -241,7 +250,7 @@ static int run_mixed_metal3(id<MTLDevice> device, void (*frame)(id), void (*capt
 API_AVAILABLE(macos(26.0))
 static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), void (*capture)(const char *))
 {
-    if (gate.mode == GATE_RACE || reentrant_end() || gate.mode == GATE_FAILED)
+    if (gate.mode == GATE_RACE || reentrant_end() || gate.mode == GATE_TIMEOUT || gate.mode == GATE_FAILED)
         return run_gate(device, frame, capture);
     if (!strcmp(mode, "mtl4-mixed-metal3")) return run_mixed_metal3(device, frame, capture);
     BOOL discard = !strcmp(mode, "mtl4-discard");
@@ -350,6 +359,7 @@ int main(int argc, char **argv)
         if (!strcmp(mode, "mtl4-end-race")) gate.mode = GATE_RACE;
         if (!strcmp(mode, "mtl4-reentrant-end")) gate.mode = GATE_REENTRANT;
         if (!strcmp(mode, "mtl4-reentrant-recording-end")) gate.mode = GATE_REENTRANT_RECORDING;
+        if (!strcmp(mode, "mtl4-end-start-timeout")) gate.mode = GATE_TIMEOUT;
         if (!strcmp(mode, "mtl4-failed-commit")) gate.mode = GATE_FAILED;
         if (!strcmp(mode, "mtl4-feedback-fallback")) gate.mode = GATE_FEEDBACK;
         if (!strcmp(mode, "teardown-api")) gate.mode = GATE_TEARDOWN;

@@ -122,6 +122,11 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
             captures.remove(partial)
     if message:
         assert log.splitlines().count(message) == 1, log
+    if mode == "mtl4-end-start-timeout":
+        assert log.splitlines().count(
+            "fencepost: capture refused: Metal 4 command buffer tracking lost during capture start") == 1, log
+        assert log.splitlines().count(
+            "fencepost: capture refused: Metal 4 command buffer tracking unavailable") == 1, log
     if reason is None:
         assert not captures and not starts and not stops, (captures, log)
         return
@@ -249,6 +254,9 @@ def main():
                         message="fencepost: capture refused: Metal 4 end reentered capture start")),
                     ("mtl4-reentrant-recording-end", "same-thread Metal 4 end stops a live capture before replay", dict(gate,
                         message="fencepost: capture refused: Metal 4 end reentered capture start")),
+                    ("mtl4-end-start-timeout", "Metal 4 end times out of the start gate and still submits", {
+                        "hooks": True, "message": "fencepost: Metal 4 capture disabled for this process: "
+                        "timed out waiting to end a Metal 4 command buffer during capture start"}),
                     ("mtl4-failed-commit", "Metal 4 commit exception holds the gate until successful retry", dict(gate,
                         message="fencepost: Metal 4 capture gate recovered after failed commit")),
                     ("mtl4-blocked", "Metal 4 gives up after three blocked frame starts", {

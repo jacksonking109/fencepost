@@ -333,7 +333,9 @@ Metal API can open the next frame, and both entry points check the shared Metal 
 
 A Metal 4 buffer that has ended and is awaiting submission on any queue blocks the start. Fencepost
 tries the first allocation or begin of each eligible frame and logs a refusal after three blocked frame starts.
-An ended buffer stops blocking capture when it is successfully submitted or deallocated. Metal 4 captures stop at a frame
+An ended buffer stops blocking capture when it is successfully submitted or deallocated. If an end waits three seconds
+for a capture start, fencepost logs the timeout, disables capture for the process, and lets the end proceed.
+Metal 4 captures stop at a frame
 boundary once submission feedback has arrived. If fencepost cannot get feedback for a submission, it logs
 that it will stop at the frame boundary. If the app starts another frame while feedback is pending, the
 capture can extend to its end. The idle and hard-cap timers still apply.
