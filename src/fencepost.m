@@ -779,6 +779,7 @@ static int g_capture_mtl4_failed;            /* a failed commit left tracked buf
 static unsigned g_capture_mtl4_ended;       /* ended, unsubmitted buffers (g_lock) */
 static int g_capture_starting, g_capture_stop_queued;
 static uint64_t g_capture_generation, g_capture_feedback;
+static int g_capture_feedback_unavailable;
 static unsigned g_capture_attempts;          /* first begins tried for this request (capture lock) */
 static pthread_cond_t g_capture_started_cond = PTHREAD_COND_INITIALIZER;
 static NSString *g_capture_path;
@@ -4751,6 +4752,7 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
                 g_capture_until = frame + g_capture_frames;
                 g_capture_generation = ++g_capture_count;
                 g_capture_feedback = 0;
+                g_capture_feedback_unavailable = 0;
             }
             g_capture_starting = 0;
             pthread_cond_broadcast(&g_capture_started_cond);
@@ -4913,12 +4915,12 @@ static void capture_watchdog(uint64_t check_at)
     });
 }
 
-/* g_lock held. The boundary must have reached Metal, and in a Metal 4
- * process every observed submission in this capture must have feedback. */
+/* g_lock held. The boundary must have reached Metal. Only wait for feedback
+ * when every tracked submission in the recording could provide it. */
 static int capture_ready(void)
 {
     return g_capture_generation && !g_capture_commits && g_capture_frame >= g_capture_until &&
-           (!g_capture_mtl4 || !g_capture_feedback);
+           (!g_capture_mtl4 || !g_capture_feedback || g_capture_feedback_unavailable);
 }
 
 /* Called under the capture lock, never from Metal's feedback callback. */
@@ -4957,6 +4959,26 @@ static void capture_feedback_done(uint64_t generation, int failed)
         g_capture_feedback--;
         g_capture_last_commit = trace_clock();
         capture_schedule_stop();
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* Register after attaching the handler and before handing it to Metal. */
+static void capture_feedback_attached(uint64_t generation)
+{
+    if (!generation) return;
+    pthread_mutex_lock(&g_lock);
+    if (generation == g_capture_generation) g_capture_feedback++;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void capture_feedback_missing(uint64_t generation)
+{
+    if (!generation) return;
+    pthread_mutex_lock(&g_lock);
+    if (generation == g_capture_generation && !g_capture_feedback_unavailable) {
+        g_capture_feedback_unavailable = 1;
+        fp_log("fencepost: capture feedback unavailable for a submission; stopping at the frame boundary\n");
     }
     pthread_mutex_unlock(&g_lock);
 }
@@ -6256,9 +6278,9 @@ static void h_cb_commit(id self, SEL _cmd)
     ENTER;
     int capture_commit = 0;
     uint64_t capture_generation = 0;
+    uint64_t uid = 0;
+    fp_trace_cb *trace = NULL;
     if (OUTER) {
-        uint64_t uid = 0;
-        fp_trace_cb *trace = NULL;
         char cb_label[sizeof ((fp_cb *)0)->label] = "";
         char queue_label[sizeof g_trace_queue_labels[0]] = "";
         @autoreleasepool {
@@ -6278,7 +6300,6 @@ static void h_cb_commit(id self, SEL _cmd)
                 g_capture_commits++;
                 capture_commit = 1;
                 capture_generation = g_capture_generation;
-                if (capture_generation) g_capture_feedback++;
             }
             memcpy(c->label, cb_label, sizeof c->label);
             if (g_trace_enabled && (trace = c->trace)) {
@@ -6304,16 +6325,23 @@ static void h_cb_commit(id self, SEL _cmd)
             g_st[ST_ANALYSIS_NS] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
         }
         pthread_mutex_unlock(&g_lock);
+    }
+    int returned = 0;
+    @try {
         if (uid) {
             [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> b) {
                 cb_done(uid, trace, b, capture_generation);
             }];
+            capture_feedback_attached(capture_generation);
             maybe_summary();
         }
+        ORIG(H_CB_COMMIT, void (*)(id, SEL))(self, _cmd);
+        returned = 1;
+    } @finally {
+        if (!returned) capture_feedback_missing(capture_generation);
+        if (capture_commit) capture_after_commit();
+        LEAVE;
     }
-    ORIG(H_CB_COMMIT, void (*)(id, SEL))(self, _cmd);
-    if (capture_commit) capture_after_commit();
-    LEAVE;
 }
 
 typedef struct {
@@ -6603,8 +6631,6 @@ static int capture_mtl4_submit(const id *buffers, NSUInteger count, int outer, u
         g_capture_mtl4 = 1;
         g_capture_commits++;
         *generation = g_capture_generation;
-        /* A submission we cannot attach feedback to will drain by watchdog. */
-        if (*generation) g_capture_feedback++;
     }
     pthread_mutex_unlock(&g_lock);
     return tracked;
@@ -6684,6 +6710,7 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
     if (!submission && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
     for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
     [blocks release];
+    capture_feedback_attached(capture_generation);
     return opts;
 }
 
@@ -6709,6 +6736,7 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
         }
         returned = 1;
     } @finally {
+        if (!opts || !returned) capture_feedback_missing(generation);
         [opts release];
         capture_mtl4_submit_done(&submit, tracked, returned);
         LEAVE;
@@ -6731,6 +6759,7 @@ static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger 
         ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, opts ?: options);
         returned = 1;
     } @finally {
+        if (!opts || !returned) capture_feedback_missing(generation);
         [opts release];
         capture_mtl4_submit_done(&submit, tracked, returned);
         LEAVE;
