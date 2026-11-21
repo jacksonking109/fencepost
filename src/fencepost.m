@@ -67,6 +67,10 @@ enum { FPK_RENDER = 1, FPK_COMPUTE, FPK_BLIT, FPK_SIGNAL };
 static const char *const kind_name[] = { "?", "render", "compute", "blit", "event signal" };
 enum { FP4_VERTEX, FP4_FRAGMENT, FP4_TILE, FP4_OBJECT, FP4_MESH,
        FP4_DISPATCH, FP4_BLIT, FP4_ACCEL, FP4_ML, FP4_RESOURCE_STATE, FP4_STAGE_COUNT };
+static const char *const fp4_stage_names[] = {
+    "Vertex", "Fragment", "Tile", "Object", "Mesh", "Dispatch", "Blit",
+    "AccelerationStructure", "MachineLearning", "ResourceState"
+};
 #define FP4_STAGE(i) (1u << (i))
 #define FP4_ALL (FP4_STAGE(FP4_STAGE_COUNT) - 1)
 enum { FP4_TABLES = FP4_DISPATCH + 1 };
@@ -96,10 +100,20 @@ typedef struct {
 } fp_acc;
 
 typedef struct { uint64_t src; uint8_t after, before; } fp_edge;
-typedef struct { void *ev; uint64_t val, queue_seq; uint8_t before; } fp_evwait;
+typedef struct { void *ev; uint64_t val, queue_seq; uint8_t before; uint64_t ticket; } fp_evwait;
 typedef struct { void *f; uint64_t src; uint8_t st; } fp_fwait;
 typedef struct { void *f; uint8_t st; } fp_fupd;
 typedef struct { uint64_t uid, seq; } fp_queue_signal;
+enum { FP4_CONSUMER, FP4_PRODUCER, FP4_INTRA, FP4_FENCE_UPDATE, FP4_FENCE_WAIT };
+typedef struct {
+    void *fence;
+    uint32_t epoch;
+    uint16_t after, before;
+    uint8_t kind;
+} fp4_sync;
+typedef struct { uint64_t uid, seq; uint32_t epoch; } fp4_prefix;
+typedef struct { fp4_prefix cut[FP4_STAGE_COUNT][FP4_STAGE_COUNT]; } fp4_prefixes;
+typedef struct { uint32_t epoch; uint16_t mask; } fp4_work_epoch;
 
 struct fp_queue;
 typedef struct fp_node {
@@ -121,6 +135,11 @@ typedef struct fp_node {
     uint64_t frame, queue_seq, chain_prev;   /* chain_prev: earlier node on the longest ordered chain */
     uint32_t depth;                 /* encoders on that chain within the frame, this one included */
     uint32_t mtl4_epoch, mtl4_work;
+    uint32_t mtl4_first[FP4_STAGE_COUNT], mtl4_last[FP4_STAGE_COUNT];
+    uint64_t mtl4_previous;
+    fp4_sync *mtl4_sync; int mtl4_nsync, mtl4_csync;
+    fp4_work_epoch *mtl4_work_epochs; int mtl4_nwork_epochs, mtl4_cwork_epochs;
+    fp4_prefixes *mtl4_prefixes;
     id mtl4_tables[FP4_TABLES];
     uint64_t mtl4_versions[FP4_TABLES];
     fp_bits anc[2];                 /* what is ordered before this node's vertex / fragment work */
@@ -146,6 +165,8 @@ typedef struct fp_queue {
     uint64_t *held; int nheld, cheld;
     fp_evwait *mtl4_waits;
     int mtl4_nwaits, mtl4_cwaits;
+    uint64_t mtl4_wait_ticket, mtl4_last_node;
+    fp4_prefixes *mtl4_prefixes;
     struct fp_trace_cb *mtl4_last_trace;
     void **mtl4_residency;
     int mtl4_nresidency, mtl4_cresidency;
@@ -175,7 +196,7 @@ static uint64_t *g_pend; static int g_npend, g_cpend;
 static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
 static long g_st[ST_COUNT];
 static long g_mtl4_ml_encoders, g_mtl4_gpu_errors;
-static long g_mtl4_residency_only, g_mtl4_accel_builds;
+static long g_mtl4_residency_only, g_mtl4_accel_builds, g_mtl4_partial_hits;
 static atomic_long g_fp4_address_misses, g_fp4_id_misses;
 #ifdef FENCEPOST_TEST_HOOKS
 static unsigned g_mtl4_test_error_commit;
@@ -246,6 +267,10 @@ static fp_node *node_new(int kind)   /* lock held */
     memset(n->mtl4_tables, 0, sizeof n->mtl4_tables);
     memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
     n->mtl4_epoch = 1; n->mtl4_work = 0;
+    n->mtl4_previous = 0; n->mtl4_nsync = 0; n->mtl4_nwork_epochs = 0;
+    free(n->mtl4_prefixes); n->mtl4_prefixes = NULL;
+    memset(n->mtl4_first, 0, sizeof n->mtl4_first);
+    memset(n->mtl4_last, 0, sizeof n->mtl4_last);
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
@@ -396,6 +421,16 @@ static void describe_node(char *buf, size_t len, const fp_node *n)
 
 static void describe_store(char *buf, size_t len, const fp_acc *a, int safe)
 {
+    if (a->mtl4_stage) {
+        if (a->is_tex)
+            snprintf(buf, len, "Metal 4 texture 0x%llx, levels [%llu,%llu), slices [%u,%u)",
+                     (unsigned long long)a->gpu_address, (unsigned long long)a->a0, (unsigned long long)a->a1,
+                     a->s0, a->s1);
+        else
+            snprintf(buf, len, "Metal 4 buffer 0x%llx, bytes [%llu,%llu)", (unsigned long long)a->gpu_address,
+                     (unsigned long long)a->a0, (unsigned long long)a->a1);
+        return;
+    }
     char what[160] = "";
     if (a->is_tex) {
         if (safe) {
@@ -1439,7 +1474,16 @@ static void trace_analyse(const fp_node *n)
             "\"after_declared_barrier\":%s", TRACE_U64(n->uid),
             TRACE_U64(e->cb->mtl4 ? e->cb->uid : n->cb_uid), e->cb->queue,
             TRACE_U64(n->frame + 1), n->depth, n->nacc, n->req_mark ? "true" : "false");
-    if (e->cb->mtl4) fprintf(f, ",\"logical_cb\":%llu", TRACE_U64(n->cb_uid));
+    if (e->cb->mtl4) {
+        fprintf(f, ",\"logical_cb\":%llu,\"mtl4_sync\":[", TRACE_U64(n->cb_uid));
+        for (int i = 0; i < n->mtl4_nsync; i++) {
+            const fp4_sync *sync = &n->mtl4_sync[i];
+            static const char *const names[] = { "consumer", "producer", "intra-pass", "fence update", "fence wait" };
+            fprintf(f, "%s{\"kind\":\"%s\",\"after_mask\":%u,\"before_mask\":%u}", i ? "," : "",
+                    names[sync->kind], sync->after, sync->before);
+        }
+        fputc(']', f);
+    }
     trace_label(f, "kind", kind_name[n->kind]);
     trace_label(f, "label", n->label);
     trace_label(f, "cb_label", e->cb->mtl4 ? e->mtl4_cb_label : e->cb->label);
@@ -1996,6 +2040,49 @@ static const char *rw_verb(int rw)
     return "reads";
 }
 
+static void fp4_mask_text(char *text, size_t capacity, unsigned mask)
+{
+    if (mask == FP4_ALL) { snprintf(text, capacity, "All"); return; }
+    if (!mask) { snprintf(text, capacity, "None"); return; }
+    size_t used = 0;
+    for (unsigned bits = mask; bits; bits &= bits - 1) {
+        int n = snprintf(text + used, capacity - used, "%s%s", used ? "|" : "",
+                         fp4_stage_names[__builtin_ctz(bits)]);
+        if (n < 0 || (size_t)n >= capacity - used) break;
+        used += n;
+    }
+}
+
+static void fp4_explain(char *why, size_t size, const fp_node *f, const fp_acc *fa,
+                        const fp_node *s, const fp_acc *sa)
+{
+    const char *after = fp4_stage_names[__builtin_ctz(fa->mtl4_stage)];
+    const char *before = fp4_stage_names[__builtin_ctz(sa->mtl4_stage)];
+    for (int i = 0; i < s->ned; i++) {
+        fp_node *signal = node_get(s->ed[i].src);
+        if (signal && signal->kind == FPK_SIGNAL && signal->req_q == f->req_q &&
+            signal->queue_seq < f->queue_seq) {
+            snprintf(why, size, "event wait matched a signal before the producer's %s work", after);
+            return;
+        }
+    }
+    if (f->req_q == s->req_q) {
+        for (int side = 0; side < 2; side++) {
+            const fp_node *n = side ? f : s;
+            for (int i = 0; i < n->mtl4_nsync; i++) {
+                const fp4_sync *op = &n->mtl4_sync[i];
+                if (op->kind != (side ? FP4_PRODUCER : FP4_CONSUMER)) continue;
+                char a[160], b[160];
+                fp4_mask_text(a, sizeof a, op->after);
+                fp4_mask_text(b, sizeof b, op->before);
+                snprintf(why, size, "queue barrier %s -> %s does not order %s -> %s", a, b, after, before);
+                return;
+            }
+        }
+    }
+    snprintf(why, size, "no Metal 4 ordering covers %s -> %s", after, before);
+}
+
 /* x's access e and y's access a conflict and nothing orders them. "first" is the one
  * committed first; the race is symmetric, the naming is for the reader. */
 static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
@@ -2036,11 +2123,19 @@ static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
     describe_node(d1, sizeof d1, f);
     describe_node(d2, sizeof d2, s);
     describe_store(st, sizeof st, ya, y->done_tick == 0);
-    snprintf(first, sizeof first, "%s %s it: %s%s", d1, rw_verb(fa->rw), via_name[fa->via], stage_name(f, fa->sl));
-    snprintf(second, sizeof second, "%s %s it: %s%s", d2, rw_verb(sa->rw), via_name[sa->via], stage_name(s, sa->sf));
+    if (fa->mtl4_stage && sa->mtl4_stage) {
+        snprintf(first, sizeof first, "%s %s it: %s, %s stage", d1, rw_verb(fa->rw), via_name[fa->via],
+                 fp4_stage_names[__builtin_ctz(fa->mtl4_stage)]);
+        snprintf(second, sizeof second, "%s %s it: %s, %s stage", d2, rw_verb(sa->rw), via_name[sa->via],
+                 fp4_stage_names[__builtin_ctz(sa->mtl4_stage)]);
+    } else {
+        snprintf(first, sizeof first, "%s %s it: %s%s", d1, rw_verb(fa->rw), via_name[fa->via], stage_name(f, fa->sl));
+        snprintf(second, sizeof second, "%s %s it: %s%s", d2, rw_verb(sa->rw), via_name[sa->via], stage_name(s, sa->sf));
+    }
 
     /* why: look for the fence that was meant to order them */
     int said = 0;
+    if (fa->mtl4_stage && sa->mtl4_stage) { fp4_explain(why, sizeof why, f, fa, s, sa); said = 1; }
     for (int i = 0; i < s->nfw && !said; i++)
         for (int j = 0; j < f->nfu && !said; j++) {
             if (s->fw[i].f != f->fu[j].f) continue;
@@ -2202,9 +2297,9 @@ static void summary(int final)
            g_st[ST_RACE_UNIQ], g_st[ST_RACE_HITS], g_st[ST_POSS_UNIQ], g_st[ST_POSS_HITS],
            g_st[ST_NODES], g_st[ST_CBS], g_st[ST_ACCESSES]);
     if (g_st[ST_BARRIERS])
-        fp_log("fencepost:   %ld declared barriers: %ld encoder(s) not ordered after them (%ld hits), %ld ordered for the "
-               "fragment stage only (%ld hits)\n", g_st[ST_BARRIERS], g_st[ST_ORDER_UNIQ], g_st[ST_ORDER_HITS],
-               g_st[ST_PARTIAL_UNIQ], g_st[ST_PARTIAL_HITS]);
+        fp_log("fencepost:   %ld declared barriers: %ld encoder(s) not ordered after them (%ld hits), %ld ordered for "
+               "%s only (%ld hits)\n", g_st[ST_BARRIERS], g_st[ST_ORDER_UNIQ], g_st[ST_ORDER_HITS],
+               g_st[ST_PARTIAL_UNIQ], g_mtl4_partial_hits ? "some stages" : "the fragment stage", g_st[ST_PARTIAL_HITS]);
     if (g_st[ST_TRACKED])
         fp_log("fencepost:   %ld uses of tracked resources skipped (Metal orders those itself)\n", g_st[ST_TRACKED]);
     if (g_mtl4_gpu_errors)
@@ -2244,13 +2339,157 @@ static int covers(const fp_acc *a, const fp_acc *b)   /* a's range contains b's 
     return a->a0 <= b->a0 && a->a1 >= b->a1 && (!a->is_tex || (a->s0 <= b->s0 && a->s1 >= b->s1));
 }
 
-static int ordered(const fp_ent *e, fp_node *x, const fp_node *y, int sf)
+typedef struct { fp_node *node; uint32_t epoch; uint8_t stage; } fp4_visit;
+static fp4_visit *g_fp4_worklist;
+static int g_fp4_nwork, g_fp4_cwork;
+static uint64_t g_fp4_query;
+static struct { uint64_t query; uint32_t epoch; } g_fp4_seen[FP_POOL][FP4_STAGE_COUNT];
+
+static void fp4_push_visit(fp_node *n, unsigned mask, uint32_t epoch)
+{
+    if (n->kind == FPK_SIGNAL) mask = 1;
+    else mask &= n->mtl4_work;
+    while (mask) {
+        int stage = __builtin_ctz(mask);
+        mask &= mask - 1;
+        uint32_t last = epoch;
+        if (n->kind != FPK_SIGNAL) {
+            if (n->mtl4_first[stage] > epoch) continue;
+            last = n->mtl4_last[stage];
+            if (last > epoch) {
+                for (int i = n->mtl4_nwork_epochs - 1; i >= 0; i--) {
+                    const fp4_work_epoch *work = &n->mtl4_work_epochs[i];
+                    if (work->epoch <= epoch && (work->mask & FP4_STAGE(stage))) { last = work->epoch; break; }
+                }
+            }
+        }
+        unsigned slot = n->uid % FP_POOL;
+        if (g_fp4_seen[slot][stage].query == g_fp4_query && g_fp4_seen[slot][stage].epoch >= last) continue;
+        g_fp4_seen[slot][stage].query = g_fp4_query;
+        g_fp4_seen[slot][stage].epoch = last;
+        fp4_visit visit = { n, last, stage };
+        PUSH(g_fp4_worklist, g_fp4_nwork, g_fp4_cwork, visit);
+    }
+}
+
+static int fp4_walk_prefix(const fp_node *dst, fp4_prefix prefix, unsigned after,
+                           const fp_node *from, int from_stage, uint32_t from_epoch)
+{
+    if (!prefix.uid) return 0;
+    if (dst->req_q == from->req_q && (after & FP4_STAGE(from_stage)) &&
+        (from->queue_seq < prefix.seq || (from->queue_seq == prefix.seq && from_epoch <= prefix.epoch)))
+        return 1;
+
+    uint32_t epoch = prefix.epoch;
+    for (fp_node *p = node_get(prefix.uid); p && p->aseq >= from->aseq; p = node_get(p->mtl4_previous)) {
+        /* A queue barrier names work stages, not queue signal operations.
+         * The signal's own prefix is entered via an event edge instead. */
+        if (p->kind != FPK_SIGNAL) fp4_push_visit(p, after, epoch);
+        epoch = UINT32_MAX;
+    }
+    return 0;
+}
+
+static fp4_prefix fp4_previous_prefix(const fp_node *n)
+{
+    return (fp4_prefix){ n->mtl4_previous, n->queue_seq ? n->queue_seq - 1 : 0, UINT32_MAX };
+}
+
+/* Queue barriers use a cut per pair of stages. Only a conflict query walks
+ * the older work behind a cut, so recording a barrier never builds N edges.
+ * Epochs separate commands before and after each synchronization operation. */
+static int fp4_reaches(fp_node *from, int from_stage, uint32_t from_epoch,
+                       fp_node *to, int to_stage, uint32_t to_epoch)
+{
+    if (from->done_tick && from->done_tick < to->commit_tick) return 1;
+    g_fp4_query++;
+    g_fp4_nwork = 0;
+    fp4_push_visit(to, FP4_STAGE(to_stage), to_epoch);
+    while (g_fp4_nwork) {
+        fp4_visit v = g_fp4_worklist[--g_fp4_nwork];
+        fp_node *n = v.node;
+        if (from == n && v.stage == from_stage && from_epoch <= v.epoch) return 1;
+        if (from->done_tick && from->done_tick < n->commit_tick) return 1;
+        if (n->kind == FPK_SIGNAL && n->mtl4 &&
+            fp4_walk_prefix(n, fp4_previous_prefix(n), FP4_ALL, from, from_stage, from_epoch))
+            return 1;
+        for (int i = 0; i < n->ned; i++) {
+            fp_node *p = node_get(n->ed[i].src);
+            if (p && p->aseq >= from->aseq)
+                fp4_push_visit(p, FP4_ALL, UINT32_MAX);
+        }
+        if (n->mtl4_prefixes) {
+            for (int a = 0; a < FP4_STAGE_COUNT; a++)
+                if (fp4_walk_prefix(n, n->mtl4_prefixes->cut[a][v.stage], FP4_STAGE(a), from, from_stage, from_epoch))
+                    return 1;
+        }
+        for (int i = 0; i < n->mtl4_nsync; i++) {
+            const fp4_sync *sync = &n->mtl4_sync[i];
+            if (sync->epoch >= v.epoch || !(sync->before & FP4_STAGE(v.stage))) continue;
+            if (sync->kind == FP4_CONSUMER) {
+                if (fp4_walk_prefix(n, fp4_previous_prefix(n), sync->after, from, from_stage, from_epoch))
+                    return 1;
+            } else if (sync->kind == FP4_FENCE_WAIT) {
+                for (fp_node *p = node_get(n->mtl4_previous); p && p->aseq >= from->aseq;
+                     p = node_get(p->mtl4_previous)) {
+                    for (int j = 0; j < p->mtl4_nsync; j++) {
+                        const fp4_sync *update = &p->mtl4_sync[j];
+                        if (update->kind == FP4_FENCE_UPDATE && update->fence == sync->fence)
+                            fp4_push_visit(p, update->after, update->epoch);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static void fp4_publish_prefixes(fp_queue *q, fp_node *n)
+{
+    if (q->mtl4_prefixes && n->kind != FPK_SIGNAL) {
+        n->mtl4_prefixes = malloc(sizeof *n->mtl4_prefixes);
+        if (n->mtl4_prefixes) *n->mtl4_prefixes = *q->mtl4_prefixes;
+    }
+    for (int i = 0; i < n->mtl4_nsync; i++) {
+        const fp4_sync *sync = &n->mtl4_sync[i];
+        if (sync->kind != FP4_PRODUCER) continue;
+        if (!q->mtl4_prefixes) q->mtl4_prefixes = calloc(1, sizeof *q->mtl4_prefixes);
+        if (!q->mtl4_prefixes) continue;
+        for (unsigned after = sync->after; after; after &= after - 1)
+            for (unsigned before = sync->before; before; before &= before - 1)
+                q->mtl4_prefixes->cut[__builtin_ctz(after)][__builtin_ctz(before)] =
+                    (fp4_prefix){ n->uid, n->queue_seq, sync->epoch };
+    }
+}
+
+static int fp4_barrier_stages(fp_node *x, fp_node *y)
+{
+    unsigned ordered = 0;
+    for (unsigned before = y->mtl4_work; before; before &= before - 1) {
+        int b = __builtin_ctz(before);
+        int covered = 1;
+        for (unsigned after = x->mtl4_work; after; after &= after - 1) {
+            int a = __builtin_ctz(after);
+            if (!fp4_reaches(x, a, x->mtl4_last[a], y, b, y->mtl4_first[b])) {
+                covered = 0;
+                break;
+            }
+        }
+        if (covered) ordered |= FP4_STAGE(b);
+    }
+    return ordered;
+}
+
+static int ordered(const fp_ent *e, fp_node *x, fp_node *y, const fp_acc *a)
 {
     if (!x) return 1;
     if (x->done_tick && x->done_tick < y->commit_tick) return 1;   /* completed before y was committed */
     uint64_t d = y->aseq - e->aseq;
     if (d >= FP_W) { g_st[ST_WINDOW]++; return 1; }
-    return bit_test(&y->anc[sf], 2 * d + e->a.sl);
+    if (e->a.mtl4_stage && a->mtl4_stage)
+        return fp4_reaches(x, __builtin_ctz(e->a.mtl4_stage), e->a.last_epoch,
+                           y, __builtin_ctz(a->mtl4_stage), a->first_epoch);
+    return bit_test(&y->anc[a->sf], 2 * d + e->a.sl);
 }
 
 static int same_range(const fp_acc *a, const fp_acc *b)
@@ -2270,13 +2509,13 @@ static void scan(fp_ent *list, int *n, fp_node *y, const fp_acc *a, int *merged)
         if (!x || (x->done_tick && x->done_tick < y->commit_tick) || y->aseq - e->aseq >= FP_W) keep = 0;
         else if (overlap(&e->a, a)) {
             if (e->uid == y->uid) {
-                if (merged && same_range(&e->a, a)) {
+                if (merged && same_range(&e->a, a) && !a->mtl4_stage) {
                     e->a.rw |= a->rw;
                     if (a->sl > e->a.sl) e->a.sl = a->sl;
                     *merged = 1;
                 }
             } else if ((e->a.rw | a->rw) & (FP_WR | FP_MAYBE)) {
-                if (!ordered(e, x, y, a->sf)) report(x, &e->a, y, a);
+                if (!ordered(e, x, y, a)) report(x, &e->a, y, a);
                 else if ((a->rw & FP_WR) && covers(a, &e->a)) keep = 0;   /* superseded by an ordered write */
             }
         }
@@ -2295,7 +2534,8 @@ static void check_access(fp_node *y, const fp_acc *a)
     int writes = a->rw & (FP_WR | FP_MAYBE);
     scan(o->w, &o->nw, y, a, writes ? &merged : NULL);
     if (writes) scan(o->r, &o->nr, y, a, NULL);
-    else if (o->nr && o->r[o->nr - 1].uid == y->uid && same_range(&o->r[o->nr - 1].a, a)) merged = 1;
+    else if (o->nr && o->r[o->nr - 1].uid == y->uid && !a->mtl4_stage &&
+             same_range(&o->r[o->nr - 1].a, a)) merged = 1;
     if (merged) return;
     fp_ent **list = writes ? &o->w : &o->r;
     int *n = writes ? &o->nw : &o->nr, *cap = writes ? &o->cw : &o->cr;
@@ -2315,7 +2555,7 @@ static unsigned g_sweep;
 static int stale(const fp_ent *e)
 {
     fp_node *x = node_get(e->uid);
-    return !x || (x->done_tick && x->done_tick < g_tick) || g_aseq - e->aseq >= FP_W;
+    return !x || (!x->mtl4 && x->done_tick && x->done_tick < g_tick) || g_aseq - e->aseq >= FP_W;
 }
 static void sweep(void)   /* lock held */
 {
@@ -2342,6 +2582,7 @@ static void check_barrier(fp_node *y)
     uint64_t hi = y->req_mark, lo = hi > FP_QRECENT ? hi - FP_QRECENT : 0;
     if (q->nrecent > FP_QRECENT && lo < q->nrecent - FP_QRECENT) lo = q->nrecent - FP_QRECENT;
     fp_node *bad = NULL, *part = NULL;
+    unsigned partial_stages = 0;
     long nbad = 0;
     for (uint64_t k = hi; k-- > lo;) {
         fp_node *x = node_get(q->recent[k % FP_QRECENT]);
@@ -2349,8 +2590,18 @@ static void check_barrier(fp_node *y)
         if (x->done_tick && x->done_tick < y->commit_tick) continue;
         uint64_t d = y->aseq - x->aseq;
         if (d >= FP_W) continue;
-        if (bit_test(&y->anc[0], 2 * d + 1)) continue;
-        if (bit_test(&y->anc[1], 2 * d + 1)) { if (!part) part = x; continue; }
+        if (y->mtl4) {
+            if (!x->mtl4_work || !y->mtl4_work) continue;
+            unsigned covered = fp4_barrier_stages(x, y);
+            if (covered == y->mtl4_work) continue;
+            if (covered) {
+                if (!part) { part = x; partial_stages = covered; }
+                continue;
+            }
+        } else {
+            if (bit_test(&y->anc[0], 2 * d + 1)) continue;
+            if (bit_test(&y->anc[1], 2 * d + 1)) { if (!part) part = x; continue; }
+        }
         if (!bad) bad = x;
         nbad++;
     }
@@ -2362,6 +2613,7 @@ static void check_barrier(fp_node *y)
     h ^= bad ? 0x5bd1e995ull : 0;
     unsigned kind = bad ? TR_ORDER : TR_FRAGMENT;
     g_st[bad ? ST_ORDER_HITS : ST_PARTIAL_HITS]++;
+    if (!bad && y->mtl4) g_mtl4_partial_hits++;
     int marker = g_trace_enabled && trace_marker_hit(y, kind);
     int print = !sig_seen(h);
     if (print) {
@@ -2378,14 +2630,23 @@ static void check_barrier(fp_node *y)
     describe_node(d2, sizeof d2, y);
     snprintf(barrier, sizeof barrier, "command buffer #%llu, after its encoder %d",
              (unsigned long long)y->bar_cb, y->bar_idx);
-    if (bad)
+    if (y->mtl4) {
+        char source[160], target[160], covered[160];
+        fp4_mask_text(source, sizeof source, x->mtl4_work);
+        fp4_mask_text(target, sizeof target, y->mtl4_work);
+        fp4_mask_text(covered, sizeof covered, partial_stages);
+        snprintf(second, sizeof second, "%s: %s -> %s is %s%s", d2, source, target,
+                 bad ? "unordered" : "ordered only before ", bad ? "" : covered);
+    } else if (bad)
         snprintf(second, sizeof second, "%s is not ordered after it%s", d2,
                  nbad > 1 ? " (nor after other encoders from before the barrier)" : "");
     else
         snprintf(second, sizeof second, "%s waits for it only before its fragment stage; its vertex stage can overlap", d2);
+    const char *detail = bad ? "a declared barrier is not honoured"
+        : y->mtl4 ? "a declared barrier is honoured for only some stages"
+                  : "a declared barrier is honoured for the fragment stage only";
     if (print) {
-        if (bad) fp_log("fencepost: ORDER a declared barrier is not honoured\n");
-        else fp_log("fencepost: ORDER a declared barrier is honoured for the fragment stage only\n");
+        fp_log("fencepost: ORDER %s\n", detail);
         fp_log("  barrier: %s\n", barrier);
         fp_log("  before : %s\n", d1);
         fp_log("  after  : %s\n", second);
@@ -2393,7 +2654,7 @@ static void check_barrier(fp_node *y)
     char *why = NULL;
     size_t why_length = 0;
     FILE *details = marker ? open_memstream(&why, &why_length) : NULL;
-    if (details) fputs(bad ? "a declared barrier is not honoured" : "a declared barrier is honoured for the fragment stage only", details);
+    if (details) fputs(detail, details);
     for (int i = 0; i < y->nfw; i++) {
         fp_node *u = node_get(y->fw[i].src);
         char wait[160];
@@ -2409,7 +2670,8 @@ static void check_barrier(fp_node *y)
     }
     if (marker) {
         if (trace_close_record(details))
-            trace_diagnostic(kind, x->uid, y->uid, bad ? "ORDER barrier not honoured" : "ORDER fragment-only",
+            trace_diagnostic(kind, x->uid, y->uid,
+                             bad ? "ORDER barrier not honoured" : y->mtl4 ? "ORDER stage partial" : "ORDER fragment-only",
                              barrier, d1, second, why);
         else trace_drop_record(1);
         free(why);
@@ -2421,6 +2683,12 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
     y->aseq = ++g_aseq;
     memset(y->anc, 0, sizeof y->anc);
     uint32_t best = 0;
+    if (y->mtl4 && y->kind == FPK_SIGNAL) {
+        for (fp_node *x = node_get(y->mtl4_previous); x && x->frame == y->frame; x = node_get(x->mtl4_previous)) {
+            if (x->done_tick && x->done_tick < y->commit_tick) continue;
+            if (x->depth > best) { best = x->depth; y->chain_prev = x->uid; }
+        }
+    }
     for (int i = 0; i < y->ned; i++) {
         const fp_edge *e = &y->ed[i];
         fp_node *x = node_get(e->src);
@@ -2442,11 +2710,21 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
         if (y->kind != FPK_SIGNAL) { r->nenc++; if (y->depth > r->depth) { r->depth = y->depth; r->tail = y->uid; } }
     }
     if (y->kind != FPK_SIGNAL) g_st[ST_NODES]++;
-    if (!y->mtl4) {
-        if (y->kind != FPK_SIGNAL && y->req_q && y->req_mark) check_barrier(y);
-        for (int i = 0; i < y->nacc; i++) check_access(y, &y->acc[i]);
-    }
+    if (y->kind != FPK_SIGNAL && y->req_q && y->req_mark) check_barrier(y);
+    for (int i = 0; i < y->nacc; i++) check_access(y, &y->acc[i]);
     if (g_trace_enabled) trace_analyse(y);
+}
+
+static fp_node *first_event_signal(const fp_ev *ev, const fp_queue *queue, fp_evwait wait)
+{
+    if (!ev || !ev->known) return NULL;
+    unsigned first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
+    for (unsigned k = first; k < ev->nh; k++) {
+        if (ev->h[k % FP_EVHIST].val < wait.val) continue;
+        fp_node *signal = node_get(ev->h[k % FP_EVHIST].uid);
+        if (signal && (signal->req_q != queue || signal->queue_seq < wait.queue_seq)) return signal;
+    }
+    return NULL;
 }
 
 /* force 1 clears waits with no candidate, leaving pending signal dependencies
@@ -2460,20 +2738,12 @@ static int ready(fp_node *n, int force)
         int done = 0;
         if (!ev || !ev->known) done = 1;   /* event made outside our view (e.g. from a mach port): CPU-side */
         else {
-            int pending_signal = 0;
-            unsigned first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
-            for (unsigned k = first; k < ev->nh; k++) {
-                if (ev->h[k % FP_EVHIST].val < w.val) continue;
-                uint64_t uid = ev->h[k % FP_EVHIST].uid;
-                fp_node *signal = node_get(uid);
-                if (!signal || (signal->req_q == n->req_q && signal->queue_seq >= w.queue_seq)) continue;
-                /* Use the first eligible signal in history. A later signal
-                 * must not replace it while its dependencies are unresolved. */
-                if (!signal->aseq) { pending_signal = 1; break; }
-                fp_edge e = { uid, 1, w.before };
+            fp_node *signal = first_event_signal(ev, n->req_q, w);
+            int pending_signal = signal && !signal->aseq;
+            if (signal && !pending_signal) {
+                fp_edge e = { signal->uid, 1, w.before };
                 PUSH(n->ed, n->ned, n->ced, e);
                 done = 1;
-                break;
             }
             if (!done && !pending_signal && ev->cpu_max >= w.val) done = 1;
             if (!done && (force == 2 || (force && !pending_signal) || g_tick - n->pend_since > FP_PEND_TIMEOUT)) {
@@ -2487,6 +2757,12 @@ static int ready(fp_node *n, int force)
     n->nev = j;
     if (n->nev) return 0;
     if (force || g_tick - n->pend_since > FP_PEND_TIMEOUT) return 1;
+    /* Process Metal 4 nodes in queue order for analysis. This allows a
+     * signal to settle after its prefix without adding implicit GPU edges. */
+    if (n->mtl4) {
+        fp_node *previous = node_get(n->mtl4_previous);
+        if (previous && !previous->aseq) return 0;
+    }
     for (i = 0; i < n->ned; i++) {
         fp_node *x = node_get(n->ed[i].src);
         if (x && !x->aseq) return 0;
@@ -2552,7 +2828,7 @@ static fp_node *phase_signal(fp_queue *q, uint64_t cb_uid, uint64_t tick, fp_ite
     it->uid = n->uid;
     n->cb_uid = cb_uid; n->state = 2;
     unsigned first = q->nrecent > FP_QRECENT ? q->nrecent - FP_QRECENT : 0;
-    for (unsigned k = first; k < q->nrecent; k++) {   /* the signal follows earlier work on this queue */
+    for (unsigned k = first; !q->mtl4 && k < q->nrecent; k++) {   /* Metal 3 signal edges */
         fp_node *p = node_get(q->recent[k % FP_QRECENT]);
         if (!p || (p->done_tick && p->done_tick < tick)) continue;
         fp_edge e = { p->uid, 1, 0 };
@@ -2580,6 +2856,11 @@ static void phase_node(fp_queue *q, fp_node *n, uint64_t tick, fp_trace_cb *trac
     if (trace) trace_phase_node(trace, n, waits, nwaits);
     n->state = 3;
     n->queue_seq = q->nrecent;
+    if (n->mtl4) {
+        n->mtl4_previous = q->mtl4_last_node;
+        q->mtl4_last_node = n->uid;
+        fp4_publish_prefixes(q, n);
+    }
     queue_recent(q, n->uid);
     PUSH(g_pend, g_npend, g_cpend, n->uid);
 }
@@ -2608,7 +2889,7 @@ static void phase1(fp_cb *c)
             continue;
         }
         if (it->type == 2) {
-            if (nactive < 32) active[nactive++] = (fp_evwait){ it->ev, it->val, q->nrecent, 0 };
+            if (nactive < 32) active[nactive++] = (fp_evwait){ it->ev, it->val, q->nrecent, 0, 0 };
             continue;
         }
         fp_node *n;
@@ -2920,6 +3201,21 @@ static fp4_resource fp4_lookup(uintptr_t device, uint64_t key, int by_id)
     return info;
 }
 
+static void fp4_note_work(fp_node *n, int stage)
+{
+    unsigned mask = FP4_STAGE(stage);
+    n->mtl4_work |= mask;
+    if (!n->mtl4_first[stage]) n->mtl4_first[stage] = n->mtl4_epoch;
+    if (n->mtl4_last[stage] == n->mtl4_epoch) return;
+    n->mtl4_last[stage] = n->mtl4_epoch;
+    if (n->mtl4_nwork_epochs && n->mtl4_work_epochs[n->mtl4_nwork_epochs - 1].epoch == n->mtl4_epoch)
+        n->mtl4_work_epochs[n->mtl4_nwork_epochs - 1].mask |= mask;
+    else {
+        fp4_work_epoch work = { n->mtl4_epoch, mask };
+        PUSH(n->mtl4_work_epochs, n->mtl4_nwork_epochs, n->mtl4_cwork_epochs, work);
+    }
+}
+
 static int fp4_record_access(fp_node *n, fp4_resource r, uint64_t off, uint64_t end, uint32_t slice, uint32_t slices,
                              int rw, int stage, int via)
 {
@@ -2936,7 +3232,7 @@ static int fp4_record_access(fp_node *n, fp4_resource r, uint64_t off, uint64_t 
         a.a1 = MIN(a.a1, r.end - r.address);
     }
     if (a.a0 >= a.a1) return -1;
-    n->mtl4_work |= a.mtl4_stage;
+    fp4_note_work(n, stage);
     return push_acc(n, &a);
 }
 
@@ -3029,10 +3325,10 @@ static void fp4_capture_tables(id encoder, unsigned stages)
 {
     fp_node *n = cur_node(encoder);
     if (!n || !n->mtl4) return;
-    n->mtl4_work |= stages;
     while (stages) {
         int stage = __builtin_ctz(stages);
         stages &= stages - 1;
+        fp4_note_work(n, stage);
         fp4_sample_table(n, stage);
     }
 }
@@ -3164,6 +3460,7 @@ enum {
     H_4_DRAW_MESH_GROUPS, H_4_DRAW_MESH, H_4_DRAW_MESH_IND, H_4_DRAW_TILE,
     H_4_DISPATCH, H_4_DISPATCH_GROUPS, H_4_DISPATCH_IND, H_4_DISPATCH_GROUPS_IND,
     H_4_RES_ADD, H_4_RES_ADDS, H_4_RES_REMOVE, H_4_RES_REMOVES, H_4_RES_USE, H_4_RES_USES,
+    H_4_CONSUMER_BARRIER, H_4_PRODUCER_BARRIER, H_4_INTRA_BARRIER, H_4_FENCE_UPDATE, H_4_FENCE_WAIT,
     H_COUNT
 };
 
@@ -4084,7 +4381,7 @@ static void h_mtl4_accel_build(id self, SEL _cmd, id accel, id descriptor, MTL4B
     if (OUTER) {
         __atomic_fetch_add(&g_mtl4_accel_builds, 1, __ATOMIC_RELAXED);
         fp_node *n = cur_node(self);
-        if (n && n->mtl4) n->mtl4_work |= FP4_STAGE(FP4_ACCEL);
+        if (n && n->mtl4) fp4_note_work(n, FP4_ACCEL);
     }
 }
 
@@ -4266,6 +4563,51 @@ FP4_RES_ARRAY(h_mtl4_res_uses, H_4_RES_USES, 1, 1)
 #undef FP4_RES_SINGLE
 #undef FP4_RES_ARRAY
 
+static unsigned fp4_stage_mask(NSUInteger mask)
+{
+    if (@available(macOS 26.0, *)) {
+        unsigned stages = (unsigned)mask & (FP4_STAGE(FP4_MESH + 1) - 1);
+        if (mask & MTLStageDispatch) stages |= FP4_STAGE(FP4_DISPATCH);
+        if (mask & MTLStageBlit) stages |= FP4_STAGE(FP4_BLIT);
+        if (mask & MTLStageAccelerationStructure) stages |= FP4_STAGE(FP4_ACCEL);
+        if (mask & MTLStageMachineLearning) stages |= FP4_STAGE(FP4_ML);
+        if (mask & MTLStageResourceState) stages |= FP4_STAGE(FP4_RESOURCE_STATE);
+        return stages;
+    }
+    return 0;
+}
+
+static void fp4_record_sync(id encoder, int kind, id fence, NSUInteger after, NSUInteger before)
+{
+    fp_node *n = cur_node(encoder);
+    if (!n || !n->mtl4) return;
+    fp4_sync sync = { (void *)fence, n->mtl4_epoch++, fp4_stage_mask(after), fp4_stage_mask(before), kind };
+    PUSH(n->mtl4_sync, n->mtl4_nsync, n->mtl4_csync, sync);
+    memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
+}
+
+#define FP4_BARRIER(fn, hook_id, kind) \
+    static void fn(id self, SEL _cmd, NSUInteger after, NSUInteger before, NSUInteger visibility) { \
+        ENTER; ORIG(hook_id, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, after, before, visibility); LEAVE; \
+        if (OUTER) fp4_record_sync(self, kind, nil, after, before); \
+    }
+FP4_BARRIER(h_mtl4_consumer_barrier, H_4_CONSUMER_BARRIER, FP4_CONSUMER)
+FP4_BARRIER(h_mtl4_producer_barrier, H_4_PRODUCER_BARRIER, FP4_PRODUCER)
+FP4_BARRIER(h_mtl4_intra_barrier, H_4_INTRA_BARRIER, FP4_INTRA)
+#undef FP4_BARRIER
+
+static void h_mtl4_fence_update(id self, SEL _cmd, id fence, NSUInteger stages)
+{
+    ENTER; ORIG(H_4_FENCE_UPDATE, void (*)(id, SEL, id, NSUInteger))(self, _cmd, fence, stages); LEAVE;
+    if (OUTER) fp4_record_sync(self, FP4_FENCE_UPDATE, fence, stages, 0);
+}
+
+static void h_mtl4_fence_wait(id self, SEL _cmd, id fence, NSUInteger stages)
+{
+    ENTER; ORIG(H_4_FENCE_WAIT, void (*)(id, SEL, id, NSUInteger))(self, _cmd, fence, stages); LEAVE;
+    if (OUTER) fp4_record_sync(self, FP4_FENCE_WAIT, fence, 0, stages);
+}
+
 static void cb_item(id cb, int type, id ev, uint64_t val)
 {
     pthread_mutex_lock(&g_lock);
@@ -4410,7 +4752,7 @@ static void h_cb_commit(id self, SEL _cmd)
 typedef struct {
     fp_trace_cb *trace;
     fp_queue *queue;
-    uint64_t signal_limit, frame;
+    uint64_t signal_limit, wait_limit, frame;
 #ifdef FENCEPOST_TEST_HOOKS
     int inject_error;
 #endif
@@ -4507,8 +4849,9 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
             submission->inject_error = g_mtl4_test_error_commit && --g_mtl4_test_error_commit == 0;
 #endif
         }
-        if (nenc) q->mtl4_nwaits = 0;
+        if (nenc) submission->wait_limit = q->mtl4_wait_ticket;
         process_pending(0);
+        if ((g_tick & 15) == 0) sweep();
         if (g_trace) trace_stream_flush();
     }
     pthread_mutex_unlock(&g_lock);
@@ -4544,6 +4887,29 @@ static void mtl4_retire_signals(fp_queue *q, uint64_t limit)
     mtl4_compact_signals(q);
 }
 
+/* Keep queue waits active for every submission until GPU progress confirms
+ * they passed. Completion also proves the resolved signal's prefix finished,
+ * even when feedback delivery on the signaling queue lags this callback. */
+static void mtl4_retire_waits(fp_queue *q, uint64_t limit)
+{
+    int retired = 0;
+    while (retired < q->mtl4_nwaits && q->mtl4_waits[retired].ticket <= limit) {
+        fp_evwait wait = q->mtl4_waits[retired++];
+        fp_ev *event = ev_get(wait.ev, 0);
+        if (event && event->cpu_max >= wait.val) continue;
+        fp_node *signal = first_event_signal(event, q, wait);
+        if (!signal || !signal->mtl4) continue;
+        for (fp_node *p = signal; p; p = node_get(p->mtl4_previous)) {
+            if (p->kind == FPK_SIGNAL) continue;   /* signal retirement has its own completion checkpoint */
+            if (!p->done_tick) p->done_tick = g_tick;
+        }
+    }
+    if (retired) {
+        q->mtl4_nwaits -= retired;
+        memmove(q->mtl4_waits, q->mtl4_waits + retired, (size_t)q->mtl4_nwaits * sizeof *q->mtl4_waits);
+    }
+}
+
 API_AVAILABLE(macos(26.0))
 static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback> feedback)
 {
@@ -4565,7 +4931,10 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
         g_mtl4_gpu_errors++;
         if (g_ring && g_ring_gpuerr)
             ring_trigger_impl(DUMP_AUTO, "gpu-error", "gpu-error", submission->frame, trace_clock(), message, 1);
-    } else mtl4_retire_signals(submission->queue, submission->signal_limit);
+    } else {
+        mtl4_retire_signals(submission->queue, submission->signal_limit);
+        mtl4_retire_waits(submission->queue, submission->wait_limit);
+    }
     fp_trace_cb *trace = submission->trace;
     if (trace) {
         if (!failed && start > 0 && end >= start && end <= (double)trace_clock() / 1e9 + 1) {
@@ -4636,19 +5005,21 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
     /* Metal consumes the app's registrations once per submission. Take that
      * list under a short lock and replay it on private, per-commit options.
      * Native submission can block and must never hold a fencepost lock. */
+    NSArray *blocks = nil;
     if (callbacks) {
         pthread_mutex_lock(&g_mtl4_options_lock);
-        NSArray *blocks = callbacks->blocks;
+        blocks = callbacks->blocks;
         callbacks->blocks = nil;
         pthread_mutex_unlock(&g_mtl4_options_lock);
-        for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
-        [blocks release];
     }
     fp_mtl4_submission *submission = mtl4_record_commit(queue, buffers, count);
+    /* Record completion before an app handler can submit dependent work. */
     if (submission)
         [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
             mtl4_completed(submission, feedback);
         }];
+    for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
+    [blocks release];
     return opts;
 }
 
@@ -4732,7 +5103,7 @@ static void mtl4_record_event(id queue, fp_item item)
         trace_mtl4_signal(q, n->uid, item.val);
         process_pending(0);
     } else if (q) {
-        fp_evwait wait = { item.ev, item.val, q->nrecent, 0 };
+        fp_evwait wait = { item.ev, item.val, q->nrecent, 0, ++q->mtl4_wait_ticket };
         PUSH(q->mtl4_waits, q->mtl4_nwaits, q->mtl4_cwaits, wait);
     }
     pthread_mutex_unlock(&g_lock);
@@ -4802,6 +5173,13 @@ static void h_end(id self, SEL _cmd)
     if (!n) return;
     NSString *l = [self label];
     if (n->mtl4) {
+        for (int i = 0; i < n->nacc; i++) {
+            fp_acc *access = &n->acc[i];
+            if (access->via == VIA_ATT || access->via == VIA_ATT_LOAD || access->via == VIA_RESOLVE) {
+                access->last_epoch = n->mtl4_epoch;
+                fp4_note_work(n, FP4_FRAGMENT);
+            }
+        }
         for (int i = 0; i < FP4_TABLES; i++) {
             [n->mtl4_tables[i] release];
             n->mtl4_tables[i] = nil;
@@ -5203,6 +5581,11 @@ static const hook_def mtl4_argument_hooks[] = {
 };
 static const hook_def mtl4_render_hooks[] = {
     HD(H_END, "endEncoding", h_end),
+    HD(H_4_CONSUMER_BARRIER, "barrierAfterQueueStages:beforeStages:visibilityOptions:", h_mtl4_consumer_barrier),
+    HD(H_4_PRODUCER_BARRIER, "barrierAfterStages:beforeQueueStages:visibilityOptions:", h_mtl4_producer_barrier),
+    HD(H_4_INTRA_BARRIER, "barrierAfterEncoderStages:beforeEncoderStages:visibilityOptions:", h_mtl4_intra_barrier),
+    HD(H_4_FENCE_UPDATE, "updateFence:afterEncoderStages:", h_mtl4_fence_update),
+    HD(H_4_FENCE_WAIT, "waitForFence:beforeEncoderStages:", h_mtl4_fence_wait),
     HD(H_R_CSA, "setColorStoreAction:atIndex:", h_r_csa),
     HD(H_R_DSA, "setDepthStoreAction:", h_r_dsa),
     HD(H_R_SSA, "setStencilStoreAction:", h_r_ssa),
@@ -5222,6 +5605,11 @@ static const hook_def mtl4_render_hooks[] = {
 };
 static const hook_def mtl4_compute_hooks[] API_AVAILABLE(macos(26.0)) = {
     HD(H_END, "endEncoding", h_end),
+    HD(H_4_CONSUMER_BARRIER, "barrierAfterQueueStages:beforeStages:visibilityOptions:", h_mtl4_consumer_barrier),
+    HD(H_4_PRODUCER_BARRIER, "barrierAfterStages:beforeQueueStages:visibilityOptions:", h_mtl4_producer_barrier),
+    HD(H_4_INTRA_BARRIER, "barrierAfterEncoderStages:beforeEncoderStages:visibilityOptions:", h_mtl4_intra_barrier),
+    HD(H_4_FENCE_UPDATE, "updateFence:afterEncoderStages:", h_mtl4_fence_update),
+    HD(H_4_FENCE_WAIT, "waitForFence:beforeEncoderStages:", h_mtl4_fence_wait),
     HD(H_4_BIND_COMPUTE, "setArgumentTable:", h_mtl4_bind_compute),
     HD(H_4_ACCEL_BUILD, "buildAccelerationStructure:descriptor:scratchBuffer:", h_mtl4_accel_build),
     HD(H_4_DISPATCH, "dispatchThreads:threadsPerThreadgroup:", h_mtl4_dispatch),
@@ -5640,7 +6028,7 @@ __attribute__((visibility("default"))) int fencepost_test_wait_source(void)
     event->h[0].uid = first->uid; event->h[0].val = 1;
     event->h[1].uid = second->uid; event->h[1].val = 2;
     event->nh = 2;
-    fp_evwait wait = { &event_key, 1, 0, 0 };
+    fp_evwait wait = { &event_key, 1, 0, 0, 0 };
     PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
     int pending = !ready(waiter, 0) && !waiter->ned;
     first->aseq = 2;
@@ -5693,7 +6081,7 @@ __attribute__((visibility("default"))) void fencepost_barrier(id cb)
 {
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)cb);
-    if (c && !c->mtl4) { fp_item it = { 3, 0, NULL, (uint64_t)c->nenc }; PUSH(c->it, c->nit, c->cit, it); }
+    if (c) { fp_item it = { 3, 0, NULL, (uint64_t)c->nenc }; PUSH(c->it, c->nit, c->cit, it); }
     pthread_mutex_unlock(&g_lock);
 }
 
