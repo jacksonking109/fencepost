@@ -130,14 +130,14 @@ static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), v
             return 2;
     }
 
-    if (!mtl4_encode(main, 1, frame) || !mtl4_submit(main)) return 1;
-    capture("API Request");
     if (mixed) {
         id<MTLCommandQueue> queue = [[device newCommandQueue] autorelease];
         id<MTLBuffer> buffer = [[device newBufferWithLength:4096 options:MTLResourceStorageModeShared] autorelease];
         id<MTLCommandBuffer> first = [queue commandBuffer];
         if (!first || !buffer || manager.isCapturing || !submit(first, buffer, NULL)) return 3;
     }
+    if (!mtl4_encode(main, 1, frame) || !mtl4_submit(main)) return 1;
+    capture("API Request");
     if (defer || blocked) {
         // The first begin after a frame boundary must see the worker's held buffer.
         for (NSUInteger frame_no = 2; frame_no <= (blocked ? 4 : 2); frame_no++) {

@@ -4967,7 +4967,9 @@ static void capture_before_cb(id owner, int mtl4)
     capture_stop_at_boundary();
     pthread_mutex_lock(&g_lock);
     uint64_t frame = mtl4 ? g_frame_cur : g_capture_frame;
-    int new_frame = frame > g_capture_opened && mtl4 == g_capture_mtl4;
+    /* Either API can open the frame. capture_start checks the shared Metal 4
+     * gate before starting the device capture from either entry point. */
+    int new_frame = frame > g_capture_opened;
     /* Do not hold a new frame hostage to feedback that could depend on its
      * work. If recording continues into this frame, wait for its end too. */
     if (g_capture_generation && g_capture_mtl4)

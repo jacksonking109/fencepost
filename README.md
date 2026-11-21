@@ -328,13 +328,12 @@ time, a reason on line one, and an optional `pid=N` on line two.
 
 After the program has ended at least one frame, fencepost captures the device used by the next frame's
 first Metal 3 command buffer allocation or Metal 4 `beginCommandBufferWithAllocator:`. A present,
-`signalDrawable:`, or an explicit `fencepost_frame` marker ends the frame. Once a process creates a
-Metal 4 queue or command buffer, it uses the Metal 4 gate. In a mixed process, Metal 3 work before that
-first Metal 4 begin can fall outside the capture.
+`signalDrawable:`, or an explicit `fencepost_frame` marker ends the frame. In a mixed process either
+Metal API can open the next frame, and both entry points check the shared Metal 4 gate.
 
 A Metal 4 buffer that has ended and is awaiting submission on any queue blocks the start. Fencepost
-tries the first begin of each eligible frame and logs a refusal after three blocked frame starts.
-An ended buffer stops blocking capture when it is submitted or deallocated. Metal 4 captures stop at a frame
+tries the first allocation or begin of each eligible frame and logs a refusal after three blocked frame starts.
+An ended buffer stops blocking capture when it is successfully submitted or deallocated. Metal 4 captures stop at a frame
 boundary once submission feedback has arrived. If the app starts another frame while feedback is pending,
 the capture can extend to its end. The idle and hard-cap timers still apply.
 
