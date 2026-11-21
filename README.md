@@ -17,8 +17,8 @@ fencepost: RACE read-after-write on texture 64x64, pixel format 70, 1 levels 0x7
 
 ## Why
 
-Metal orders GPU work for you only on resources it tracks. Translation layers (DXMT, MoltenVK, D3D12 runtimes) and
-most engines create resources with `MTLHazardTrackingModeUntracked`, or reach them through argument buffers Metal does
+Metal 3 can order GPU work for resources it tracks. Metal 4 queues require explicit synchronisation. Translation layers (DXMT, MoltenVK, D3D12 runtimes) and
+many engines create resources with `MTLHazardTrackingModeUntracked`, or reach them through argument buffers Metal does
 not track, because tracking costs CPU time. Then ordering is the program's job, through `updateFence`/`waitForFence`
 and `MTLEvent` signals and waits. Forget one and two passes overlap on the GPU: a read sees half-written data, and a
 frame flickers. The bug comes and goes with timing, it often disappears under a frame capture (captures serialise the
@@ -31,7 +31,7 @@ show.
 
 ## What it checks
 
-**Resource races.** For each untracked texture or buffer, fencepost records which encoder reads or writes it, through:
+**Resource races.** On Metal 3, for each untracked texture or buffer, fencepost records which encoder reads or writes it, through:
 - render pass attachments (load, store, MSAA resolve, visibility buffer);
 - `useResource` (with its usage and stages);
 - vertex/fragment/compute bindings;
@@ -50,7 +50,7 @@ if (fp_barrier) fp_barrier(commandBuffer);   /* at a D3D12 ResourceBarrier, a Vu
 ```
 
 Every encoder submitted to that queue before the call must then be ordered before every encoder after it. fencepost
-checks the encoded fences and events against that, resource by resource or not at all. A render encoder that waits
+checks that ordering against the encoded fences and events, and against stage barriers on Metal 4. This check also works when resource accesses are invisible. A render encoder that waits
 only before its fragment stage is reported separately: its vertex stage can still overlap.
 
 An encoder the runtime orders by other means (a present blit that touches only tracked resources, say) can be left out
@@ -58,7 +58,7 @@ of these checks as an earlier encoder with `fencepost_exempt(encoder)`, called w
 are still checked.
 
 **How parallel each frame is.** Too much synchronisation costs as well: encoders chained one after another leave the
-GPU nothing to overlap. For every frame (a `presentDrawable`), fencepost counts the encoders and the longest chain of
+GPU nothing to overlap. For every frame (a Metal 3 present, a Metal 4 drawable signal, or an explicit frame boundary), fencepost counts the encoders and the longest chain of
 them the encoded fences and events force to run in order, and prints the medians with the running summary:
 
 ```
@@ -112,19 +112,22 @@ descriptor for the descriptorless calls). A program that attaches its own counte
 boundaries, such as Madeira with `gpu-pass-profile`, keeps its samples. Fencepost skips sampling those encoders
 and also skips sampling if all attachment slots are occupied.
 
-On Metal 4, sampled render and compute encoders have their own spans inside the commit's GPU span. Overlapping
-GPU work stays overlapping in separate lanes, and race markers use both measured spans when available.
-A capture can change the timing of the work it observes.
-Set `FENCEPOST_TRACE_GPU=0` to disable encoder counter sampling and keep command buffer GPU timing.
+Set `FENCEPOST_TRACE_GPU=0` to disable per-encoder sampling and keep command buffer GPU timing.
+
+The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
+process stopped before writing the closing bracket.
 
 ## Metal 4
 
-On macOS 26 and later, fencepost records Metal 4 queues, render and compute encoders (including blit commands),
-and event signals and waits. Each queue commit has one measured GPU span, including commits that batch several
-logical command buffers. Encoders appear in submission and encoding order with estimated GPU positions.
+On macOS 26 and later with a Metal 4 device, fencepost records queues, command buffers, render and compute
+encoders (including blit commands), and queue event signals and waits. A commit that batches several command
+buffers has one GPU span from commit feedback. Sampled encoders have individual spans within it. The trace
+puts overlapping encoders in separate lanes and uses their samples to annotate race markers.
+
+### Resources and pipeline reflection
 
 Race analysis tracks render attachments, copies, fills, mipmap generation, and the argument-table bindings
-that each draw or dispatch uses. For tracked buffers, an address inside a buffer covers the remaining range
+that each draw or dispatch uses. For a known buffer, an address inside a buffer covers the remaining range
 when Metal supplies no length. Texture views are checked against their underlying storage. Unresolved
 addresses and resource IDs are counted in the summary.
 
@@ -150,41 +153,50 @@ archives, data sets, device pipelines made before the first Metal 4 object) use 
 are otherwise counted as "access unknown" in the summary. Their slots fall back to reads, or to possible writes
 with `FENCEPOST_BIND_MAYWRITE=1`.
 
-A Metal 4 queue supplies no implicit ordering between encoders. A consumer barrier orders the specified
-stages of earlier encoders before matching work after the barrier in its own encoder and in all later
-encoders on the queue. The SDK header describes the current encoder only. Fencepost follows
-[Apple's online documentation](https://developer.apple.com/documentation/metal/mtl4commandencoder/barrierafterqueuestages:beforestages:visibilityoptions:)
-and tests across command buffers and commits. A producer barrier also covers commands encoded before it in
-its own encoder, and gates work in later encoders. Barriers chain through a shared stage only when both
-cover an operation in that stage, including a fence update or wait. Fences order covered work on the same
-queue. Queue events order all covered stages, and commit feedback orders completed work before a later
-submission. Reports name the stages of both accesses.
+### Ordering between encoders
+
+Queue submission order alone does not order resource accesses. The source stage must cover the producer's
+access, and the destination stage must cover the consumer's. For example, a Blit → Dispatch barrier leaves an
+earlier Dispatch write unordered.
+
+A consumer barrier orders the specified stages of earlier encoders before matching work after the barrier in
+its own encoder and in later encoders on the queue. The SDK header describes only the current encoder.
+Fencepost applies the broader rule in Apple's online documentation. The race suite checks it across command
+buffers and commits. [Apple's consumer barrier reference](https://developer.apple.com/documentation/metal/mtl4commandencoder/barrierafterqueuestages:beforestages:visibilityoptions:)
+
+A producer barrier orders earlier commands in its own encoder before work at the specified stages in later
+encoders. Two barriers chain through a shared stage only if both cover an operation in that stage, which can
+be a fence update or wait. Fences order covered work on the same queue. Queue event signals and waits order
+work across queues. Commit feedback orders completed work before a later submission.
 
 Render attachments load at the start of the pass and store at its end, both in the Fragment stage. Apple's
-documentation does not say whether a consumer barrier or fence wait inside a render encoder orders the load, so
-fencepost decides conservatively: one encoded before the encoder's first draw covers the attachment loads and
-stores; one encoded after a draw covers the stores only. A Fragment fence update or producer barrier covers
-the render pass's attachment stores only when no draw is encoded after it; one before or between draws covers
-neither the stores nor later draws.
+documentation leaves the effect of an in-encoder wait on the load unspecified. Fencepost treats a consumer
+barrier or fence wait covering Fragment before the first draw as covering both loads and stores. After a draw,
+it covers stores only. A Fragment fence update or producer barrier covers stores only if it follows the last
+draw. One before or between draws leaves the stores and subsequent draws uncovered.
+
+### Timing, frames and capture
 
 Fencepost submits `commit:count:` as `commit:count:options:` with fresh options for its own feedback. For
 app options it tracks, it transfers the registered handlers to fresh options for that submission. Each handler
 registration is consumed once, including when the app reuses its options.
 
-With GPU tracing on, fencepost inserts two Relaxed timestamp writes into each sampled app encoder. Relaxed
-sampling keeps overhead low and avoids the encoder splitting that Precise sampling can cause. The writes can
-shift GPU timing slightly. Spans are approximate: in repeated runs of fixed workloads, an occasional
-encoder span came out shorter than its work, by up to half, with Relaxed and Precise stamps alike. Use
-them for ordering, overlap and rough cost, not exact durations. Render samples go from the vertex stage before the first draw to the fragment
-stage after the last draw. Fencepost resolves samples on commit feedback from its own timestamp heap per
-device. The heap holds 4,096 entries, enough for 2,048 encoder pairs across outstanding submissions.
-Excess encoders, machine-learning encoders, suspend/resume render segments and encoders without a valid
-timestamp pair get estimated spans and count toward `sampling_skipped` when GPU sampling is enabled.
+With GPU tracing on, fencepost writes two Relaxed timestamps per sampled render or compute encoder. Render
+samples run from Vertex before the first draw to Fragment after the last. Fencepost resolves the timestamps on
+commit feedback. Sampling can shift GPU timing. In repeated fixed-workload tests, some spans underestimated
+duration by up to half with either Relaxed or Precise timestamps. Use the spans for overlap and rough cost.
+
+Each device has 4,096 timestamp entries, enough for 2,048 encoder pairs across outstanding submissions.
+When the heap fills, the encoder type is unsupported (machine learning or suspend/resume render segments),
+or the timestamp pair is invalid, the trace estimates the encoder's position. With GPU sampling enabled,
+these fallbacks count toward `sampling_skipped`.
 
 `signalDrawable:` marks the end of a frame. Programs can use `fencepost_frame` to supply their own frame
 boundaries. Ring dumps support manual requests, races, frame spikes, and GPU errors reported by commit feedback.
 `FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
 because fencepost learns the submitting queue after encoding.
+
+### Limits
 
 Fencepost records a queue's events in the order its hooks see them. When two threads submit to the same
 `MTL4CommandQueue` without the app serializing those calls, Metal can see them in a different order.
@@ -193,9 +205,6 @@ Metal 4 analysis covers races between encoders. It skips within-encoder races, a
 resource contents, and `MTL4VisibilityOptions` correctness. Residency-set membership alone supplies no
 accesses. The summary counts encoders with residency sets and no visible accesses, machine-learning encoders,
 and acceleration-structure builds. Frame chains follow queue event ordering.
-
-The trace is flushed with running summaries and on exit. Perfetto can read the complete records in a file whose
-process stopped before writing the closing bracket.
 
 ## Catching a bad frame (FENCEPOST_RING)
 
@@ -265,7 +274,7 @@ briefly show a checkmark, and fencepost should log a dump whose filename ends in
 
 ## Xcode capture
 
-Launch a Metal program with `MTL_CAPTURE_ENABLED=1` and `FENCEPOST_CAPTURE` set to a filename prefix in an
+Launch a Metal 3 program with `MTL_CAPTURE_ENABLED=1` and `FENCEPOST_CAPTURE` set to a filename prefix in an
 existing directory. Capture is opt-in and works independently of `FENCEPOST_TRACE` and `FENCEPOST_RING`.
 In our submission probe, `MTL_CAPTURE_ENABLED=1` added about 67% CPU overhead even with no capture running.
 
@@ -287,18 +296,7 @@ After the program has ended at least one frame, fencepost starts capture before 
 first command buffer. It ignores requests while a capture is active. Open the logged
 `<prefix>-<pid>-f<frame>-<reason>.gputrace` in Xcode with **File → Open**.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `FENCEPOST_CAPTURE_FILE` | `/tmp/fencepost-capture-<uid>` | request file, empty disables polling |
-| `FENCEPOST_CAPTURE_ON` | empty | comma-separated `race`, `gpu-error`, `spike` auto triggers |
-| `FENCEPOST_CAPTURE_FRAMES` | 1 | frame ends to record |
-| `FENCEPOST_CAPTURE_IDLE_SECS` | 10 | seconds without command buffer commits before stopping, minimum 1 |
-| `FENCEPOST_CAPTURE_MAX_SECS` | 120 | hard cap on recording time in seconds, minimum 1 |
-| `FENCEPOST_CAPTURE_MAX` | 3 | captures allowed per process |
-| `FENCEPOST_CAPTURE_MIN_FREE_GB` | 10 | minimum free GiB on the output volume |
-| `FENCEPOST_CAPTURE_COOLDOWN` | 10 | seconds after a capture before another can start |
-
-## How it works
+## How Metal 3 analysis works
 
 - **Nodes:** every encoder is one. A render encoder has two stages, vertex and fragment.
 - **Edges** order nodes:
@@ -312,9 +310,9 @@ first command buffer. It ignores requests while a capture is active. Open the lo
   sets the value, or for 256 commits.
 - **Tracked resources** are skipped: Metal orders those itself.
 
-## Limits
+## Metal 3 limits
 
-These are reported in the summary as blind spots where they occur.
+The summary reports blind spots where it can identify them.
 - **Argument buffers and residency sets:** resources reached only through them are invisible. Declared barriers cover
   the ordering, not the data.
 - **`useHeap`:** the resources inside a heap are not seen. Aliasing between resources placed in the same heap memory
@@ -323,7 +321,7 @@ These are reported in the summary as blind spots where they occur.
   translation layers declare their writes with `useResource` (`FENCEPOST_BIND_MAYWRITE=1` changes this).
 - **Read+write `useResource`:** a kernel may or may not write the resource. Conflicts that rest only on such a "may
   write" are reported as *possible*, not as races.
-- **Not followed:** parallel render encoders and Metal 4 (`MTL4CommandQueue`) encoders.
+- **Parallel render encoders** are outside Metal 3 race analysis.
 - **Event signals** are taken to follow all earlier work on their queue.
 - **Retired work:** a command buffer that completed before the next commit is treated as ordered. A race whose window
   closed that way on this run is missed.
@@ -333,7 +331,7 @@ These are reported in the summary as blind spots where they occur.
 
 ## Knobs (environment)
 
-| Variable | Default | |
+| Variable | Default | Meaning |
 |---|---|---|
 | `FENCEPOST_LOG` | stderr | append reports to this file; `%p` in the name becomes the process id |
 | `FENCEPOST_MAX_REPORTS` | 200 | detailed reports printed; the rest are counted |
@@ -358,6 +356,17 @@ These are reported in the summary as blind spots where they occur.
 | `FENCEPOST_MAX_AUTO_DUMPS` | 20 | timeline dumps per process from race, GPU-error and spike triggers |
 | `FENCEPOST_MAX_MANUAL_DUMPS` | 20 | timeline dumps per process from file, hotkey, CLI and API requests |
 | `FENCEPOST_MAX_DUMPS` | 20 | fallback for either timeline dump quota when its own knob is unset |
+| `FENCEPOST_CAPTURE` | unset | filename prefix for Metal 3 Xcode captures, requires `MTL_CAPTURE_ENABLED=1` |
+| `FENCEPOST_CAPTURE_FILE` | `/tmp/fencepost-capture-<uid>` | request file, empty disables polling |
+| `FENCEPOST_CAPTURE_ON` | empty | comma-separated `race`, `gpu-error`, `spike` auto triggers |
+| `FENCEPOST_CAPTURE_FRAMES` | 1 | frame ends to record |
+| `FENCEPOST_CAPTURE_IDLE_SECS` | 10 | seconds without command buffer commits before stopping, minimum 1 |
+| `FENCEPOST_CAPTURE_MAX_SECS` | 120 | hard cap on recording time in seconds, minimum 1 |
+| `FENCEPOST_CAPTURE_MAX` | 3 | captures allowed per process |
+| `FENCEPOST_CAPTURE_MIN_FREE_GB` | 10 | minimum free GiB on the output volume |
+| `FENCEPOST_CAPTURE_COOLDOWN` | 10 | seconds after a capture before another can start |
+| `FENCEPOST_MTL4_TEST_ERROR_COMMIT` | 0 | test-hooks dylib only, simulate a feedback error on this one-based submission |
+| `FENCEPOST_MTL4_TEST_REFLECTION_FAIL` | 0 | test-hooks dylib only, force this many added-reflection requests to fail to exercise retries |
 
 Each distinct race is printed once and counted after that.
 
@@ -373,9 +382,9 @@ Prebuilt (universal: Apple Silicon and x86_64/Rosetta, macOS 13+) on the
 macOS then refuses to load the library ("library load disallowed by system policy"); clear the mark after extracting:
 
 ```
-tar -xzf fencepost-0.2.0-macos.tar.gz
-xattr -dr com.apple.quarantine fencepost-0.2.0-macos
-DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.2.0-macos/libfencepost.dylib  your-metal-program
+tar -xzf fencepost-0.3.0-macos.tar.gz
+xattr -dr com.apple.quarantine fencepost-0.3.0-macos
+DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.3.0-macos/libfencepost.dylib  your-metal-program
 ```
 
 The archive also holds the trigger tools: `fencepost-trigger` (command line) and `Fencepost Trigger.app` (menu-bar
@@ -385,38 +394,42 @@ The library is signed ad hoc, not by an Apple developer ID; building it yourself
 
 ## Build and test
 
-Needs macOS 13 or later and Apple's command-line tools (`xcode-select --install`; full Xcode is not required).
+Build with Apple's command-line tools and the macOS 26 SDK for the Metal 4 APIs. The universal binaries target
+macOS 13 and later. Metal 4 tests require a Metal 4 device and macOS 26 or later. The two-slice test commands
+below assume Apple silicon with Rosetta installed.
 
-```
+```sh
 git clone https://github.com/jacksonking109/fencepost && cd fencepost
-./build.sh                                                   # universal arm64 + x86_64, signed ad hoc
-./build.sh release 0.2.0                                     # also a release archive, without debug information
-DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
-arch -x86_64 -e DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest   # the Rosetta slice
-FENCEPOST_TRACE=out/fptest.json DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/fptest
-python3 -I tests/trace_check.py out/fptest.json
-FENCEPOST_TRACE=out/tracetest.json FENCEPOST_MAX_REPORTS=0 DYLD_INSERT_LIBRARIES=$PWD/out/libfencepost.dylib out/tracetest
-python3 -I tests/trace_check.py --shape out/tracetest.json
-python3 -I tests/ring_check.py arm64
-python3 -I tests/ring_check.py x86_64
-python3 -I tests/trigger_check.py arm64
-python3 -I tests/trigger_check.py x86_64
-python3 -I tests/capture_check.py arm64
-python3 -I tests/capture_check.py x86_64
-out/mtl4test event
-out/mtl4bench metal4
-out/mtl4bench metal4-commit
-out/mtl4frames
-python3 -I tests/mtl4_check.py arm64
-python3 -I tests/mtl4_check.py x86_64
-python3 -I tests/mtl4_check.py arm64 --threads
-python3 -I tests/mtl4_check.py x86_64 --threads
-python3 -I tests/mtl4_race_check.py arm64
-python3 -I tests/mtl4_race_check.py x86_64
-python3 -I tests/mtl4_timing_check.py arm64                  # every Metal 4 timing case 3 times
-python3 -I tests/mtl4_timing_check.py x86_64
-python3 -I tests/mtl4_overhead.py                            # CPU overhead table, both slices
-python3 -I tests/mtl4_overhead.py --trace-timing arm64 x86_64 # CPU cost of estimated and sampled traces
+./build.sh
+./build.sh release 0.2.0  # also build a stripped release archive
+```
+
+Run the Metal 3 detector, trace, ring, trigger and capture checks on each slice:
+
+```sh
+for slice in arm64 x86_64; do
+    arch "-$slice" -e DYLD_INSERT_LIBRARIES="$PWD/out/libfencepost.dylib" out/fptest
+    arch "-$slice" -e DYLD_INSERT_LIBRARIES="$PWD/out/libfencepost.dylib" \
+        -e FENCEPOST_TRACE="out/fptest-$slice.json" out/fptest
+    python3 -I tests/trace_check.py "out/fptest-$slice.json"
+    arch "-$slice" -e DYLD_INSERT_LIBRARIES="$PWD/out/libfencepost.dylib" \
+        -e FENCEPOST_TRACE="out/tracetest-$slice.json" -e FENCEPOST_MAX_REPORTS=0 out/tracetest
+    python3 -I tests/trace_check.py --shape "out/tracetest-$slice.json"
+    for check in ring trigger capture; do python3 -I "tests/${check}_check.py" "$slice"; done
+done
+```
+
+Run the Metal 4 checks and benchmarks:
+
+```sh
+for slice in arm64 x86_64; do
+    for check in mtl4 mtl4_race mtl4_timing; do python3 -I "tests/${check}_check.py" "$slice"; done
+    python3 -I tests/mtl4_check.py "$slice" --threads
+    arch "-$slice" -e DYLD_INSERT_LIBRARIES="$PWD/out/libfencepost.dylib" out/mtl4frames
+    arch "-$slice" -e DYLD_INSERT_LIBRARIES="$PWD/out/libfencepost.dylib" out/mtl4bench metal4
+done
+python3 -I tests/mtl4_overhead.py arm64 x86_64
+python3 -I tests/mtl4_overhead.py --trace-timing arm64 x86_64
 ```
 
 `tests/fptest.m` holds 35 small Metal programs with and without the synchronisation they need, each with the number of
@@ -432,18 +445,22 @@ races, barrier violations or frame chain lengths fencepost must report. Examples
 verifies their exact arrows and marker, track lanes, and the trace's summary. Use `out/tracetest --app-counters`
 to check that the app still gets its own timestamps when tracing is on.
 
-`tests/trigger_check.py` checks trigger file writes, one CLI-triggered ring dump and app startup in the logged-in
+`tests/trigger_check.py` checks trigger file writes, broadcast and PID-targeted CLI ring dumps and app startup in the logged-in
 macOS session. Check the global hotkey by hand as described above.
 
 On a Metal 4 device, `mtl4bench metal4-commit` measures CPU time for small submissions with up to eight in
 flight, and `mtl4bench pipelines` times compute pipeline builds through `MTL4Compiler` and the device.
 `tests/mtl4_overhead.py` runs each with and without fencepost, three times per slice, and prints the medians.
-`tests/mtl4_race_check.py` runs every Metal 4 verdict case three times per slice. `mtl4frames --long` checks frame chain depth over 512 frames. `./build.sh` also builds
-`out/libfencepost-testhooks.dylib` for checking live trace records, retired queue signals, and synthetic errors.
-In that build,
-`FENCEPOST_MTL4_TEST_ERROR_COMMIT` selects a submission by its one-based number for simulated feedback errors.
+The debug build includes `out/libfencepost-testhooks.dylib` for testing trace records, retired queue signals,
+pipeline retries and simulated feedback errors. `mtl4frames --long` exercises frame chains over 512 frames.
 
 ## Results so far
+
+**Metal 4 on arm64 and Rosetta (0.3.0).** All 49 race verdicts and six GPU timing cases passed three
+times per slice. The detector caught the missing barrier, wrong-stage barrier and premature event signal.
+The frame workload and the 10,000-draw benchmark produced zero race reports.
+
+**Earlier Metal 3 results**
 
 - **Our D3D12 runtime, 14 test programs:** 5,300 declared barriers checked, 0 reports, the same check results with and
   without fencepost.
