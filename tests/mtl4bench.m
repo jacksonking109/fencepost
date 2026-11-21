@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 
@@ -209,6 +210,12 @@ static int pipelines(void)
     }
     printf("pipelines: %d fresh compute pipelines each, median %.4f ms MTL4Compiler, %.4f ms device\n",
            Count, medians[0], medians[1]);
+    int (*stats)(long *, int) = (void *)dlsym(RTLD_DEFAULT, "fencepost_stats");
+    if (stats) {
+        long reports[2];   /* ST_RACE_UNIQ, ST_POSS_UNIQ */
+        if (stats(reports, 2) < 2) return 1;
+        printf("fencepost stats: %ld races, %ld possible\n", reports[0], reports[1]);
+    }
     return 0;
 }
 

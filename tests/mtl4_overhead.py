@@ -27,8 +27,17 @@ def bench(arch, mode, injected, env):
     result = subprocess.run(["arch", "-" + arch, *knobs, OUT / "mtl4bench", mode], env=env,
                             text=True, capture_output=True, timeout=120, check=True)
     if injected:
-        assert "0 race(s) (0 hits), 0 possible (0 hits)" in result.stderr or mode == "pipelines", result.stderr
+        if mode == "pipelines":
+            assert "fencepost stats: 0 races, 0 possible" in result.stdout.splitlines(), (result.stdout, result.stderr)
+        else:
+            assert "fencepost: final: 0 race(s) (0 hits), 0 possible (0 hits)" in result.stderr, result.stderr
     return result.stdout
+
+
+def samples(arch, mode, injected, env):
+    if mode == "pipelines":
+        bench(arch, mode, injected, env)  # warm the shader cache for this configuration
+    return [bench(arch, mode, injected, env) for _ in range(RUNS)]
 
 
 def main():
@@ -37,9 +46,10 @@ def main():
     args = parser.parse_args()
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("FENCEPOST_") and k not in ("DYLD_INSERT_LIBRARIES", "MTL_CAPTURE_ENABLED")}
-    print(f"| slice | measure | without | with fencepost | change |\n|---|---|---|---|---|")
+    print("Pipeline timings are measured with a warm shader cache.\n", flush=True)
+    print("| slice | measure | without | with fencepost | change |\n|---|---|---|---|---|")
     for arch in args.arch:
-        outputs = {(mode, injected): [bench(arch, mode, injected, env) for _ in range(RUNS)]
+        outputs = {(mode, injected): samples(arch, mode, injected, env)
                    for mode in dict.fromkeys(m for m, _, _ in MEASURES) for injected in (False, True)}
         for mode, unit, pattern in MEASURES:
             values = [median(float(re.search(pattern, text)[1]) for text in outputs[mode, injected])
