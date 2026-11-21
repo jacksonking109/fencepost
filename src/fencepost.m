@@ -65,8 +65,8 @@
 #define FP_HOOKCLS      8
 
 enum { FP_RD = 1, FP_WR = 2, FP_MAYBE = 4 };    /* FP_MAYBE: declared read+write, may not write */
-enum { FPK_RENDER = 1, FPK_COMPUTE, FPK_BLIT, FPK_SIGNAL };
-static const char *const kind_name[] = { "?", "render", "compute", "blit", "event signal" };
+enum { FPK_RENDER = 1, FPK_COMPUTE, FPK_BLIT, FPK_SIGNAL, FPK_ML };
+static const char *const kind_name[] = { "?", "render", "compute", "blit", "event signal", "machine learning" };
 enum { FP4_VERTEX, FP4_FRAGMENT, FP4_TILE, FP4_OBJECT, FP4_MESH,
        FP4_DISPATCH, FP4_BLIT, FP4_ACCEL, FP4_ML, FP4_RESOURCE_STATE, FP4_STAGE_COUNT };
 static const char *const fp4_stage_names[] = {
@@ -516,10 +516,13 @@ typedef struct {
 typedef struct fp_trace_device {
     id<MTLDevice> device;
     id<MTLCounterSampleBuffer> buffer;
+    id heap;                       /* MTL4CounterHeap, initialized only on Metal 4 */
+    uint64_t frequency;
     struct { uint64_t cpu, gpu; } first, last;
     uint64_t calibration;
     uint64_t previous_end[FP_TRACE_SAMPLES / 2];
     unsigned free_slots[FP_TRACE_SAMPLES / 2], nfree;
+    int mtl4;
     struct fp_trace_device *next;
 } fp_trace_device;
 
@@ -528,7 +531,7 @@ typedef struct fp_trace_encoder {
     struct fp_trace_encoder *next;
     struct fp_trace_cb *cb;
     uint64_t uid, start, end, thread, gpu_start, gpu_end;
-    int sample, selected, kind, args_dropped;
+    int sample, sample_ended, selected, kind, args_dropped;
     char label[64], mtl4_cb_label[48];
     char *args;
     fp_evwait *waits;
@@ -1151,24 +1154,40 @@ static void trace_diagnostic(unsigned kind, uint64_t from, uint64_t to, const ch
     trace_link_settle(link);
 }
 
-static fp_trace_device *trace_device(id<MTLDevice> device)
+static fp_trace_device *trace_device(id<MTLDevice> device, int mtl4)
 {
-    for (fp_trace_device *d = g_trace_devices; d; d = d->next) if (d->device == device) return d;
+    for (fp_trace_device *d = g_trace_devices; d; d = d->next)
+        if (d->device == device && d->mtl4 == mtl4) return d;
     fp_trace_device *d = calloc(1, sizeof *d);
-    d->device = [device retain]; d->next = g_trace_devices; g_trace_devices = d;
-    if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) return d;
-    for (id<MTLCounterSet> set in device.counterSets) {
-        if (![set.name isEqualToString:MTLCommonCounterSetTimestamp]) continue;
-        MTLCounterSampleBufferDescriptor *desc = [[MTLCounterSampleBufferDescriptor alloc] init];
-        desc.counterSet = set;
-        desc.sampleCount = FP_TRACE_SAMPLES;
-        desc.storageMode = MTLStorageModeShared;
-        desc.label = @"fencepost timestamps";
-        d->buffer = [device newCounterSampleBufferWithDescriptor:desc error:NULL];
-        [desc release];
-        break;
+    if (!d) return NULL;
+    d->device = [device retain]; d->mtl4 = mtl4; d->next = g_trace_devices; g_trace_devices = d;
+    if (mtl4) {
+        if (@available(macOS 26.0, *)) {
+            if ([device sizeOfCounterHeapEntry:MTL4CounterHeapTypeTimestamp] != sizeof(MTL4TimestampHeapEntry))
+                return d;
+            d->frequency = [device queryTimestampFrequency];
+            if (!d->frequency) return d;
+            MTL4CounterHeapDescriptor *desc = [[MTL4CounterHeapDescriptor alloc] init];
+            desc.type = MTL4CounterHeapTypeTimestamp;
+            desc.count = FP_TRACE_SAMPLES;
+            d->heap = [device newCounterHeapWithDescriptor:desc error:NULL];
+            [desc release];
+            [(id<MTL4CounterHeap>)d->heap setLabel:@"fencepost timestamps"];
+        }
+    } else if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        for (id<MTLCounterSet> set in device.counterSets) {
+            if (![set.name isEqualToString:MTLCommonCounterSetTimestamp]) continue;
+            MTLCounterSampleBufferDescriptor *desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+            desc.counterSet = set;
+            desc.sampleCount = FP_TRACE_SAMPLES;
+            desc.storageMode = MTLStorageModeShared;
+            desc.label = @"fencepost timestamps";
+            d->buffer = [device newCounterSampleBufferWithDescriptor:desc error:NULL];
+            [desc release];
+            break;
+        }
     }
-    if (d->buffer) {
+    if (d->buffer || d->heap) {
         g_trace_sampling_supported = 1;
         for (unsigned i = 0; i < FP_TRACE_SAMPLES / 2; i++) d->free_slots[d->nfree++] = FP_TRACE_SAMPLES - 2 - 2 * i;
     }
@@ -1243,7 +1262,7 @@ static fp_trace_cb *trace_cb_new(id cb, uint64_t uid, int queue, int mtl4)
         g_mtl4_trace_peak = MAX(g_mtl4_trace_peak, g_mtl4_trace_live);
     }
 #endif
-    if (g_trace_gpu && !mtl4) c->device = trace_device([cb device]);
+    if (g_trace_gpu) c->device = trace_device([cb device], mtl4);
     if (!g_trace_origin) trace_start();
     if (!owner) {
         owner = [[FPTraceOwner alloc] init];
@@ -1315,12 +1334,26 @@ static int trace_take_sample(fp_trace_encoder *e)
     fp_trace_device *d = e->cb->device;
     if (!g_trace_stopped) {
         if (d->nfree) {
-            if (!d->first.cpu) trace_calibrate(d);
+            if (!d->mtl4 && !d->first.cpu) trace_calibrate(d);
             e->sample = (int)d->free_slots[--d->nfree];
         } else g_trace_pool_exhausted++;
     }
     pthread_mutex_unlock(&g_lock);
     return e->sample >= 0;
+}
+
+API_AVAILABLE(macos(26.0))
+static void trace_mtl4_stamp(id enc, fp_trace_encoder *e, int end)
+{
+    id<MTL4CounterHeap> heap = e->cb->device->heap;
+    NSUInteger index = (NSUInteger)e->sample + end;
+    if (e->kind == FPK_RENDER) {
+        [(id<MTL4RenderCommandEncoder>)enc writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed
+            afterStage:end ? MTLRenderStageFragment : MTLRenderStageVertex intoHeap:heap atIndex:index];
+    } else {
+        [(id<MTL4ComputeCommandEncoder>)enc writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed
+            intoHeap:heap atIndex:index];
+    }
 }
 
 static void trace_encoder_register(fp_trace_encoder *e, fp_node *n)
@@ -4547,6 +4580,13 @@ static void fp4_render_attachments(fp_node *n, MTL4RenderPassDescriptor *desc)
     att(n, 9, desc.stencilAttachment, layers);
 }
 
+API_AVAILABLE(macos(26.0))
+static void trace_mtl4_begin_encoder(id enc, fp_node *n, fp_trace_encoder *trace)
+{
+    if (n && trace && trace->cb->device && trace->cb->device->heap && trace_take_sample(trace))
+        trace_mtl4_stamp(enc, trace, 0);
+}
+
 static id h_mtl4_render(id self, SEL _cmd, id desc)
 {
     ENTER;
@@ -4554,7 +4594,11 @@ static id h_mtl4_render(id self, SEL _cmd, id desc)
     id enc = ORIG(H_4_RENDER, id (*)(id, SEL, id))(self, _cmd, desc);
     LEAVE;
     if (OUTER) {
-        if (@available(macOS 26.0, *)) fp4_render_attachments(on_encoder_kind(self, enc, FPK_RENDER, trace, 1), desc);
+        if (@available(macOS 26.0, *)) {
+            fp_node *n = on_encoder_kind(self, enc, FPK_RENDER, trace, 1);
+            fp4_render_attachments(n, desc);
+            trace_mtl4_begin_encoder(enc, n, trace);
+        }
     }
     return enc;
 }
@@ -4566,7 +4610,12 @@ static id h_mtl4_render_opts(id self, SEL _cmd, id desc, NSUInteger options)
     id enc = ORIG(H_4_RENDER_OPTS, id (*)(id, SEL, id, NSUInteger))(self, _cmd, desc, options);
     LEAVE;
     if (OUTER) {
-        if (@available(macOS 26.0, *)) fp4_render_attachments(on_encoder_kind(self, enc, FPK_RENDER, trace, 1), desc);
+        if (@available(macOS 26.0, *)) {
+            fp_node *n = on_encoder_kind(self, enc, FPK_RENDER, trace, 1);
+            fp4_render_attachments(n, desc);
+            /* Suspend/resume encoders are pieces of a single stitched render pass. */
+            if (options == MTL4RenderEncoderOptionNone) trace_mtl4_begin_encoder(enc, n, trace);
+        }
     }
     return enc;
 }
@@ -4577,17 +4626,26 @@ static id h_mtl4_compute(id self, SEL _cmd)
     fp_trace_encoder *trace = TRACE_ENCODER();
     id enc = ORIG(H_4_COMPUTE, id (*)(id, SEL))(self, _cmd);
     LEAVE;
-    if (OUTER) on_encoder_kind(self, enc, FPK_COMPUTE, trace, 1);
+    if (OUTER) {
+        fp_node *n = on_encoder_kind(self, enc, FPK_COMPUTE, trace, 1);
+        if (trace) {
+            if (@available(macOS 26.0, *)) trace_mtl4_begin_encoder(enc, n, trace);
+        }
+    }
     return enc;
 }
 
 static id h_mtl4_ml(id self, SEL _cmd)
 {
-    ENTER; id enc = ORIG(H_4_ML, id (*)(id, SEL))(self, _cmd); LEAVE;
+    ENTER;
+    fp_trace_encoder *trace = TRACE_ENCODER();
+    id enc = ORIG(H_4_ML, id (*)(id, SEL))(self, _cmd);
+    LEAVE;
     if (OUTER && enc) {
         pthread_mutex_lock(&g_lock);
         g_mtl4_ml_encoders++;
         pthread_mutex_unlock(&g_lock);
+        if (trace) on_encoder_kind(self, enc, FPK_ML, trace, 1);
     }
     return enc;
 }
@@ -5462,6 +5520,22 @@ static void trace_mtl4_join(fp_trace_cb **batch, fp_cb *c)
     }
 }
 
+/* Without a feedback hook we cannot establish when an encoded write retires.
+ * Keep those pairs reserved for the lifetime of the heap. */
+static void trace_mtl4_abandon_samples(id cb)
+{
+    FPTraceOwner *owner = objc_getAssociatedObject(cb, &g_trace_owner_key);
+    if (!owner || !owner->record) return;
+    for (fp_trace_encoder *e = owner->record->encoders; e; e = e->next) e->sample = -1;
+}
+
+static void trace_mtl4_untracked_commit(const id *buffers, NSUInteger count)
+{
+    pthread_mutex_lock(&g_lock);
+    for (NSUInteger i = 0; i < count; i++) trace_mtl4_abandon_samples(buffers[i]);
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void trace_mtl4_submit(fp_queue *q, fp_trace_cb *trace)
 {
     if (q->mtl4_last_trace) trace_release_cb(q->mtl4_last_trace);
@@ -5506,7 +5580,10 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
         for (NSUInteger i = 0; i < count; i++) {
             id cb = buffers[i];
             fp_cb *c = cb_find_open((void *)cb);
-            if (!c || !c->mtl4 || c->state != 2) continue;
+            if (!c || !c->mtl4 || c->state != 2) {
+                if (g_trace_enabled && g_trace_gpu) trace_mtl4_abandon_samples(cb);
+                continue;
+            }
             snprintf(c->label, sizeof c->label, "%s", labels[i]);
             c->q = q;
             c->commit_tick = tick;
@@ -5528,6 +5605,8 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
         process_pending(0);
         if ((g_tick & 15) == 0) sweep();
         if (g_trace) trace_stream_flush();
+    } else if (g_trace_enabled && g_trace_gpu) {
+        for (NSUInteger i = 0; i < count; i++) trace_mtl4_abandon_samples(buffers[i]);
     }
     pthread_mutex_unlock(&g_lock);
     if (labels != local_labels) free(labels);
@@ -5619,6 +5698,7 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
             trace->gpu_start = (uint64_t)(start * 1e9);
             trace->gpu_end = (uint64_t)(end * 1e9);
         }
+        for (fp_trace_encoder *e = trace->encoders; e; e = e->next) trace_release_sample(e);
         trace->completed = 1;
         trace_cb_finish(trace);
     }
@@ -5696,6 +5776,7 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
         [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
             mtl4_completed(submission, feedback);
         }];
+    else if (g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
     for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
     [blocks release];
     return opts;
@@ -5717,7 +5798,10 @@ static void h_mtl4_commit(id self, SEL _cmd, const id *buffers, NSUInteger count
             }
         }
     }
-    if (!submitted) ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
+    if (!submitted) {
+        if (OUTER && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
+        ORIG(H_4_COMMIT, void (*)(id, SEL, const id *, NSUInteger))(self, _cmd, buffers, count);
+    }
     LEAVE;
     if (submitted) maybe_summary();
 }
@@ -5729,6 +5813,7 @@ static void h_mtl4_commit_opts(id self, SEL _cmd, const id *buffers, NSUInteger 
     if (OUTER && options) {
         if (@available(macOS 26.0, *)) opts = mtl4_submit_options(self, buffers, count, options);
     }
+    if (OUTER && !opts && g_trace_enabled && g_trace_gpu) trace_mtl4_untracked_commit(buffers, count);
     ORIG(H_4_COMMIT_OPTS, void (*)(id, SEL, const id *, NSUInteger, id))(self, _cmd, buffers, count, opts ?: options);
     [opts release];
     LEAVE;
@@ -5843,11 +5928,40 @@ static void h_ev_set(id self, SEL _cmd, uint64_t v)
 
 /* every encoder */
 
+API_AVAILABLE(macos(26.0))
+static void trace_mtl4_end_encoder(id enc, const fp_node *n)
+{
+    pthread_mutex_lock(&g_lock);
+    fp_trace_encoder *e = (fp_trace_encoder *)trace_node(n->uid);
+    pthread_mutex_unlock(&g_lock);
+    if (!e || e->sample < 0) return;
+
+    int work = n->mtl4_drawn;
+    if (n->kind == FPK_RENDER) {
+        for (int i = 0; !work && i < 10; i++) work = n->att[i] >= 0;
+    } else {
+        work = [(id<MTL4ComputeCommandEncoder>)enc stages] != 0;
+    }
+    if (work) {
+        trace_mtl4_stamp(enc, e, 1);
+        e->sample_ended = 1;
+    }
+}
+
 static void h_end(id self, SEL _cmd)
 {
-    ENTER; ORIG(H_END, void (*)(id, SEL))(self, _cmd); LEAVE;
+    ENTER;
+    fp_node *n = NULL;
+    if (OUTER && g_trace_enabled && g_trace_gpu) {
+        n = cur_node(self);
+        if (n && n->mtl4) {
+            if (@available(macOS 26.0, *)) trace_mtl4_end_encoder(self, n);
+        }
+    }
+    ORIG(H_END, void (*)(id, SEL))(self, _cmd);
+    LEAVE;
     if (!OUTER) return;
-    fp_node *n = cur_node(self);
+    if (!n) n = cur_node(self);
     if (!n) return;
     NSString *l = [self label];
     if (n->mtl4) {
@@ -6484,6 +6598,10 @@ static void hook_mtl4_cb(Class cls)
 static void hook_mtl4_encoder(Class cls, int kind)
 {
     if (kind == FPK_RENDER) install(cls, 106, mtl4_render_hooks, N(mtl4_render_hooks));
+    else if (kind == FPK_ML) {
+        static const hook_def ml_hooks[] = { HD(H_END, "endEncoding", h_end) };
+        install(cls, 114, ml_hooks, N(ml_hooks));
+    }
     else if (@available(macOS 26.0, *)) install(cls, 112, mtl4_compute_hooks, N(mtl4_compute_hooks));
 }
 static void hook_mtl4_argument(Class cls) { install(cls, 111, mtl4_argument_hooks, N(mtl4_argument_hooks)); }
