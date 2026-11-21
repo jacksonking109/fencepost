@@ -460,6 +460,17 @@ pipeline retries and simulated feedback errors. `mtl4frames --long` exercises fr
 times per slice. The detector caught the missing barrier, wrong-stage barrier and premature event signal.
 The frame workload and the 10,000-draw benchmark produced zero race reports.
 
+**Metal 4 CPU overhead.** These are medians of three runs per configuration, interleaved on the same
+Apple silicon Mac while plugged in and charging at 78%. The draw workload changes a buffer address and
+a texture binding on every draw. The commit workload encodes four draws per submission.
+
+| Slice | Measure | Without fencepost | With fencepost | Overhead |
+|---|---|---:|---:|---:|
+| arm64 | µs/draw | 0.0858 | 0.1059 | +23.4% |
+| arm64 | µs/commit | 5.000 | 8.458 | +69.2% |
+| x86_64 (Rosetta) | µs/draw | 0.1371 | 0.1762 | +28.5% |
+| x86_64 (Rosetta) | µs/commit | 8.041 | 12.958 | +61.1% |
+
 **Earlier Metal 3 results**
 
 - **Our D3D12 runtime, 14 test programs:** 5,300 declared barriers checked, 0 reports, the same check results with and
