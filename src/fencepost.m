@@ -3844,12 +3844,13 @@ enum {
 };
 
 static struct { Class c; IMP imp; } g_orig[H_COUNT][FP_HOOKCLS];
-static int g_norig[H_COUNT];
+static atomic_int g_norig[H_COUNT];
 
 static IMP orig_imp(int h, id self)
 {
+    int count = atomic_load_explicit(&g_norig[h], memory_order_acquire);
     for (Class c = object_getClass(self); c; c = class_getSuperclass(c))
-        for (int i = 0; i < g_norig[h]; i++)
+        for (int i = 0; i < count; i++)
             if (g_orig[h][i].c == c) return g_orig[h][i].imp;
     fp_log("fencepost: internal error: no original for hook %d on %s\n", h, class_getName(object_getClass(self)));
     abort();
@@ -3862,14 +3863,24 @@ static void hook(Class cls, int h, const char *selname, IMP repl)   /* g_lock he
     if (!m) return;
     IMP cur = method_getImplementation(m);
     if (cur == repl) return;   /* inherited from a class already hooked */
-    if (g_norig[h] == FP_HOOKCLS) { fp_log("fencepost: too many classes for %s\n", selname); return; }
-    g_orig[h][g_norig[h]].c = cls;
-    g_orig[h][g_norig[h]].imp = cur;
-    g_norig[h]++;
+    int count = atomic_load_explicit(&g_norig[h], memory_order_relaxed);
+    if (count == FP_HOOKCLS) { fp_log("fencepost: too many classes for %s\n", selname); return; }
+    g_orig[h][count].c = cls;
+    g_orig[h][count].imp = cur;
+    atomic_store_explicit(&g_norig[h], count + 1, memory_order_release);
     if (!class_addMethod(cls, sel, repl, method_getTypeEncoding(m))) method_setImplementation(m, repl);
 }
 
+/* Called from the replacement for h itself, so the receiver has a class
+ * registered for this hook. Most Metal draw and binding hooks have only one. */
+static inline IMP fp4_orig_imp(int h, id self)
+{
+    if (atomic_load_explicit(&g_norig[h], memory_order_acquire) == 1) return g_orig[h][0].imp;
+    return orig_imp(h, self);
+}
+
 #define ORIG(h, T) ((T)orig_imp((h), self))
+#define FP4_ORIG(h, T) ((T)fp4_orig_imp((h), self))
 #define ENTER int outer_ = !tl_depth; tl_depth++
 #define LEAVE tl_depth--
 #define OUTER outer_
@@ -5128,14 +5139,14 @@ static void h_mtl4_set_render_pipeline(id self, SEL _cmd, id pipeline)
 
 static void h_mtl4_address(id self, SEL _cmd, uint64_t address, NSUInteger index)
 {
-    ORIG(H_4_ADDRESS, void (*)(id, SEL, uint64_t, NSUInteger))(self, _cmd, address, index);
+    FP4_ORIG(H_4_ADDRESS, void (*)(id, SEL, uint64_t, NSUInteger))(self, _cmd, address, index);
     fp4_set_slot(self, index, 0, address, 0);
 }
 
 static void h_mtl4_stride(id self, SEL _cmd, uint64_t address, NSUInteger stride, NSUInteger index)
 {
     ENTER;
-    ORIG(H_4_STRIDE, void (*)(id, SEL, uint64_t, NSUInteger, NSUInteger))(self, _cmd, address, stride, index);
+    FP4_ORIG(H_4_STRIDE, void (*)(id, SEL, uint64_t, NSUInteger, NSUInteger))(self, _cmd, address, stride, index);
     LEAVE;
     if (OUTER) fp4_set_slot(self, index, 0, address, 0);
 }
@@ -5143,14 +5154,14 @@ static void h_mtl4_stride(id self, SEL _cmd, uint64_t address, NSUInteger stride
 static void h_mtl4_resource(id self, SEL _cmd, MTLResourceID resource, NSUInteger index)
 {
     ENTER;
-    ORIG(H_4_RESOURCE, void (*)(id, SEL, MTLResourceID, NSUInteger))(self, _cmd, resource, index);
+    FP4_ORIG(H_4_RESOURCE, void (*)(id, SEL, MTLResourceID, NSUInteger))(self, _cmd, resource, index);
     LEAVE;
     if (OUTER) fp4_set_slot(self, index, 0, resource._impl, 1);
 }
 
 static void h_mtl4_texture(id self, SEL _cmd, MTLResourceID resource, NSUInteger index)
 {
-    ORIG(H_4_TEXTURE, void (*)(id, SEL, MTLResourceID, NSUInteger))(self, _cmd, resource, index);
+    FP4_ORIG(H_4_TEXTURE, void (*)(id, SEL, MTLResourceID, NSUInteger))(self, _cmd, resource, index);
     fp4_set_slot(self, index, 1, resource._impl, 1);
 }
 
@@ -5194,14 +5205,14 @@ static void h_mtl4_accel_build(id self, SEL _cmd, id accel, id descriptor, MTL4B
 static void h_mtl4_draw(id self, SEL _cmd, NSUInteger primitive, NSUInteger start, NSUInteger count)
 {
     fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
-    ORIG(H_4_DRAW, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count);
+    FP4_ORIG(H_4_DRAW, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count);
 }
 
 static void h_mtl4_draw_i(id self, SEL _cmd, NSUInteger primitive, NSUInteger start, NSUInteger count, NSUInteger instances)
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
-    ORIG(H_4_DRAW_I, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count, instances);
+    FP4_ORIG(H_4_DRAW_I, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count, instances);
     LEAVE;
 }
 
@@ -5209,7 +5220,7 @@ static void h_mtl4_draw_b(id self, SEL _cmd, NSUInteger primitive, NSUInteger st
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
-    ORIG(H_4_DRAW_B, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count, instances, base);
+    FP4_ORIG(H_4_DRAW_B, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger))(self, _cmd, primitive, start, count, instances, base);
     LEAVE;
 }
 
@@ -5218,7 +5229,7 @@ static void h_mtl4_draw_idx(id self, SEL _cmd, NSUInteger primitive, NSUInteger 
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
     if (OUTER) fp4_index_access(self, index_address, index_bytes);
-    ORIG(H_4_DRAW_IDX, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes);
+    FP4_ORIG(H_4_DRAW_IDX, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes);
     LEAVE;
 }
 
@@ -5227,7 +5238,7 @@ static void h_mtl4_draw_idx_i(id self, SEL _cmd, NSUInteger primitive, NSUIntege
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
     if (OUTER) fp4_index_access(self, index_address, index_bytes);
-    ORIG(H_4_DRAW_IDX_I, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes, instances);
+    FP4_ORIG(H_4_DRAW_IDX_I, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes, instances);
     LEAVE;
 }
 
@@ -5236,7 +5247,7 @@ static void h_mtl4_draw_idx_b(id self, SEL _cmd, NSUInteger primitive, NSUIntege
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
     if (OUTER) fp4_index_access(self, index_address, index_bytes);
-    ORIG(H_4_DRAW_IDX_B, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger, NSUInteger, NSInteger, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes, instances, base_vertex, base_instance);
+    FP4_ORIG(H_4_DRAW_IDX_B, void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger, uint64_t, NSUInteger, NSUInteger, NSInteger, NSUInteger))(self, _cmd, primitive, count, index_type, index_address, index_bytes, instances, base_vertex, base_instance);
     LEAVE;
 }
 
@@ -5244,7 +5255,7 @@ static void h_mtl4_draw_ind(id self, SEL _cmd, NSUInteger primitive, uint64_t in
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
-    ORIG(H_4_DRAW_IND, void (*)(id, SEL, NSUInteger, uint64_t))(self, _cmd, primitive, indirect);
+    FP4_ORIG(H_4_DRAW_IND, void (*)(id, SEL, NSUInteger, uint64_t))(self, _cmd, primitive, indirect);
     LEAVE;
 }
 
@@ -5253,7 +5264,7 @@ static void h_mtl4_draw_idx_ind(id self, SEL _cmd, NSUInteger primitive, NSUInte
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_VERTEX) | FP4_STAGE(FP4_FRAGMENT));
     if (OUTER) fp4_index_access(self, index_address, index_bytes);
-    ORIG(H_4_DRAW_IDX_IND, void (*)(id, SEL, NSUInteger, NSUInteger, uint64_t, NSUInteger, uint64_t))(self, _cmd, primitive, index_type, index_address, index_bytes, indirect);
+    FP4_ORIG(H_4_DRAW_IDX_IND, void (*)(id, SEL, NSUInteger, NSUInteger, uint64_t, NSUInteger, uint64_t))(self, _cmd, primitive, index_type, index_address, index_bytes, indirect);
     LEAVE;
 }
 
@@ -5261,7 +5272,7 @@ static void h_mtl4_draw_mesh_groups(id self, SEL _cmd, MTLSize grid, MTLSize obj
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, (FP4_STAGE(FP4_OBJECT) | FP4_STAGE(FP4_MESH) | FP4_STAGE(FP4_FRAGMENT)));
-    ORIG(H_4_DRAW_MESH_GROUPS, void (*)(id, SEL, MTLSize, MTLSize, MTLSize))(self, _cmd, grid, object, mesh);
+    FP4_ORIG(H_4_DRAW_MESH_GROUPS, void (*)(id, SEL, MTLSize, MTLSize, MTLSize))(self, _cmd, grid, object, mesh);
     LEAVE;
 }
 
@@ -5269,7 +5280,7 @@ static void h_mtl4_draw_mesh(id self, SEL _cmd, MTLSize grid, MTLSize object, MT
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, (FP4_STAGE(FP4_OBJECT) | FP4_STAGE(FP4_MESH) | FP4_STAGE(FP4_FRAGMENT)));
-    ORIG(H_4_DRAW_MESH, void (*)(id, SEL, MTLSize, MTLSize, MTLSize))(self, _cmd, grid, object, mesh);
+    FP4_ORIG(H_4_DRAW_MESH, void (*)(id, SEL, MTLSize, MTLSize, MTLSize))(self, _cmd, grid, object, mesh);
     LEAVE;
 }
 
@@ -5277,7 +5288,7 @@ static void h_mtl4_draw_mesh_ind(id self, SEL _cmd, uint64_t indirect, MTLSize o
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, (FP4_STAGE(FP4_OBJECT) | FP4_STAGE(FP4_MESH) | FP4_STAGE(FP4_FRAGMENT)));
-    ORIG(H_4_DRAW_MESH_IND, void (*)(id, SEL, uint64_t, MTLSize, MTLSize))(self, _cmd, indirect, object, mesh);
+    FP4_ORIG(H_4_DRAW_MESH_IND, void (*)(id, SEL, uint64_t, MTLSize, MTLSize))(self, _cmd, indirect, object, mesh);
     LEAVE;
 }
 
@@ -5285,7 +5296,7 @@ static void h_mtl4_draw_tile(id self, SEL _cmd, MTLSize threads)
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_TILE));
-    ORIG(H_4_DRAW_TILE, void (*)(id, SEL, MTLSize))(self, _cmd, threads);
+    FP4_ORIG(H_4_DRAW_TILE, void (*)(id, SEL, MTLSize))(self, _cmd, threads);
     LEAVE;
 }
 
@@ -5293,7 +5304,7 @@ static void h_mtl4_dispatch(id self, SEL _cmd, MTLSize grid, MTLSize threads)
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
-    ORIG(H_4_DISPATCH, void (*)(id, SEL, MTLSize, MTLSize))(self, _cmd, grid, threads);
+    FP4_ORIG(H_4_DISPATCH, void (*)(id, SEL, MTLSize, MTLSize))(self, _cmd, grid, threads);
     LEAVE;
 }
 
@@ -5301,7 +5312,7 @@ static void h_mtl4_dispatch_groups(id self, SEL _cmd, MTLSize grid, MTLSize thre
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
-    ORIG(H_4_DISPATCH_GROUPS, void (*)(id, SEL, MTLSize, MTLSize))(self, _cmd, grid, threads);
+    FP4_ORIG(H_4_DISPATCH_GROUPS, void (*)(id, SEL, MTLSize, MTLSize))(self, _cmd, grid, threads);
     LEAVE;
 }
 
@@ -5309,7 +5320,7 @@ static void h_mtl4_dispatch_ind(id self, SEL _cmd, uint64_t indirect)
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
-    ORIG(H_4_DISPATCH_IND, void (*)(id, SEL, uint64_t))(self, _cmd, indirect);
+    FP4_ORIG(H_4_DISPATCH_IND, void (*)(id, SEL, uint64_t))(self, _cmd, indirect);
     LEAVE;
 }
 
@@ -5317,7 +5328,7 @@ static void h_mtl4_dispatch_groups_ind(id self, SEL _cmd, uint64_t indirect, MTL
 {
     ENTER;
     if (OUTER) fp4_capture_tables(self, FP4_STAGE(FP4_DISPATCH));
-    ORIG(H_4_DISPATCH_GROUPS_IND, void (*)(id, SEL, uint64_t, MTLSize))(self, _cmd, indirect, threads);
+    FP4_ORIG(H_4_DISPATCH_GROUPS_IND, void (*)(id, SEL, uint64_t, MTLSize))(self, _cmd, indirect, threads);
     LEAVE;
 }
 
