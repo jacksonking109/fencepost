@@ -7698,6 +7698,8 @@ __attribute__((visibility("default"))) int fencepost_test_wait_source(void)
     pthread_mutex_lock(&g_lock);
     static fp_queue producer, consumer;
     fp_node *first = node_new(FPK_SIGNAL), *second = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
+    int passed = 0;
+    if (!first || !second || !waiter) goto done;
     first->req_q = second->req_q = &producer;
     second->aseq = 1;
     waiter->req_q = &consumer;
@@ -7709,10 +7711,14 @@ __attribute__((visibility("default"))) int fencepost_test_wait_source(void)
     int pending = !ready(waiter, 0) && !waiter->ned;
     first->aseq = 2;
     int selected = ready(waiter, 0) && waiter->ned == 1 && waiter->ed[0].src == first->uid;
-    first->state = second->state = waiter->state = 0;
+    passed = pending && selected;
+done:
+    if (first) first->state = 0;
+    if (second) second->state = 0;
+    if (waiter) waiter->state = 0;
     pthread_mutex_unlock(&g_lock);
     [object release];
-    return pending && selected;
+    return passed;
 }
 
 /* The earliest satisfying signal's node was recycled: the wait settles with no edge,
@@ -7724,6 +7730,8 @@ __attribute__((visibility("default"))) int fencepost_test_recycled_signal(void)
     pthread_mutex_lock(&g_lock);
     static fp_queue producer, consumer;
     fp_node *later = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
+    int settled = 0;
+    if (!later || !waiter) goto done;
     later->req_q = &producer;
     later->aseq = 1;
     waiter->req_q = &consumer;
@@ -7734,9 +7742,11 @@ __attribute__((visibility("default"))) int fencepost_test_recycled_signal(void)
     fp_evwait wait = { key, 1, 0, 0, 0 };
     PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
     long before = g_st[ST_EVENT_UNKNOWN_SIGNALS];
-    int settled = !node_get(recycled) && ready(waiter, 0) && !waiter->ned && !waiter->nev &&
+    settled = !node_get(recycled) && ready(waiter, 0) && !waiter->ned && !waiter->nev &&
         g_st[ST_EVENT_UNKNOWN_SIGNALS] == before + 1;
-    later->state = waiter->state = 0;
+done:
+    if (later) later->state = 0;
+    if (waiter) waiter->state = 0;
     pthread_mutex_unlock(&g_lock);
     [object release];
     return settled;
@@ -7749,6 +7759,8 @@ __attribute__((visibility("default"))) int fencepost_test_rotated_signal(void)
     pthread_mutex_lock(&g_lock);
     static fp_queue producer, consumer;
     fp_node *first = node_new(FPK_SIGNAL), *later = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
+    int passed = 0;
+    if (!first || !later || !waiter) goto done;
     first->req_q = later->req_q = &producer;
     first->aseq = 1;
     later->aseq = 2;
@@ -7765,10 +7777,14 @@ __attribute__((visibility("default"))) int fencepost_test_rotated_signal(void)
     wait.val = 3;
     PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
     int selected = ready(waiter, 0) && waiter->ned == 1 && waiter->ed[0].src == later->uid;
-    first->state = later->state = waiter->state = 0;
+    passed = unknown && selected;
+done:
+    if (first) first->state = 0;
+    if (later) later->state = 0;
+    if (waiter) waiter->state = 0;
     pthread_mutex_unlock(&g_lock);
     [object release];
-    return unknown && selected;
+    return passed;
 }
 
 __attribute__((visibility("default"))) int fencepost_test_event_lifetime(void)
@@ -7782,11 +7798,14 @@ __attribute__((visibility("default"))) int fencepost_test_event_lifetime(void)
     pthread_mutex_lock(&g_lock);
     long before = g_st[ST_EVENT_LOOKUP_MISSES];
     fp_node *waiter = node_new(FPK_COMPUTE);
-    fp_evwait wait = { expired, 1, 0, 0, 0 };
-    PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
-    int settled = expired && fresh && fresh != expired && ev_get(fresh) && !ev_get(expired) &&
-        ready(waiter, 0) && !waiter->ned && !waiter->nev && g_st[ST_EVENT_LOOKUP_MISSES] == before + 1;
-    waiter->state = 0;
+    int settled = 0;
+    if (waiter) {
+        fp_evwait wait = { expired, 1, 0, 0, 0 };
+        PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
+        settled = expired && fresh && fresh != expired && ev_get(fresh) && !ev_get(expired) &&
+            ready(waiter, 0) && !waiter->ned && !waiter->nev && g_st[ST_EVENT_LOOKUP_MISSES] == before + 1;
+        waiter->state = 0;
+    }
     pthread_mutex_unlock(&g_lock);
     [replacement release];
     return settled;
@@ -7818,6 +7837,10 @@ __attribute__((visibility("default"))) int fencepost_test_signal_window(void)
 {
     pthread_mutex_lock(&g_lock);
     fp_node *signal = node_new(FPK_SIGNAL);
+    if (!signal) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
     fp_queue_signal entry = { signal->uid, 0 };
     fp_queue queue = { .nrecent = FP_QRECENT + 1, .mtl4_signals = &entry, .mtl4_nsignals = 1 };
     uint64_t saved_tick = g_tick;
