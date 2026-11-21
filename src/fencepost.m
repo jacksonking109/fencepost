@@ -5423,14 +5423,15 @@ static void h_mtl4_end(id self, SEL _cmd)
 {
     ENTER;
     if (g_capture_available) {
+        pthread_mutex_lock(&g_lock);
+        if (g_capture_starting && !tl_capture_start) capture_mtl4_wait_for_start();
+        /* Publish the owner once, under the same lock as the ended count. */
         FPCaptureBufferOwner *owner = objc_getAssociatedObject(self, &g_capture_buffer_key);
         if (!owner) {
             owner = [[FPCaptureBufferOwner alloc] init];
             objc_setAssociatedObject(self, &g_capture_buffer_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [owner release];
         }
-        pthread_mutex_lock(&g_lock);
-        if (g_capture_starting && !tl_capture_start) capture_mtl4_wait_for_start();
         if (owner)
             g_capture_mtl4_ended += !atomic_exchange_explicit(&owner->ended, 1, memory_order_relaxed);
         else capture_mtl4_mark_untracked("could not track an ended Metal 4 command buffer");
