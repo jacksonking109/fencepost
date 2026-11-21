@@ -4787,6 +4787,7 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
             tl_capture_start = &start;
             (void)CAPTURE_TEST("start-reserved");
             started = [manager startCaptureWithDescriptor:desc error:&error];
+            if (started) (void)CAPTURE_TEST("start-recording");
         } @catch (NSException *exception) {
             threw = YES;
             if (!start.refusal)

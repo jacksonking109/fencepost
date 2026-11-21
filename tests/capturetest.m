@@ -7,7 +7,10 @@
 #include <string.h>
 #include <unistd.h>
 
-enum gate_case { GATE_NONE, GATE_RACE, GATE_REENTRANT, GATE_FAILED, GATE_TEARDOWN, GATE_TEARDOWN_FILE, GATE_FEEDBACK };
+enum gate_case {
+    GATE_NONE, GATE_RACE, GATE_REENTRANT, GATE_REENTRANT_RECORDING, GATE_FAILED,
+    GATE_TEARDOWN, GATE_TEARDOWN_FILE, GATE_FEEDBACK
+};
 static struct {
     enum gate_case mode;
     dispatch_semaphore_t enter_end, end_tracked, release_end;
@@ -23,6 +26,11 @@ static void phase_wait(dispatch_semaphore_t sem)
     _exit(4);
 }
 
+static BOOL reentrant_end(void)
+{
+    return gate.mode == GATE_REENTRANT || gate.mode == GATE_REENTRANT_RECORDING;
+}
+
 static int gate_hook(const char *phase)
 {
     if (gate.mode == GATE_RACE) {
@@ -35,13 +43,15 @@ static int gate_hook(const char *phase)
             phase_wait(gate.release_end);
         }
     }
-    if (gate.mode == GATE_REENTRANT) {
-        if (!strcmp(phase, "start-reserved") && gate.nested_end) {
+    if (reentrant_end()) {
+        BOOL recording = gate.mode == GATE_REENTRANT_RECORDING;
+        if (!strcmp(phase, recording ? "start-recording" : "start-reserved") && gate.nested_end) {
+            if (MTLCaptureManager.sharedCaptureManager.isCapturing != recording) _exit(4);
             id cb = gate.nested_end;
             gate.nested_end = nil;
             gate.replay_pending = YES;
             if (@available(macOS 26.0, *)) [(id<MTL4CommandBuffer>)cb endCommandBuffer];
-            // A nested end must unwind before any native capture can start.
+            // A nested end must unwind the transition before it reaches Metal.
             _exit(4);
         }
         if (!strcmp(phase, "before-native-end") && gate.replay_pending) {
@@ -183,7 +193,7 @@ static int run_gate(id<MTLDevice> device, void (*frame)(id), void (*capture)(con
                 [held.cb endCommandBuffer];
             }
         });
-    } else if (gate.mode == GATE_REENTRANT) {
+    } else if (reentrant_end()) {
         gate.nested_end = held.cb;
     } else {
         [held.cb endCommandBuffer];
@@ -205,10 +215,10 @@ static int run_gate(id<MTLDevice> device, void (*frame)(id), void (*capture)(con
         dispatch_release(gate.end_tracked);
         dispatch_release(gate.enter_end);
     }
-    if (gate.mode == GATE_REENTRANT && !gate.replayed) return 3;
+    if (reentrant_end() && !gate.replayed) return 3;
     if (!mtl4_submit(held)) return 3;
     gate.failed_end = NO;
-    if (gate.mode == GATE_REENTRANT) capture("API Request");
+    if (reentrant_end()) capture("API Request");
     if (!mtl4_encode(main, 3, frame) || !manager.isCapturing || !mtl4_submit(main)) return 3;
     return wait_capture_stop(manager) ? 0 : 3;
 }
@@ -231,7 +241,7 @@ static int run_mixed_metal3(id<MTLDevice> device, void (*frame)(id), void (*capt
 API_AVAILABLE(macos(26.0))
 static int run_mtl4(const char *mode, id<MTLDevice> device, void (*frame)(id), void (*capture)(const char *))
 {
-    if (gate.mode == GATE_RACE || gate.mode == GATE_REENTRANT || gate.mode == GATE_FAILED)
+    if (gate.mode == GATE_RACE || reentrant_end() || gate.mode == GATE_FAILED)
         return run_gate(device, frame, capture);
     if (!strcmp(mode, "mtl4-mixed-metal3")) return run_mixed_metal3(device, frame, capture);
     BOOL discard = !strcmp(mode, "mtl4-discard");
@@ -339,6 +349,7 @@ int main(int argc, char **argv)
         int mtl4 = !strncmp(mode, "mtl4-", 5);
         if (!strcmp(mode, "mtl4-end-race")) gate.mode = GATE_RACE;
         if (!strcmp(mode, "mtl4-reentrant-end")) gate.mode = GATE_REENTRANT;
+        if (!strcmp(mode, "mtl4-reentrant-recording-end")) gate.mode = GATE_REENTRANT_RECORDING;
         if (!strcmp(mode, "mtl4-failed-commit")) gate.mode = GATE_FAILED;
         if (!strcmp(mode, "mtl4-feedback-fallback")) gate.mode = GATE_FEEDBACK;
         if (!strcmp(mode, "teardown-api")) gate.mode = GATE_TEARDOWN;

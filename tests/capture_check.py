@@ -113,13 +113,20 @@ def run_case(directory, arch, mode, *, enabled=True, min_free=0, frames=1, idle_
         assert app_trace.is_dir(), log
     starts = [line for line in log.splitlines() if line.startswith("fencepost: capturing frame ")]
     stops = [line for line in log.splitlines() if line.startswith("fencepost: capture written ")]
+    if mode == "mtl4-reentrant-recording-end":
+        partial = directory / f"capture-{test.pid}-f2-api-request.gputrace"
+        interrupted = [line for line in stops if line.endswith(" (start interrupted)")]
+        assert len(interrupted) == 1 and interrupted[0].startswith(f"fencepost: capture written {partial}, "), log
+        stops.remove(interrupted[0])
+        if partial in captures:
+            captures.remove(partial)
     if message:
         assert log.splitlines().count(message) == 1, log
     if reason is None:
         assert not captures and not starts and not stops, (captures, log)
         return
     next_frame = {"empty-file", "mtl4-defer", "mtl4-discard", "mtl4-drawable", "mtl4-end-race",
-                  "mtl4-reentrant-end", "mtl4-failed-commit"}
+                  "mtl4-reentrant-end", "mtl4-reentrant-recording-end", "mtl4-failed-commit"}
     frame = 4 if mode == "wrong-pid" else 3 if mode in next_frame else 2
     recordings = [(frame, reason)]
     if mode.startswith("teardown-"):
@@ -239,6 +246,8 @@ def main():
                     ("mtl4-discard", "Metal 4 starts after an ended buffer is discarded", api),
                     ("mtl4-end-race", "end registers while a capture start approaches the gate", gate),
                     ("mtl4-reentrant-end", "same-thread Metal 4 end interrupts start before entering Metal", dict(gate,
+                        message="fencepost: capture refused: Metal 4 end reentered capture start")),
+                    ("mtl4-reentrant-recording-end", "same-thread Metal 4 end stops a live capture before replay", dict(gate,
                         message="fencepost: capture refused: Metal 4 end reentered capture start")),
                     ("mtl4-failed-commit", "Metal 4 commit exception holds the gate until successful retry", dict(gate,
                         message="fencepost: Metal 4 capture gate recovered after failed commit")),
