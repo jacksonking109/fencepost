@@ -27,11 +27,15 @@ WHY = {
     "consumer-intervening": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-empty": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-before-blit": "no Metal 4 ordering covers Dispatch -> Dispatch",
+    "copy-compute": "no Metal 4 ordering covers Dispatch -> Dispatch",
+    "copy-compute-async": "no Metal 4 ordering covers Dispatch -> Dispatch",
+    "copy-render": "no Metal 4 ordering covers Fragment -> Dispatch",
+    "copy-render-async": "no Metal 4 ordering covers Fragment -> Dispatch",
 }
 
 
-def run(arch, program, mode, env, **knobs):
-    settings = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost.dylib", **knobs}
+def run(arch, program, mode, env, *, injected=True, **knobs):
+    settings = {"DYLD_INSERT_LIBRARIES": OUT / "libfencepost.dylib", **knobs} if injected else knobs
     cmd = ["arch", "-" + arch, *[arg for key, value in settings.items() for arg in ("-e", f"{key}={value}")],
            OUT / program, mode]
     result = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=20)
@@ -40,14 +44,20 @@ def run(arch, program, mode, env, **knobs):
 
 
 def check_case(arch, directory, program, mode, env, **extra):
+    baseline = None
+    if mode.startswith("copy-"):
+        clean = run(arch, program, mode, env, injected=False)
+        baseline, = [line for line in clean.stdout.splitlines() if line.startswith("pipeline reflection: ")]
     for run_index in range(RUNS):
-        check_run(arch, directory, program, mode, env, run_index, **extra)
+        check_run(arch, directory, program, mode, env, run_index, baseline, **extra)
 
 
-def check_run(arch, directory, program, mode, env, run_index, **extra):
+def check_run(arch, directory, program, mode, env, run_index, baseline, **extra):
     path = directory / f"{mode}-{run_index}.json"
     knobs = {"FENCEPOST_TRACE": path, **extra}
     result = run(arch, program, mode, env, **knobs)
+    if baseline:
+        assert baseline in result.stdout.splitlines(), (mode, baseline, result.stdout)
     races = [line for line in result.stderr.splitlines() if line.startswith(("fencepost: RACE ", "fencepost: possible race "))]
     expected = int(mode in WHY)
     assert len(races) == expected, (mode, result.stderr)
@@ -91,7 +101,8 @@ def check_suite(arch, directory):
                  "const-shared", "fragment-only", "fragment-vertex", "reflect-app", "compiler-race",
                  "load-early", "load-late", "load-fence-early", "load-fence-late", "load-fence-drawless",
                  "load-fence-multiple", "load-producer", "consumer-buffer", "consumer-buffers", "consumer-commits",
-                 "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence"):
+                 "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence",
+                 "copy-compute", "copy-compute-async", "copy-render", "copy-render-async"):
         check_case(arch, directory, "mtl4races", mode, env)
     possible = directory / "rw"
     possible.mkdir()
@@ -113,4 +124,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 39 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 43 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")

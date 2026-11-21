@@ -3752,6 +3752,7 @@ enum {
     H_P_RDESC, H_P_RDESC_R, H_P_RDESC_A, H_P_RDESC_AR, H_P_TILE_R, H_P_TILE_AR, H_P_MESH_R, H_P_MESH_AR,
     H_C4_COMPUTE, H_C4_COMPUTE_LINK, H_C4_RENDER, H_C4_RENDER_LINK, H_C4_SPECIALIZE,
     H_C4_COMPUTE_A, H_C4_COMPUTE_LINK_A, H_C4_RENDER_A, H_C4_RENDER_LINK_A, H_C4_SPECIALIZE_A,
+    H_C4_REFLECTION,
     H_COUNT
 };
 
@@ -4765,8 +4766,26 @@ static id fp4_reflect_descriptor(id desc)
     return [desc retain];
 }
 
+static char g_fp4_private_reflection_key;
+
+static id h_fp4_reflection(id self, SEL cmd)
+{
+    if (objc_getAssociatedObject(self, &g_fp4_private_reflection_key)) return nil;
+    return ORIG(H_C4_REFLECTION, id (*)(id, SEL))(self, cmd);
+}
+
+static int fp4_private_reflection(id desc, id copy, id base)
+{
+    if (@available(macOS 26.0, *)) {
+        MTL4PipelineDescriptor *original = desc;
+        return copy != desc && original.options.shaderReflection == MTL4ShaderReflectionNone &&
+               (![base respondsToSelector:@selector(reflection)] || ![base reflection]);
+    }
+    return 0;
+}
+
 /* A specialized pipeline without its own reflection keeps the bindings of the one it specializes. */
-static void fp4_compiled(id pipeline, id base)
+static void fp4_compiled(id pipeline, id base, int private_reflection)
 {
     if (!pipeline) return;
     id reflection = nil;
@@ -4776,6 +4795,12 @@ static void fp4_compiled(id pipeline, id base)
     if (!table && base) table = [objc_getAssociatedObject(base, &g_fp4_pipeline_key) retain];
     fp4_attach_table(pipeline, table);
     [table release];
+    if (private_reflection && reflection) {
+        pthread_mutex_lock(&g_lock);
+        hook(object_getClass(pipeline), H_C4_REFLECTION, "reflection", (IMP)h_fp4_reflection);
+        pthread_mutex_unlock(&g_lock);
+        objc_setAssociatedObject(pipeline, &g_fp4_private_reflection_key, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 }
 
 static id fp4_compile(int h, id self, SEL cmd, id desc, id x, id y, NSError **error, int four, int specialize)
@@ -4786,14 +4811,16 @@ static id fp4_compile(int h, id self, SEL cmd, id desc, id x, id y, NSError **er
                           : ((id (*)(id, SEL, id, id, NSError **))imp)(self, cmd, d, x, error))
     id pipeline;
     if (OUTER) {
-        id mine = fp4_reflect_descriptor(desc);
+        id mine = fp4_reflect_descriptor(desc), base = specialize ? x : nil;
+        int private_reflection = fp4_private_reflection(desc, mine, base);
         pipeline = FP4_CALL(mine);
         if (!pipeline && mine != desc) {
             if (error) *error = nil;
             pipeline = FP4_CALL(desc);
+            private_reflection = 0;
         }
         [mine release];
-        fp4_compiled(pipeline, specialize ? x : nil);
+        fp4_compiled(pipeline, base, private_reflection);
     } else pipeline = FP4_CALL(desc);
 #undef FP4_CALL
     LEAVE;
@@ -4872,16 +4899,17 @@ static id fp4_compile_async(int h, id self, SEL cmd, id desc, id x, id y, fp4_pi
     if (OUTER && handler) {
         id mine = fp4_reflect_descriptor(desc), base = specialize ? x : nil;
         if (mine != desc) {
+            int private_reflection = fp4_private_reflection(desc, mine, base);
             FP4CompilerTask *request = [[FP4CompilerTask alloc] initWithCompiler:self];
             id initial = FP4_CALL(mine, ^(id pipeline, NSError *error) {
                 if (pipeline) {
-                    fp4_compiled(pipeline, base);
+                    fp4_compiled(pipeline, base, private_reflection);
                     [request finish];
                     handler(pipeline, error);
                 } else {
                     tl_depth++;
                     id retry = FP4_CALL(desc, ^(id plain, NSError *plainError) {
-                        fp4_compiled(plain, base);
+                        fp4_compiled(plain, base, 0);
                         [request finish];
                         handler(plain, plainError);
                     });
@@ -4894,7 +4922,7 @@ static id fp4_compile_async(int h, id self, SEL cmd, id desc, id x, id y, fp4_pi
             task = request;
         } else {
             task = FP4_CALL(mine, ^(id pipeline, NSError *error) {
-                fp4_compiled(pipeline, base);
+                fp4_compiled(pipeline, base, 0);
                 handler(pipeline, error);
             });
         }
@@ -6224,6 +6252,7 @@ static const hook_def mtl4_device_hooks[] API_AVAILABLE(macos(26.0)) = {
     HD(H_P_MESH_R, "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:", h_p_mesh_r),
     HD(H_P_MESH_AR, "newRenderPipelineStateWithMeshDescriptor:options:completionHandler:", h_p_mesh_ar),
 };
+API_AVAILABLE(macos(26.0))
 static const hook_def mtl4_compiler_hooks[] = {
     HD(H_C4_COMPUTE, "newComputePipelineStateWithDescriptor:compilerTaskOptions:error:", h_c4_compute),
     HD(H_C4_COMPUTE_LINK, "newComputePipelineStateWithDescriptor:dynamicLinkingDescriptor:compilerTaskOptions:error:",
@@ -6456,7 +6485,10 @@ static void hook_mtl4_encoder(Class cls, int kind)
     else if (@available(macOS 26.0, *)) install(cls, 112, mtl4_compute_hooks, N(mtl4_compute_hooks));
 }
 static void hook_mtl4_argument(Class cls) { install(cls, 111, mtl4_argument_hooks, N(mtl4_argument_hooks)); }
-static void hook_mtl4_compiler(Class cls) { install(cls, 113, mtl4_compiler_hooks, N(mtl4_compiler_hooks)); }
+static void hook_mtl4_compiler(Class cls)
+{
+    if (@available(macOS 26.0, *)) install(cls, 113, mtl4_compiler_hooks, N(mtl4_compiler_hooks));
+}
 static void hook_mtl4_queue(Class cls)
 {
     if (@available(macOS 26.0, *)) install(cls, 107, mtl4_queue_hooks, N(mtl4_queue_hooks));
