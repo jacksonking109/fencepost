@@ -170,6 +170,7 @@ typedef struct {
     void *cb;
     struct fp_queue *q;
     int state, nenc, mtl4, mtl4_resident;
+    unsigned open_slot;
     fp_item *it; int nit, cit;
     char label[48];
     struct fp_trace_cb *trace;
@@ -209,7 +210,8 @@ static pthread_mutex_t g_mtl4_options_lock = PTHREAD_MUTEX_INITIALIZER;
 static fp_node g_pool[FP_POOL];
 static fp_cb g_cbs[FP_CBPOOL];
 static fp_queue g_q[FP_MAXQ]; static int g_nq;
-static struct { void *cb; uint64_t uid; } g_opencb[FP_OPENCB]; static unsigned g_opencb_rr;
+static struct { void *cb; uint64_t uid; } g_opencb[FP_OPENCB];
+static unsigned g_opencb_end, g_opencb_rr;
 static struct { void *f; uint64_t uid; uint8_t after; } g_fence[FP_FENCEMAP];
 static CFMutableDictionaryRef g_events;   /* event lifetime key -> fp_ev owned by its association */
 static uintptr_t g_next_event_key;
@@ -437,15 +439,16 @@ static fp_cb *cb_get(uint64_t uid)
 
 static fp_cb *cb_find_open(void *cb)   /* lock held */
 {
-    for (unsigned i = 0; i < FP_OPENCB; i++)
+    for (unsigned i = 0; i < g_opencb_end; i++)
         if (g_opencb[i].cb == cb) return cb_get(g_opencb[i].uid);
     return NULL;
 }
 
-static void cb_close(void *cb)
+static void cb_close(fp_cb *c)   /* g_lock held; c still owns its open slot */
 {
-    for (unsigned i = 0; i < FP_OPENCB; i++)
-        if (g_opencb[i].cb == cb) { g_opencb[i].cb = NULL; g_opencb[i].uid = 0; }
+    g_opencb[c->open_slot].cb = NULL;
+    g_opencb[c->open_slot].uid = 0;
+    while (g_opencb_end && !g_opencb[g_opencb_end - 1].cb) g_opencb_end--;
 }
 
 static fp_queue *queue_get_kind(void *q, int mtl4)   /* lock held */
@@ -4613,12 +4616,14 @@ static fp_cb *cb_record_new(id cb, fp_queue *q, int mtl4, fp_trace_device *devic
     c->uid = uid; c->cb = (void *)cb; c->q = q; c->state = 1; c->nenc = 0; c->nit = 0; c->mtl4 = mtl4; c->mtl4_resident = 0;
     c->enq = 0; c->commit_tick = 0; c->label[0] = 0;
     c->trace = g_trace_enabled ? trace_cb_new(cb, uid, q ? q->idx : -1, mtl4, device) : NULL;
-    unsigned slot = FP_OPENCB;
-    for (unsigned i = 0; i < FP_OPENCB; i++) {
+    unsigned slot = g_opencb_end;
+    for (unsigned i = 0; i < g_opencb_end; i++) {
         if (g_opencb[i].cb == (void *)cb) { slot = i; break; }   /* stale entry for a reused address */
-        if (slot == FP_OPENCB && !g_opencb[i].cb) slot = i;
+        if (slot == g_opencb_end && !g_opencb[i].cb) slot = i;
     }
     if (slot == FP_OPENCB) slot = g_opencb_rr++ % FP_OPENCB;
+    if (slot == g_opencb_end) g_opencb_end++;
+    c->open_slot = slot;
     g_opencb[slot].cb = (void *)cb; g_opencb[slot].uid = uid;
     return c;
 }
@@ -6337,7 +6342,7 @@ static void h_cb_commit(id self, SEL _cmd)
                 if (!g_trace_tracks[c->q->idx][TR_CB].n && queue_label[0])
                     memcpy(g_trace_queue_labels[c->q->idx], queue_label, sizeof queue_label);
             }
-            cb_close((void *)self);
+            cb_close(c);
             c->state = 2;
             if (!g_inflight && g_tick) { frame_get(g_frame_cur)->idle++; g_st[ST_GPU_IDLE]++; }   /* the GPU ran dry */
             g_inflight++;
@@ -6496,7 +6501,7 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
             c->commit_tick = tick;
             submission->cbs[submission->ncbs++] = c->uid;
             nenc += c->nenc;
-            cb_close((void *)cb);
+            cb_close(c);
             trace_mtl4_join(&submission->trace, c);
             phase1(c, &suspended);
             if (!c->nenc) suspended = NULL;
@@ -8123,7 +8128,7 @@ __attribute__((visibility("default"))) int fencepost_test_safety_abandoned(void)
     atexit(final_summary);
     NSObject *cb = [[NSObject alloc] init], *encoder = [[NSObject alloc] init];
     pthread_mutex_lock(&g_lock);
-    cb_record_new(cb, NULL, 0, NULL);
+    fp_cb *buffer = cb_record_new(cb, NULL, 0, NULL);
     pthread_mutex_unlock(&g_lock);
     fp_node *first = on_encoder(cb, encoder, FPK_COMPUTE, NULL);
     if (!first) {
@@ -8141,7 +8146,7 @@ __attribute__((visibility("default"))) int fencepost_test_safety_abandoned(void)
     int reclaimed = !node_get(uid) && g_st[ST_ABANDONED_ENCODERS] == before + 1;
     fp_node *replacement = node_new(FPK_COMPUTE);
     for (int i = 0; i < FP_POOL; i++) g_pool[i].state = 0;
-    cb_close(cb);
+    cb_close(buffer);
     pthread_mutex_unlock(&g_lock);
     [cb release];
     return reclaimed && replacement == first;
@@ -8192,7 +8197,7 @@ __attribute__((visibility("default"))) int fencepost_test_safety_trace_recycled(
     fp_node *n = node_new(FPK_COMPUTE);
     if (!n || !encoder) {
         if (n) n->state = 0;
-        cb_close(cb);
+        cb_close(buffer);
         pthread_mutex_unlock(&g_lock);
         [cb release];
         return 0;
@@ -8218,7 +8223,7 @@ __attribute__((visibility("default"))) int fencepost_test_safety_trace_recycled(
     uint64_t before = g_trace_encoders;
     trace_cb_completed(trace, 0, 0, NULL, (fp_trace_calibration){0});
     int written = g_trace_encoders == before + 1;
-    cb_close(cb);
+    cb_close(buffer);
     pthread_mutex_unlock(&g_lock);
     [cb release];
     return recycled && written;
