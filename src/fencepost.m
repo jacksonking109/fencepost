@@ -87,7 +87,7 @@ enum { ST_RACE_UNIQ, ST_POSS_UNIQ, ST_RACE_HITS, ST_POSS_HITS, ST_NODES, ST_ACCE
        ST_OBJS, ST_OBJ_DROPS, ST_ANALYSIS_NS,
        ST_FRAMES, ST_FRAME_ENC, ST_FRAME_CHAIN, ST_GPU_IDLE,   /* last finished frame's encoders and chain */
        ST_EVENT_LOOKUP_MISSES, ST_EVENT_UNKNOWN_SIGNALS,
-       ST_NODE_POOL_EXHAUSTED, ST_COUNT };
+       ST_NODE_POOL_EXHAUSTED, ST_ABANDONED_ENCODERS, ST_COUNT };
 
 typedef struct { uint64_t w[FP_WORDS]; } fp_bits;
 
@@ -134,8 +134,7 @@ typedef struct fp_node {
     uint64_t uid, aseq;             /* aseq: analysis order, 0 = not analysed yet */
     uint64_t cb_uid, commit_tick, done_tick, pend_since;
     int kind, state, idx;           /* state: 1 encoding, 2 ended, 3 committed, 4 analysed */
-    void *enc;
-    struct fp_node *next_open;
+    _Atomic uint64_t open_uid;      /* nonzero while an encoder owns the slot */
     uint8_t uncertain, exempt, mtl4, mtl4_drawn;   /* mtl4_drawn: a draw or dispatch was encoded */
     uint8_t mtl4_has_attachment, mtl4_render_options;
     fp_deferred_att *deferred_att; int ndeferred_att, cdeferred_att;
@@ -211,7 +210,6 @@ static fp_node g_pool[FP_POOL];
 static fp_cb g_cbs[FP_CBPOOL];
 static fp_queue g_q[FP_MAXQ]; static int g_nq;
 static struct { void *cb; uint64_t uid; } g_opencb[FP_OPENCB]; static unsigned g_opencb_rr;
-static fp_node *g_open_encoders;
 static struct { void *f; uint64_t uid; uint8_t after; } g_fence[FP_FENCEMAP];
 static CFMutableDictionaryRef g_events;   /* event lifetime key -> fp_ev owned by its association */
 static uintptr_t g_next_event_key;
@@ -387,7 +385,7 @@ static fp_node *node_new(int kind)   /* lock held */
     memset(n->mtl4_last, 0, sizeof n->mtl4_last);
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
-    n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->next_open = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
+    n->kind = kind; n->state = 1; n->idx = 0; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
     n->mtl4 = 0; n->mtl4_drawn = 0; n->mtl4_has_attachment = n->mtl4_render_options = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->frame = 0; n->queue_seq = 0; n->chain_prev = 0; n->depth = 0;
@@ -2092,7 +2090,7 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
         "heap_uses", "parallel", "tracked", "timeouts", "uncertain", "window", "lost",
         "order_unique", "order_hits", "partial_unique", "partial_hits", "barriers",
         "objs", "obj_drops", "analysis_ns", "frames", "frame_enc", "frame_chain", "gpu_idle",
-        "event_wait_lookup_misses", "event_wait_unknown_signals", "node_pool_exhausted"
+        "event_wait_lookup_misses", "event_wait_unknown_signals", "node_pool_exhausted", "abandoned_encoders"
     };
     _Static_assert(sizeof stats / sizeof *stats == ST_COUNT, "trace summary must include all detector counters");
     trace_header_at(f, 'i', 0, timestamp, "fencepost", "fencepost summary", state->origin ?: timestamp);
@@ -2661,6 +2659,8 @@ static void summary(int final)
     if (g_st[ST_NODE_POOL_EXHAUSTED])
         fp_log("fencepost:   node pool exhausted: %ld nodes skipped while all slots were open\n",
                g_st[ST_NODE_POOL_EXHAUSTED]);
+    if (g_st[ST_ABANDONED_ENCODERS])
+        fp_log("fencepost:   %ld encoders released without endEncoding\n", g_st[ST_ABANDONED_ENCODERS]);
     if (g_st[ST_EVENT_LOOKUP_MISSES])
         fp_log("fencepost:   event waits with missing records: %ld\n", g_st[ST_EVENT_LOOKUP_MISSES]);
     if (g_st[ST_EVENT_UNKNOWN_SIGNALS])
@@ -3436,17 +3436,66 @@ static void cb_done(uint64_t uid, fp_trace_cb *trace, id<MTLCommandBuffer> b, ui
 
 /* ---------------------------------------------------------------- recording */
 
+@interface FPEncoderOwner : NSObject {
+@public
+    uint64_t uid;
+}
+@end
+
+static char g_encoder_owner_key;
+
+static fp_node *open_node(uint64_t uid)
+{
+    fp_node *n = &g_pool[uid % FP_POOL];
+    return uid && atomic_load_explicit(&n->open_uid, memory_order_acquire) == uid ? n : NULL;
+}
+
+@implementation FPEncoderOwner
+- (void)dealloc
+{
+    if (open_node(uid)) {
+        id tables[FP4_TABLES] = {0}, pipeline = nil;
+        fp_deferred_att *attachments = NULL;
+        int count = 0;
+        pthread_mutex_lock(&g_lock);
+        fp_node *n = open_node(uid);
+        if (n) {
+            memcpy(tables, n->mtl4_tables, sizeof tables);
+            memset(n->mtl4_tables, 0, sizeof n->mtl4_tables);
+            pipeline = n->mtl4_pipeline;
+            n->mtl4_pipeline = nil;
+            count = n->ndeferred_att;
+            if (count) {
+                attachments = n->deferred_att;
+                n->deferred_att = NULL;
+                n->ndeferred_att = n->cdeferred_att = 0;
+            }
+            /* Invalidate the command buffer's item too. Its trace record
+             * still owns any sample slots until the buffer settles. */
+            atomic_store_explicit(&n->open_uid, 0, memory_order_release);
+            n->uid = 0;
+            n->state = 0;
+            g_st[ST_ABANDONED_ENCODERS]++;
+        }
+        pthread_mutex_unlock(&g_lock);
+        for (int i = 0; i < FP4_TABLES; i++) [tables[i] release];
+        [pipeline release];
+        for (int i = 0; i < count; i++) [attachments[i].desc release];
+        free(attachments);
+    }
+    [super dealloc];
+}
+@end
+
 static fp_node *cur_node(id enc)
 {
     if (tl_cache.enc == (void *)enc) {
-        fp_node *n = node_get(tl_cache.uid);
-        if (n && n->enc == (void *)enc && n->state == 1) return n;
+        fp_node *n = open_node(tl_cache.uid);
+        if (n) return n;
     }
-    pthread_mutex_lock(&g_lock);
-    fp_node *n = g_open_encoders;
-    while (n && n->enc != (void *)enc) n = n->next_open;
-    if (n) { tl_cache.enc = (void *)enc; tl_cache.uid = n->uid; }
-    pthread_mutex_unlock(&g_lock);
+    FPEncoderOwner *owner = objc_getAssociatedObject(enc, &g_encoder_owner_key);
+    fp_node *n = owner ? open_node(owner->uid) : NULL;
+    if (n) { tl_cache.enc = (void *)enc; tl_cache.uid = owner->uid; }
     return n;
 }
 
@@ -4872,16 +4921,21 @@ static fp_node *on_encoder_kind(id cb, id enc, int kind, fp_trace_encoder *trace
     fp_node *n = c ? node_new(kind) : NULL;
     if (n) {
         n->mtl4 = mtl4;
-        n->enc = (void *)enc; n->cb_uid = c->uid; n->idx = ++c->nenc;
+        n->cb_uid = c->uid; n->idx = ++c->nenc;
         if (g_ring) g_ring_encoded = 1;
         if (trace) trace_encoder_register(trace, n);
         fp_item it = { 0, n->uid, NULL, 0 };
         PUSH(c->it, c->nit, c->cit, it);
-        n->next_open = g_open_encoders;
-        g_open_encoders = n;
-        tl_cache.enc = (void *)enc; tl_cache.uid = n->uid;
+        atomic_store_explicit(&n->open_uid, n->uid, memory_order_release);
     }
     pthread_mutex_unlock(&g_lock);
+    if (n) {
+        FPEncoderOwner *owner = [[FPEncoderOwner alloc] init];
+        owner->uid = n->uid;
+        objc_setAssociatedObject(enc, &g_encoder_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [owner release];
+        tl_cache.enc = (void *)enc; tl_cache.uid = n->uid;
+    }
     return n;
 }
 
@@ -6685,10 +6739,7 @@ static void h_end(id self, SEL _cmd)
     pthread_mutex_lock(&g_lock);
     if (g_trace_enabled) trace_encoder_end(n);
     n->state = 2;
-    fp_node **link = &g_open_encoders;
-    while (*link != n) link = &(*link)->next_open;
-    *link = n->next_open;
-    n->next_open = NULL;
+    atomic_store_explicit(&n->open_uid, 0, memory_order_release);
     pthread_mutex_unlock(&g_lock);
     tl_cache.enc = NULL;
 }
