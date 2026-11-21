@@ -2768,13 +2768,16 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
  * real (earlier) signal never covered. */
 static fp_node *first_event_signal(const fp_ev *ev, const fp_queue *queue, fp_evwait wait, int *gone)
 {
-    *gone = 0;
+    if (gone) *gone = 0;
     if (!ev || !ev->known) return NULL;
     unsigned first = ev->nh > FP_EVHIST ? ev->nh - FP_EVHIST : 0;
     for (unsigned k = first; k < ev->nh; k++) {
         if (ev->h[k % FP_EVHIST].val < wait.val) continue;
         fp_node *signal = node_get(ev->h[k % FP_EVHIST].uid);
-        if (!signal) { *gone = 1; return NULL; }
+        if (!signal) {
+            if (gone) *gone = 1;
+            return NULL;
+        }
         if (signal->req_q != queue || signal->queue_seq < wait.queue_seq) return signal;
     }
     return NULL;
@@ -5569,8 +5572,7 @@ static void mtl4_retire_waits(fp_queue *q, uint64_t limit)
         fp_evwait wait = q->mtl4_waits[retired++];
         fp_ev *event = ev_get(wait.ev, 0);
         if (event && event->cpu_max >= wait.val) continue;
-        int gone;
-        fp_node *signal = first_event_signal(event, q, wait, &gone);
+        fp_node *signal = first_event_signal(event, q, wait, NULL);
         if (!signal || !signal->mtl4) continue;
         fp_queue *producer = signal->req_q;
         for (fp_node *p = signal; p && p->queue_seq >= producer->mtl4_event_completed_through;
