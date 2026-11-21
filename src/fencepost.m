@@ -6672,14 +6672,16 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
 
 @interface FPMTL4Callbacks : NSObject {
 @public
-    NSMutableArray *blocks;
+    void (^first)(id);
+    NSMutableArray *rest;
 }
 @end
 
 @implementation FPMTL4Callbacks
 - (void)dealloc
 {
-    [blocks release];
+    if (first) Block_release(first);
+    [rest release];
     [super dealloc];
 }
 @end
@@ -6759,10 +6761,15 @@ static void h_mtl4_app_feedback(id self, SEL _cmd, void (^handler)(id))
     }
     void (^copied)(id) = Block_copy(handler);
     pthread_mutex_lock(&g_mtl4_options_lock);
-    if (!callbacks->blocks) callbacks->blocks = [[NSMutableArray alloc] init];
-    [callbacks->blocks addObject:copied];
+    if (!callbacks->first) {
+        callbacks->first = copied;
+        copied = NULL;
+    } else {
+        if (!callbacks->rest) callbacks->rest = [[NSMutableArray alloc] init];
+        [callbacks->rest addObject:copied];
+    }
     pthread_mutex_unlock(&g_mtl4_options_lock);
-    Block_release(copied);
+    if (copied) Block_release(copied);
 }
 
 API_AVAILABLE(macos(26.0))
@@ -6778,24 +6785,36 @@ static MTL4CommitOptions *mtl4_submit_options(id queue, const id *buffers, NSUIn
     /* Metal consumes the app's registrations once per submission. Take that
      * list under a short lock and replay it on private, per-commit options.
      * Native submission can block and must never hold a fencepost lock. */
-    NSArray *blocks = nil;
+    void (^first)(id) = NULL;
+    NSArray *rest = nil;
     if (callbacks) {
         pthread_mutex_lock(&g_mtl4_options_lock);
-        blocks = callbacks->blocks;
-        callbacks->blocks = nil;
+        first = callbacks->first;
+        rest = callbacks->rest;
+        callbacks->first = NULL;
+        callbacks->rest = nil;
         pthread_mutex_unlock(&g_mtl4_options_lock);
     }
     fp_mtl4_submission *submission = mtl4_record_commit(queue, buffers, count);
-    /* Record completion before an app handler can submit dependent work. */
-    if (submission || capture_generation || (g_capture_on & CAP_GPU_ERROR))
+    /* One app handler can share our native registration. Keep individual
+     * registrations for a list, with Fencepost's feedback first. */
+    int needs_feedback = submission || capture_generation || (g_capture_on & CAP_GPU_ERROR);
+    if (needs_feedback) {
+        void (^app_handler)(id) = rest ? NULL : first;
         [opts addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
             if (submission) mtl4_completed(submission, feedback);
             if (capture_generation || (g_capture_on & CAP_GPU_ERROR))
                 capture_feedback_done(capture_generation, feedback.error != nil);
+            if (app_handler) app_handler(feedback);
         }];
+    }
     if (!submission) mtl4_untracked_commit(buffers, count, capture_tracked, g_trace_enabled && g_trace_gpu);
-    for (MTL4CommitFeedbackHandler handler in blocks) [opts addFeedbackHandler:handler];
-    [blocks release];
+    if (first) {
+        if (!needs_feedback || rest) [opts addFeedbackHandler:(MTL4CommitFeedbackHandler)first];
+        Block_release(first);
+    }
+    for (MTL4CommitFeedbackHandler handler in rest) [opts addFeedbackHandler:handler];
+    [rest release];
     capture_feedback_attached(capture_generation);
     return opts;
 }
