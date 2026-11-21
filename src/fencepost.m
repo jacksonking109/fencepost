@@ -6383,9 +6383,35 @@ typedef struct {
 #ifdef FENCEPOST_TEST_HOOKS
     int inject_error;
 #endif
+    int reusable;
     NSUInteger ncbs;
     uint64_t cbs[];
 } fp_mtl4_submission;
+
+static fp_mtl4_submission *g_mtl4_free_submissions[32];
+static unsigned g_mtl4_free_count;
+
+static fp_mtl4_submission *mtl4_submission_new(NSUInteger count)   /* g_lock held */
+{
+    fp_mtl4_submission *submission;
+    if (count == 1 && g_mtl4_free_count) {
+        submission = g_mtl4_free_submissions[--g_mtl4_free_count];
+        memset(submission, 0, sizeof *submission);
+    } else {
+        submission = calloc(1, sizeof *submission + count * sizeof submission->cbs[0]);
+        if (!submission) return NULL;
+    }
+    submission->reusable = count == 1;
+    return submission;
+}
+
+static void mtl4_submission_release(fp_mtl4_submission *submission)   /* g_lock held */
+{
+    if (submission->reusable && g_mtl4_free_count < sizeof g_mtl4_free_submissions / sizeof g_mtl4_free_submissions[0])
+        g_mtl4_free_submissions[g_mtl4_free_count++] = submission;
+    else
+        free(submission);
+}
 
 static void trace_mtl4_join(fp_trace_cb **batch, fp_cb *c)
 {
@@ -6469,15 +6495,19 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
     char local_labels[4][sizeof ((fp_cb *)0)->label];
     if (!count || count > MIN((SIZE_MAX - sizeof(fp_mtl4_submission)) / sizeof(uint64_t),
                              SIZE_MAX / sizeof local_labels[0])) return NULL;
-    fp_mtl4_submission *submission = calloc(1, sizeof *submission + count * sizeof submission->cbs[0]);
-    if (!submission) return NULL;
     char (*labels)[sizeof local_labels[0]] = count <= 4 ? local_labels : malloc(count * sizeof local_labels[0]);
-    if (!labels) { free(submission); return NULL; }
+    if (!labels) return NULL;
     for (NSUInteger i = 0; i < count; i++) {
         const char *label = [[buffers[i] label] UTF8String];
         strlcpy(labels[i], label ?: "", sizeof labels[i]);
     }
     pthread_mutex_lock(&g_lock);
+    fp_mtl4_submission *submission = mtl4_submission_new(count);
+    if (!submission) {
+        pthread_mutex_unlock(&g_lock);
+        if (labels != local_labels) free(labels);
+        return NULL;
+    }
     fp_queue *q = queue_get_kind((void *)queue, 1);
     if (q) {
         submission->queue = q;
@@ -6521,11 +6551,13 @@ static fp_mtl4_submission *mtl4_record_commit(id queue, const id *buffers, NSUIn
     } else if (g_trace_enabled && g_trace_gpu) {
         for (NSUInteger i = 0; i < count; i++) trace_mtl4_abandon_samples(buffers[i]);
     }
+    if (!submission->ncbs) {
+        mtl4_submission_release(submission);
+        submission = NULL;
+    }
     pthread_mutex_unlock(&g_lock);
     if (labels != local_labels) free(labels);
-    if (submission->ncbs) return submission;
-    free(submission);
-    return NULL;
+    return submission;
 }
 
 /* Successful completion proves that the queue passed every signal scheduled
@@ -6631,9 +6663,9 @@ static void mtl4_completed(fp_mtl4_submission *submission, id<MTL4CommitFeedback
     }
     if (g_ring) ring_update(0);
     if (g_trace) trace_stream_flush();
+    mtl4_submission_release(submission);
     pthread_mutex_unlock(&g_lock);
     free(message);
-    free(submission);
 }
 
 @interface FPMTL4Callbacks : NSObject {
