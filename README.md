@@ -3,9 +3,19 @@
 A race detector for Metal GPU synchronisation. Inject it into a Metal 3 or Metal 4 program to find encoders
 that touch the same memory without ordering between their accesses.
 
+## Quick start
+
+From a source checkout on a Mac with the macOS 26 SDK, run the bundled detector checks or trace your own executable.
+
+```sh
+./build.sh
+export FP_LIB="$PWD/out/libfencepost.dylib"
+DYLD_INSERT_LIBRARIES="$FP_LIB" out/fptest
+DYLD_INSERT_LIBRARIES="$FP_LIB" /path/to/your-metal-program
+FENCEPOST_TRACE=/tmp/fencepost.json DYLD_INSERT_LIBRARIES="$FP_LIB" /path/to/your-metal-program
 ```
-DYLD_INSERT_LIBRARIES=/path/to/libfencepost.dylib  your-metal-program
-```
+
+Reports go to stderr. Open the JSON in Perfetto to inspect the timeline. Prebuilt binaries are available under [Download](#download).
 
 ```
 fencepost: RACE read-after-write on texture 64x64, pixel format 70, 1 levels 0x7ff6cb75e1c0, level 0, slice 0
@@ -41,7 +51,10 @@ show.
 Texture views are mapped onto the storage they share, so two views of different mip levels do not conflict. Two
 conflicting accesses (at least one a write) whose encoders have no ordering path between them are a race.
 
-**Declared barriers.** A runtime that reaches resources only through argument buffers or residency sets (bindless
+On Metal 3 and Metal 4, a `DontCare` store discards the attachment. A resolve-only MSAA store writes the resolve
+target alone. Metal 3 also uses the final store action set on the encoder when the descriptor defers that choice.
+
+**Declared barriers.** On Metal 3, a runtime that reaches resources only through argument buffers or residency sets (bindless
 D3D12, for one) gives fencepost nothing to see. Such a runtime can still say what ordering it *means*:
 
 ```c
@@ -58,8 +71,8 @@ of these checks as an earlier encoder with `fencepost_exempt(encoder)`, called w
 are still checked.
 
 **How parallel each frame is.** Too much synchronisation costs as well: encoders chained one after another leave the
-GPU nothing to overlap. For every frame (a Metal 3 present, a Metal 4 drawable signal, or an explicit frame boundary), fencepost counts the encoders and the longest chain of
-them the encoded fences and events force to run in order, and prints the medians with the running summary:
+GPU nothing to overlap. For each Metal 3 frame, fencepost counts the encoders and finds the longest chain ordered by
+fences and events. The running summary prints the medians. Metal 4 has [different chain limits](#limits).
 
 ```
 fencepost:   frames: 833; median of the last 833: 4 encoders, longest ordered chain 2 (parallelism 2.00); the GPU had run out of work at 1.3 commits per frame
@@ -127,9 +140,9 @@ puts overlapping encoders in separate lanes and uses their samples to annotate r
 ### Resources and pipeline reflection
 
 Race analysis tracks render attachments, copies, fills, mipmap generation, and the argument-table bindings
-that each draw or dispatch uses. For a known buffer, an address inside a buffer covers the remaining range
-when Metal supplies no length. Texture views are checked against their underlying storage. Unresolved
-addresses and resource IDs are counted in the summary.
+that each draw or dispatch uses. When Metal supplies a GPU address inside a known buffer without a length,
+the access covers the rest of that buffer. Texture views are checked against their underlying storage.
+The summary counts unresolved addresses and resource IDs.
 
 Argument-table slots take their read/write access from the bound pipeline's binding reflection, per stage. A
 slot that a stage's shader does not declare or use has no access in that stage, so a table bound at
@@ -145,9 +158,9 @@ when pipelines are built:
 - through `MTL4Compiler` (compute, render and specialization, with and without dynamic linking, synchronous and
   `MTL4CompilerTask`), from a copy of the app's descriptor with `shaderReflection` including `BindingInfo`.
 
-An app that requests no Metal 4 compiler reflection still sees nil from `pipeline.reflection`. A pipeline
-data-set serializer records the copy's reflection option. A device-path app that asked for reflection without
-binding information also gets the bindings. If the added reflection causes a build to fail, fencepost retries
+An app that requests no Metal 4 compiler reflection still sees nil from `pipeline.reflection`.
+An app that requests reflection through the device API also gets the bindings, even when it omits the
+binding information option. If the added reflection causes a build to fail, fencepost retries
 the original request for synchronous and asynchronous calls. Pipelines fencepost did not see built (binary
 archives, data sets, device pipelines made before the first Metal 4 object) use their own reflection when Metal kept one, and
 are otherwise counted as "access unknown" in the summary. Their slots fall back to reads, or to possible writes
@@ -170,15 +183,25 @@ be a fence update or wait. Fences order covered work on the same queue. Queue ev
 work across queues, including between Metal 3 and Metal 4. Commit feedback orders completed work before a
 later submission. The trace summary counts waits with missing event records in `event_wait_lookup_misses`
 and waits whose signal history has become unavailable in `event_wait_unknown_signals`. These waits resolve
-without a dependency edge.
+without a dependency edge. Signal records follow the event object’s lifetime. If an evicted signal value could
+satisfy a wait, fencepost counts its source as unknown.
 
 Render attachments load at the start of the pass and store at its end, both in the Fragment stage. Apple's
 documentation leaves the effect of an in-encoder wait on the load unspecified. Fencepost treats a consumer
 barrier or fence wait covering Fragment before the first draw as covering both loads and stores. After a draw,
 it covers stores only. A Fragment fence update or producer barrier covers stores only if it follows the last
 draw. One before or between draws leaves the stores and subsequent draws uncovered. A pass stitched across
-command buffers in one commit loads in its first segment and stores in its last. `DontCare` discards the
-attachment, and `MultisampleResolve` stores only the resolve target.
+command buffers in one commit loads in its first segment and stores in its last. Fragment work in those
+segments follows submission order.
+
+In the race suite’s stitched pass, a separate writer conflicts with the resumed segment’s store.
+
+```text
+fencepost: RACE write-after-write on Metal 4 texture 0x1, levels [0,1), slices [0,1)
+  first : render encoder #3 "MTL4 outside writer" (command buffer #3, encoder 1, queue 0) writes it: attachment, Fragment stage
+  second: render encoder #1 "MTL4 resume" (command buffer #1, encoder 1, queue 0) writes it: attachment, Fragment stage
+  why   : no Metal 4 ordering covers Fragment -> Fragment
+```
 
 ### Timing, frames and capture
 
@@ -188,8 +211,12 @@ registration is consumed once, including when the app reuses its options.
 
 With GPU tracing on, fencepost writes two Relaxed timestamps per sampled render or compute encoder. Render
 samples run from Vertex before the first draw to Fragment after the last. Fencepost resolves the timestamps on
-commit feedback. Sampling can shift GPU timing. In repeated fixed-workload tests, some spans underestimated
-duration by up to half with either Relaxed or Precise timestamps. Use the spans for overlap and rough cost.
+commit feedback. See [Timeline](#timeline-fencepost_trace) for the sampling switch.
+
+Sampled spans measure elapsed GPU time. In a fixed-workload probe, the GPU clock varied by up to about 9×
+within and between commits, so the same work took different amounts of time. In about 0.1–1% of encoders,
+a Relaxed start timestamp landed late, shortening the span and leaving a gap before it. Use spans to compare
+ordering, overlap and relative cost. A span of a given length can represent different amounts of work.
 
 Each device has 4,096 timestamp entries, enough for 2,048 encoder pairs across outstanding submissions.
 When the heap fills, the encoder type is unsupported (machine learning or suspend/resume render segments),
@@ -197,7 +224,7 @@ or the timestamp pair is invalid, the trace estimates the encoder's position. Wi
 these fallbacks count toward `sampling_skipped`.
 
 `signalDrawable:` marks the end of a frame. Programs can use `fencepost_frame` to supply their own frame
-boundaries. Ring dumps support manual requests, races, frame spikes, and GPU errors reported by commit feedback.
+boundaries. See [Catching a bad frame](#catching-a-bad-frame-fencepost_ring) for ring triggers and dumps.
 `FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
 because fencepost learns the submitting queue after encoding.
 
@@ -209,7 +236,8 @@ Fencepost records a queue's events in the order its hooks see them. When two thr
 Metal 4 analysis covers races between encoders. It skips within-encoder races, argument-buffer and indirect
 resource contents, and `MTL4VisibilityOptions` correctness. Residency-set membership alone supplies no
 accesses. The summary counts encoders with residency sets and no visible accesses, machine-learning encoders,
-and acceleration-structure builds. Frame chains follow queue event ordering.
+and acceleration-structure builds. Frame chains follow queue event ordering. Stage barriers and fence waits
+can serialize work without extending the reported chain, so parallelism can read higher than the GPU achieved.
 
 ## Catching a bad frame (FENCEPOST_RING)
 
@@ -307,7 +335,7 @@ first command buffer. It ignores requests while a capture is active. Open the lo
 - **Edges** order nodes:
   - `updateFence:afterStages:` paired with `waitForFence:beforeStages:`. Pairs are resolved in submission order, so a
     wait meets the latest update `enqueue`d before it.
-  - An event signal paired with a wait for that value or less.
+  - An event wait paired with a signal whose value reaches the wait threshold.
   - A command buffer that completed before another was committed.
 - **Ancestor sets:** for each node and stage, fencepost keeps a bitset of everything ordered before it, over a sliding
   window of 4096 nodes. A query is one bit test.
@@ -344,7 +372,7 @@ The summary reports blind spots where it can identify them.
 | `FENCEPOST_SUMMARY_SECS` | 10 | print a running summary at most this often when the counts change; 0 = only at exit |
 | `FENCEPOST_CHAIN` | 0 | list the longest ordered chain of this frame (counted from 1) |
 | `FENCEPOST_BIND_MAYWRITE` | 0 | 1 counts unknown writes as possible in Metal 3 compute bindings and in Metal 4 argument tables bound with an access-unknown pipeline |
-| `FENCEPOST_MTL4_RW` | write | `possible` reports conflicts through read-write Metal 4 buffer bindings (non-`const` `device` pointers) as possible races |
+| `FENCEPOST_MTL4_RW` | definite (any value other than `possible`) | `possible` reports conflicts through read-write Metal 4 buffer bindings (non-`const` `device` pointers) as possible races |
 | `FENCEPOST_TRACE` | unset | stream to this JSON file (`%p` expands to the process id), or use this literal prefix for ring dumps |
 | `FENCEPOST_TRACE_FRAMES` | all | capture frames `a:b`, inclusive and counted from 1 |
 | `FENCEPOST_TRACE_MB` | 512 | stop streaming when the file reaches this size in MiB |
@@ -437,8 +465,9 @@ python3 -I tests/mtl4_overhead.py arm64 x86_64
 python3 -I tests/mtl4_overhead.py --trace-timing arm64 x86_64
 ```
 
-`tests/fptest.m` holds 43 small Metal programs with and without the synchronisation they need, each with the number of
-races, barrier violations or frame chain lengths fencepost must report. Examples:
+`tests/fptest.m` runs 43 checks in one Metal 3 program, covering race and barrier verdicts, frame chain lengths
+and idle commits. Cases include
+
 - a fence updated after the vertex stage while the write happens in the fragment stage;
 - a fence re-updated by an unrelated encoder before the wait;
 - a wait committed before its signal on another queue;
@@ -461,12 +490,13 @@ pipeline retries and simulated feedback errors. `mtl4frames --long` exercises fr
 
 ## Results so far
 
-**Metal 4 on arm64 and Rosetta (0.3.0).** All 49 race verdicts and six GPU timing cases passed three
-times per slice. The detector caught the missing barrier, wrong-stage barrier and premature event signal.
+**Metal 4 on arm64 and Rosetta (0.3.0).** All 61 race verdicts passed three times per slice.
+The detector caught the missing barrier, wrong-stage barrier and premature event signal.
 The frame workload and the 10,000-draw benchmark produced zero race reports.
 
-**Metal 4 CPU overhead.** These are medians of three runs per configuration, interleaved on the same
-Apple silicon Mac while plugged in and charging at 78%. The draw workload changes a buffer address and
+### Overhead
+
+The table gives median Metal 4 CPU times from three runs per configuration on Apple silicon. The draw workload changes a buffer address and
 a texture binding on every draw. The commit workload encodes four draws per submission.
 
 | Slice | Measure | Without fencepost | With fencepost | Overhead |
@@ -476,7 +506,7 @@ a texture binding on every draw. The commit workload encodes four draws per subm
 | x86_64 (Rosetta) | µs/draw | 0.1371 | 0.1762 | +28.5% |
 | x86_64 (Rosetta) | µs/commit | 8.041 | 12.958 | +61.1% |
 
-**Earlier Metal 3 results**
+### Earlier Metal 3 results
 
 - **Our D3D12 runtime, 14 test programs:** 5,300 declared barriers checked, 0 reports, the same check results with and
   without fencepost.

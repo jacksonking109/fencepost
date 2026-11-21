@@ -690,7 +690,9 @@ static int run_reflection(id<MTLDevice> device, NSString *mode)
             reflection = nil;
             own = [device newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone
                                                    reflection:&reflection error:&error];
-            if (!own || !reflection) return fail("device reflection out-parameter is missing");
+            if (!own || !binding_access(reflection.bindings, 0, MTLBindingAccessReadOnly) ||
+                !binding_access(reflection.bindings, 1, MTLBindingAccessReadWrite))
+                return fail("device reflection without explicit binding info lacks expected bindings");
         }
         if (!computePipeline) computePipeline = [device newComputePipelineStateWithFunction:function error:&error];
         if (!computePipeline) return fail("pipeline creation failed");

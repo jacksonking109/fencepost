@@ -5,7 +5,7 @@ Measured on an Apple M3 Pro running macOS 26.6.2 (25G83), built with the active 
 ## Build and Rosetta
 
 ```zsh
-pgrep -f wineserver
+pgrep -x wineserver
 ```
 
 `pgrep` exited 1 with no output, so the build could use the repo’s `out/` directory.
@@ -123,7 +123,7 @@ The median of the three per-run medians fell by 7.3% on arm64 (0.092083 to 0.085
 
 Two limits apply. The workload binds only three resources, so it can't show the per-resource tracking cost that Metal 4 removes. A translation layer with thousands of resources may gain more. The final-pixel check sees only the last draw. A scratch variant that gave each draw its own pixel (1,000 draws, both paths, both slices) found all 256 pixels correct, so Metal 4 captures argument-table bindings per draw and the two paths do the same work.
 
-**For wine-lab:** the probe spends about 0.14 µs per draw under Rosetta issuing three Metal commands. A real replay draw issues 6–12. Recent D3D12 replay measurements range from about 0.7 to 1.5 µs per draw, with PEAK at 1.5 µs. We estimate that Metal calls account for about 20–35% of per-draw replay time. Switching to Metal 4 alone offers little CPU benefit in this probe because it barely changes the cost of those calls. A D3D12 port's CPU cost and frame rate on Metal 4 remain unmeasured.
+The Rosetta probe spends about 0.14 µs per draw issuing three Metal commands. For a D3D12-to-Metal translation layer measured at about 0.7–1.5 µs per draw, with a real draw issuing 6–12 Metal commands, we estimate the Metal API accounts for roughly 20–35% of per-draw replay cost. Switching to Metal 4 alone offers little CPU benefit in this probe because the per-call cost barely changes.
 
 ## Fencepost coexistence
 
@@ -193,4 +193,4 @@ git diff main --check
 git diff main --stat
 ```
 
-`fptest: 34/34 passed` on each slice, along with the ring, trigger, and capture checks. The trigger script ran the app smoke test on arm64 and skipped the Intel app launch by design. The diff covers `build.sh`, `tests/mtl4test.m`, `tests/mtl4bench.m`, and this report.
+`fptest: 43/43 passed` on each slice, along with the ring, trigger, and capture checks. The trigger script ran the app smoke test on arm64 and skipped the Intel app launch by design. The diff covers `build.sh`, `tests/mtl4test.m`, `tests/mtl4bench.m`, and this report.
