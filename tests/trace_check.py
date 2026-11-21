@@ -113,10 +113,12 @@ def check_mtl4_timing(case, encoders, command_buffers, markers, summary):
             first, middle, last = spans
             assert slice_end(first) <= middle["ts"] and slice_end(middle) <= last["ts"], spans
             # Spans measure elapsed GPU time. The clock can vary about 9× even within
-            # a commit, and a rare late Relaxed start shortens a span. Check the
-            # longest workload's rank without assuming fixed duration ratios.
+            # a commit (it ramps up on the first encoder after idle), and a rare late
+            # Relaxed start shortens a span. So no duration ratio or rank is reliable:
+            # the 1x span has measured longer than the 16x one. Check that every span
+            # was sampled and that the barriers kept them in order; the durations are
+            # printed below as a diagnostic.
             assert all(e["dur"] > 0 for e in spans), spans
-            assert last["dur"] > max(first["dur"], middle["dur"]), spans
         else:
             by_time = sorted(spans, key=lambda e: e["ts"])
             overlapping = [(a, b) for i, a in enumerate(by_time) for b in by_time[i + 1:] if b["ts"] < slice_end(a)]
