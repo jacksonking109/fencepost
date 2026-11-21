@@ -99,8 +99,14 @@ typedef struct {
     uint8_t is_tex, rw, sf, sl, via;   /* sf/sl: first and last stage the access happens in */
     uint16_t mtl4_stage;
     uint32_t first_epoch, last_epoch;
-    union { uint64_t gpu_address; void *object; };   /* Metal 3 keeps its object pointer for diagnostics */
+    union { uint64_t gpu_address; int description; };
 } fp_acc;
+
+typedef struct {
+    const void *address;
+    NSUInteger size, height, format, levels;  /* buffer length or texture width and shape */
+    char label[96];
+} fp_store_description;
 
 typedef struct { uint64_t src; uint8_t after, before; } fp_edge;
 typedef struct { void *ev; uint64_t val, queue_seq; uint8_t before; uint64_t ticket; } fp_evwait;
@@ -135,6 +141,7 @@ typedef struct fp_node {
     fp_deferred_att *deferred_att; int ndeferred_att, cdeferred_att;
     char label[64];
     fp_acc *acc;     int nacc, cacc;
+    fp_store_description *descriptions; int ndescriptions, cdescriptions;
     fp_fwait *fw;    int nfw, cfw;
     fp_fupd *fu;     int nfu, cfu;
     fp_edge *ed;     int ned, ced;
@@ -311,7 +318,7 @@ static fp_node *node_new(int kind)   /* lock held */
     n->mtl4 = 0; n->mtl4_drawn = 0; n->mtl4_has_attachment = n->mtl4_render_options = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->frame = 0; n->queue_seq = 0; n->chain_prev = 0; n->depth = 0;
-    n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
+    n->ndescriptions = n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
     clear_deferred_attachments(n);
     return n;
 }
@@ -488,7 +495,7 @@ static void describe_node(char *buf, size_t len, const fp_node *n)
              c && c->label[0] ? "\"" : "", n->idx, c && c->q ? c->q->idx : -1);
 }
 
-static void describe_store(char *buf, size_t len, const fp_acc *a, int safe)
+static void describe_store(char *buf, size_t len, const fp_node *n, const fp_acc *a)
 {
     if (a->mtl4_stage) {
         if (a->is_tex)
@@ -500,29 +507,22 @@ static void describe_store(char *buf, size_t len, const fp_acc *a, int safe)
                      (unsigned long long)a->a0, (unsigned long long)a->a1);
         return;
     }
-    char what[160] = "";
+    const fp_store_description *d = &n->descriptions[a->description];
+    const char *quote = d->label[0] ? "\"" : "", *end_quote = d->label[0] ? "\" " : "";
+    char what[160];
     if (a->is_tex) {
-        if (safe) {
-            id<MTLTexture> t = (id<MTLTexture>)a->object;
-            const char *l = t.label ? t.label.UTF8String : NULL;
-            snprintf(what, sizeof what, "texture %s%s%s%lux%lu, pixel format %lu, %lu levels",
-                     l ? "\"" : "", l ? l : "", l ? "\" " : "", (unsigned long)t.width, (unsigned long)t.height,
-                     (unsigned long)t.pixelFormat, (unsigned long)t.mipmapLevelCount);
-        } else snprintf(what, sizeof what, "texture");
+        snprintf(what, sizeof what, "texture %s%s%s%lux%lu, pixel format %lu, %lu levels",
+                 quote, d->label, end_quote, (unsigned long)d->size, (unsigned long)d->height,
+                 (unsigned long)d->format, (unsigned long)d->levels);
         char lv[48], sl[48];
         if (a->a1 - a->a0 > 1) snprintf(lv, sizeof lv, "levels %llu-%llu", (unsigned long long)a->a0, (unsigned long long)(a->a1 - 1));
         else snprintf(lv, sizeof lv, "level %llu", (unsigned long long)a->a0);
         if (a->s1 - a->s0 > 1) snprintf(sl, sizeof sl, "slices %u-%u", a->s0, a->s1 - 1);
         else snprintf(sl, sizeof sl, "slice %u", a->s0);
-        snprintf(buf, len, "%s %p, %s, %s", what, a->object, lv, sl);
+        snprintf(buf, len, "%s %p, %s, %s", what, d->address, lv, sl);
     } else {
-        if (safe) {
-            id<MTLBuffer> b = (id<MTLBuffer>)a->object;
-            const char *l = b.label ? b.label.UTF8String : NULL;
-            snprintf(what, sizeof what, "buffer %s%s%s%lu bytes", l ? "\"" : "", l ? l : "", l ? "\" " : "",
-                     (unsigned long)b.length);
-        } else snprintf(what, sizeof what, "buffer");
-        snprintf(buf, len, "%s %p, bytes [%llu, %llu)", what, a->object,
+        snprintf(what, sizeof what, "buffer %s%s%s%lu bytes", quote, d->label, end_quote, (unsigned long)d->size);
+        snprintf(buf, len, "%s %p, bytes [%llu, %llu)", what, d->address,
                  (unsigned long long)a->a0, (unsigned long long)a->a1);
     }
 }
@@ -2256,7 +2256,7 @@ static void report(fp_node *x, const fp_acc *xa, fp_node *y, const fp_acc *ya)
     char d1[256], d2[256], st[320], first[384], second[384], why[512];
     describe_node(d1, sizeof d1, f);
     describe_node(d2, sizeof d2, s);
-    describe_store(st, sizeof st, ya, y->done_tick == 0);
+    describe_store(st, sizeof st, y, ya);
     if (fa->mtl4_stage && sa->mtl4_stage) {
         snprintf(first, sizeof first, "%s %s it: %s, %s stage", d1, rw_verb(fa->rw), via_name[fa->via],
                  fp4_stage_names[__builtin_ctz(fa->mtl4_stage)]);
@@ -3819,6 +3819,24 @@ static void fp4_bind_table(id encoder, id table, unsigned stages)
     }
 }
 
+/* Take the snapshot only for a new access. Later reports may outlive the Metal resource. */
+static void record_store(fp_node *n, fp_acc *a, id<MTLResource> resource, NSUInteger buffer_length)
+{
+    int count = n->nacc;
+    a->description = n->ndescriptions;
+    if (push_acc(n, a) != count) return;
+    fp_store_description d = { .address = resource, .size = buffer_length };
+    @autoreleasepool {
+        const char *label = resource.label.UTF8String;
+        if (label) snprintf(d.label, sizeof d.label, "%s", label);
+        if (a->is_tex) {
+            id<MTLTexture> t = (id<MTLTexture>)resource;
+            d.size = t.width; d.height = t.height; d.format = t.pixelFormat; d.levels = t.mipmapLevelCount;
+        }
+    }
+    PUSH(n->descriptions, n->ndescriptions, n->cdescriptions, d);
+}
+
 static int acc_buf(fp_node *n, id<MTLBuffer> b, uint64_t off, uint64_t end, int rw, int sf, int sl, int via)
 {
     if (!b || !n) return -1;
@@ -3830,8 +3848,8 @@ static int acc_buf(fp_node *n, id<MTLBuffer> b, uint64_t off, uint64_t end, int 
     if (off >= end) return -1;
     void *store = (void *)b;
     if (@available(macOS 26.0, *)) store = fp4_buffer(b).store;
-    fp_acc a = { .store = store, .a0 = off, .a1 = end, .rw = rw, .sf = sf, .sl = sl, .via = via, .object = b };
-    push_acc(n, &a);
+    fp_acc a = { .store = store, .a0 = off, .a1 = end, .rw = rw, .sf = sf, .sl = sl, .via = via };
+    record_store(n, &a, b, len);
     return n->nacc - 1;
 }
 
@@ -3854,8 +3872,8 @@ static int acc_tex(fp_node *n, id<MTLTexture> t, uint64_t level, uint64_t nlev, 
     void *store = (void *)t;
     if (@available(macOS 26.0, *)) store = fp4_texture(t).store;
     fp_acc a = { .store = store, .a0 = level, .a1 = level + MAX(1, nlev), .s0 = slice, .s1 = slice + MAX(1, nsl),
-                 .is_tex = 1, .rw = rw, .sf = sf, .sl = sl, .via = via, .object = t };
-    push_acc(n, &a);
+                 .is_tex = 1, .rw = rw, .sf = sf, .sl = sl, .via = via };
+    record_store(n, &a, t, 0);
     return n->nacc - 1;
 }
 
