@@ -217,6 +217,7 @@ static CFMutableDictionaryRef g_events;   /* event lifetime key -> fp_ev owned b
 static uintptr_t g_next_event_key;
 static char g_event_owner_key;
 static fp_obj g_obj[FP_OBJMAP];
+static uint64_t g_obj_occupied[FP_OBJMAP / 64];
 static uint64_t g_sig[FP_SIGMAP];
 static uint64_t *g_pend; static int g_npend, g_cpend;
 static uint64_t g_uid, g_cbuid, g_aseq, g_tick;
@@ -532,9 +533,16 @@ static fp_obj *obj_get(void *key)   /* lock held */
 {
     unsigned h = ptr_hash(key, FP_OBJBITS);
     for (unsigned i = 0; i < FP_OBJPROBE; i++) {
-        fp_obj *o = &g_obj[(h + i) & (FP_OBJMAP - 1)];
+        unsigned slot = (h + i) & (FP_OBJMAP - 1);
+        fp_obj *o = &g_obj[slot];
         if (o->key == key) return o;
-        if (!o->key) { o->key = key; o->nw = o->nr = 0; g_st[ST_OBJS]++; return o; }
+        if (!o->key) {
+            o->key = key;
+            o->nw = o->nr = 0;
+            g_obj_occupied[slot / 64] |= 1ull << (slot % 64);
+            g_st[ST_OBJS]++;
+            return o;
+        }
     }
     g_st[ST_OBJ_DROPS]++;
     return NULL;
@@ -554,6 +562,8 @@ static void obj_del(unsigned i)
         memset(&g_obj[j], 0, sizeof g_obj[j]);
         i = j;
     }
+    /* Moving an entry fills the old hole. Only the final hole is now empty. */
+    g_obj_occupied[i / 64] &= ~(1ull << (i % 64));
 }
 
 /* ---------------------------------------------------------------- reporting */
@@ -3078,17 +3088,26 @@ static int stale(const fp_ent *e)
 }
 static void sweep(void)   /* lock held */
 {
-    for (unsigned n = 0; n < FP_SWEEP; n++) {
-        unsigned i = g_sweep++ & (FP_OBJMAP - 1);
+    for (unsigned n = 0; n < FP_SWEEP;) {
+        unsigned i = g_sweep & (FP_OBJMAP - 1);
+        uint64_t occupied = g_obj_occupied[i / 64] >> (i % 64);
+        if (!(occupied & 1)) {
+            unsigned empty = occupied ? (unsigned)__builtin_ctzll(occupied) : 64 - i % 64;
+            unsigned skip = MIN(empty, FP_SWEEP - n);
+            n += skip;
+            g_sweep += skip;
+            continue;
+        }
+        n++;
         fp_obj *o = &g_obj[i];
-        if (!o->key) continue;
         int j = 0;
         for (int k = 0; k < o->nw; k++) if (!stale(&o->w[k])) o->w[j++] = o->w[k];
         o->nw = j;
         j = 0;
         for (int k = 0; k < o->nr; k++) if (!stale(&o->r[k])) o->r[j++] = o->r[k];
         o->nr = j;
-        if (!o->nw && !o->nr) { obj_del(i); g_sweep--; }   /* a later entry may have moved into i */
+        if (!o->nw && !o->nr) obj_del(i);   /* a later entry may have moved into i */
+        else g_sweep++;
     }
 }
 
