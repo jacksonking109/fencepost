@@ -14,6 +14,7 @@ MARKER_PREFIXES = {
     "possible race ": "possible",
     "ORDER barrier not honoured": "order",
     "ORDER fragment-only": "partial",
+    "ORDER stage partial": "partial",
 }
 
 

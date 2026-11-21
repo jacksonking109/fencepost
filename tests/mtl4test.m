@@ -95,6 +95,10 @@ static int probe(id<MTLDevice> device, NSString *test)
     if (crossQueue) [consumer addResidencySet:residency];
 
     MTL4ArgumentTableDescriptor *layout = [MTL4ArgumentTableDescriptor new];
+    layout.maxBufferBindCount = 1;
+    id<MTL4ArgumentTable> writeArgs = [device newArgumentTableWithDescriptor:layout error:&error];
+    if (!writeArgs) return failure(@"producer argument table creation failed", error);
+    [writeArgs setAddress:data.gpuAddress atIndex:0];
     layout.maxBufferBindCount = 2;
     id<MTL4ArgumentTable> args = [device newArgumentTableWithDescriptor:layout error:&error];
     if (!args) return failure(@"argument table creation failed", error);
@@ -105,7 +109,7 @@ static int probe(id<MTLDevice> device, NSString *test)
     id<MTL4ComputeCommandEncoder> write = [commands computeCommandEncoder];
     if (!write) return failure(@"producer encoder creation failed", nil);
     [write setComputePipelineState:writePipeline];
-    [write setArgumentTable:args];
+    [write setArgumentTable:writeArgs];
     [write dispatchThreadgroups:MTLSizeMake(WordCount / GroupSize, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(GroupSize, 1, 1)];
     [write endEncoding];
@@ -146,7 +150,36 @@ static int probe(id<MTLDevice> device, NSString *test)
         }];
     }
 
-    if (late) [producer signalEvent:event value:1];
+    dispatch_semaphore_t releaseFeedback = nil;
+    __attribute__((objc_precise_lifetime)) id<MTLBuffer> warmBuffer = nil;
+    __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> warmAllocator = nil;
+    if (late) {
+        /* Block delivery on this queue's serial feedback queue only. A
+         * fast GPU must not make the producer complete from the CPU's
+         * point of view before the deliberately early wait is submitted. */
+        releaseFeedback = dispatch_semaphore_create(0);
+        dispatch_semaphore_t blocked = dispatch_semaphore_create(0);
+        warmBuffer = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        warmAllocator = [device newCommandAllocator];
+        id<MTL4CommandBuffer> warm = [device newCommandBuffer];
+        if (!warmBuffer || !warmAllocator || !warm) return failure(@"warm-up setup failed", nil);
+        [residency addAllocation:warmBuffer];
+        [residency commit];
+        [warm beginCommandBufferWithAllocator:warmAllocator];
+        id<MTL4ComputeCommandEncoder> fill = [warm computeCommandEncoder];
+        if (!fill) return failure(@"warm-up encoder creation failed", nil);
+        [fill fillBuffer:warmBuffer range:NSMakeRange(0, 16) value:0];
+        [fill endEncoding];
+        [warm endCommandBuffer];
+        MTL4CommitOptions *warmOptions = [MTL4CommitOptions new];
+        [warmOptions addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+            dispatch_semaphore_signal(blocked);
+            dispatch_semaphore_wait(releaseFeedback, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        }];
+        [producer commit:&warm count:1 options:warmOptions];
+        if (!waitForFeedback(blocked, @"warm-up", nil)) return 1;
+        [producer signalEvent:event value:1];
+    }
     [producer commit:&commands count:1 options:writeCommit];
     if (crossQueue) {
         // Queue signaling covers prior work, and queue waiting gates future work.
@@ -154,6 +187,7 @@ static int probe(id<MTLDevice> device, NSString *test)
         [consumer waitForEvent:event value:late ? 1 : 2];
         [consumer commit:&readCommands count:1 options:readCommit];
     }
+    if (releaseFeedback) dispatch_semaphore_signal(releaseFeedback);
     if (!waitForFeedback(writeDone, crossQueue ? @"producer" : @"workload", event) ||
         (crossQueue && !waitForFeedback(readDone, @"consumer", event))) return 1;
     if (writeError) return failure(@"producer workload failed", writeError);
