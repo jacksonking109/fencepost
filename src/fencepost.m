@@ -790,6 +790,11 @@ static dispatch_queue_t g_capture_reporter;
 static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 static void capture_feedback_done(uint64_t generation, int failed);
 
+typedef struct {
+    NSMutableArray *ends;
+} fp_capture_start;
+static _Thread_local fp_capture_start *tl_capture_start;
+
 @interface FPCaptureBufferOwner : NSObject {
 @public
     atomic_int ended;
@@ -4644,6 +4649,7 @@ static int capture_poll_file(char reason[static sizeof g_capture_reason])
 }
 
 static void capture_watchdog(uint64_t check_at);
+static void capture_stop(const char *limit);
 
 /* 0 consumes the request, 1 defers it to another unopened frame. */
 static int capture_start(id owner, uint64_t frame, const char *reason)
@@ -4697,14 +4703,20 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
 
         BOOL started = NO;
         BOOL threw = NO;
+        fp_capture_start start = {0};
+        int depth = tl_depth;
         @try {
+            tl_capture_start = &start;
             started = [manager startCaptureWithDescriptor:desc error:&error];
         } @catch (NSException *exception) {
             threw = YES;
-            fp_log("fencepost: capture failed: %s\n", exception.reason.UTF8String ?: exception.name.UTF8String);
+            if (!start.ends)
+                fp_log("fencepost: capture failed: %s\n", exception.reason.UTF8String ?: exception.name.UTF8String);
         } @finally {
+            tl_capture_start = NULL;
+            tl_depth = depth;
             pthread_mutex_lock(&g_lock);
-            if (started) {
+            if (started && !start.ends) {
                 g_capture_started = g_capture_last_commit = trace_clock();
                 g_capture_until = frame + g_capture_frames;
                 g_capture_generation = ++g_capture_count;
@@ -4713,6 +4725,27 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
             g_capture_starting = 0;
             pthread_cond_broadcast(&g_capture_started_cond);
             pthread_mutex_unlock(&g_lock);
+        }
+        if (start.ends) {
+            fp_log("fencepost: capture refused: Metal 4 end reentered capture start\n");
+            if (started || manager.isCapturing) {
+                g_capture_started = trace_clock();
+                g_capture_count++;
+                g_capture_path = [path copy];
+                capture_stop(" (start interrupted)");
+            }
+            for (id cb in start.ends) {
+                @try {
+                    h_mtl4_end(cb, @selector(endCommandBuffer));
+                } @catch (NSException *exception) {
+                    fp_log("fencepost: deferred Metal 4 end failed: %s\n",
+                           exception.reason.UTF8String ?: exception.name.UTF8String);
+                } @finally {
+                    tl_depth = depth;
+                }
+            }
+            [start.ends release];
+            return 0;
         }
         if (!started) {
             if (!threw) fp_log("fencepost: capture failed: %s\n", error.localizedDescription.UTF8String ?: "unknown error");
@@ -5258,11 +5291,23 @@ static void h_mtl4_end(id self, SEL _cmd)
             [owner release];
         }
         pthread_mutex_lock(&g_lock);
-        while (g_capture_starting) pthread_cond_wait(&g_capture_started_cond, &g_lock);
+        while (g_capture_starting && !tl_capture_start)
+            pthread_cond_wait(&g_capture_started_cond, &g_lock);
         if (owner)
             g_capture_mtl4_ended += !atomic_exchange_explicit(&owner->ended, 1, memory_order_relaxed);
         else g_capture_mtl4_unsafe = 1;
         pthread_mutex_unlock(&g_lock);
+        if (tl_capture_start) {
+            /* The starting thread cannot wait for itself. Record the end above,
+             * but unwind before native end: Metal may still be activating the
+             * capture layer. If Metal catches this exception and starts anyway,
+             * capture_start stops it before replaying any native ends. */
+            if (!tl_capture_start->ends) tl_capture_start->ends = [[NSMutableArray alloc] init];
+            [tl_capture_start->ends addObject:self];
+            LEAVE;
+            @throw [NSException exceptionWithName:@"FencepostCaptureStartInterrupted"
+                                           reason:@"Metal 4 end reentered capture start" userInfo:nil];
+        }
     }
     ORIG(H_4_END, void (*)(id, SEL))(self, _cmd);
     LEAVE;
