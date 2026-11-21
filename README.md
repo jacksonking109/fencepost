@@ -401,7 +401,7 @@ below assume Apple silicon with Rosetta installed.
 ```sh
 git clone https://github.com/jacksonking109/fencepost && cd fencepost
 ./build.sh
-./build.sh release 0.2.0  # also build a stripped release archive
+./build.sh release 0.3.0  # also build a stripped release archive
 ```
 
 Run the Metal 3 detector, trace, ring, trigger and capture checks on each slice:

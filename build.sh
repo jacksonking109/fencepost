@@ -2,7 +2,7 @@
 # Builds libfencepost.dylib, the test programs and the trigger helpers, all universal (arm64 + x86_64: the
 # x86_64 slice is the one Wine under Rosetta loads), signed ad hoc.
 #   ./build.sh                 build into out/
-#   ./build.sh release 0.2.0   also out/fencepost-0.2.0-macos.tar.gz: the dylib, fencepost-trigger and
+#   ./build.sh release 0.3.0   also out/fencepost-0.3.0-macos.tar.gz: the dylib, fencepost-trigger and
 #                              Fencepost Trigger.app without debug information (it holds local paths),
 #                              README.md, LICENSE
 set -e
