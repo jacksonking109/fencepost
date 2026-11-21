@@ -225,8 +225,7 @@ these fallbacks count toward `sampling_skipped`.
 
 `signalDrawable:` marks the end of a frame. Programs can use `fencepost_frame` to supply their own frame
 boundaries. See [Catching a bad frame](#catching-a-bad-frame-fencepost_ring) for ring triggers and dumps.
-`FENCEPOST_CAPTURE` logs that Xcode GPU capture is unavailable for Metal 4
-because fencepost learns the submitting queue after encoding.
+See [Xcode capture](#xcode-capture) for Metal 4 capture settings and frame boundaries.
 
 ### Limits
 
@@ -307,9 +306,11 @@ briefly show a checkmark, and fencepost should log a dump whose filename ends in
 
 ## Xcode capture
 
-Launch a Metal 3 program with `MTL_CAPTURE_ENABLED=1` and `FENCEPOST_CAPTURE` set to a filename prefix in an
+Launch a Metal 3 or Metal 4 program with `MTL_CAPTURE_ENABLED=1` and `FENCEPOST_CAPTURE` set to a filename prefix in an
 existing directory. Capture is opt-in and works independently of `FENCEPOST_TRACE` and `FENCEPOST_RING`.
-In our submission probe, `MTL_CAPTURE_ENABLED=1` added about 67% CPU overhead even with no capture running.
+The capture layer adds overhead even when idle. In our Metal 3 submission probe it added about 67% CPU
+overhead. On an M3 Pro running macOS 26.6.2, it raised Metal 4 commit time from 1.3 to 7.7 µs on arm64 and
+from 2.0 to 12.1 µs under Rosetta. It added 3.6 and 6.4 µs per draw, respectively.
 
 ```sh
 MTL_CAPTURE_ENABLED=1 FENCEPOST_CAPTURE=/tmp/fencepost \
@@ -325,8 +326,19 @@ processes unless you pass `--pid N`. You can also call `void fencepost_capture(c
 `FENCEPOST_CAPTURE_FILE` in the Metal program. Like the timeline trigger file, it uses its modification
 time, a reason on line one, and an optional `pid=N` on line two.
 
-After the program has ended at least one frame, fencepost starts capture before allocating the next frame's
-first command buffer. It ignores requests while a capture is active. Open the logged
+After the program has ended at least one frame, fencepost captures the device used by the next frame's
+first Metal 3 command buffer allocation or Metal 4 `beginCommandBufferWithAllocator:`. A present,
+`signalDrawable:`, or an explicit `fencepost_frame` marker ends the frame. Once a process creates a
+Metal 4 queue or command buffer, it uses the Metal 4 gate. In a mixed process, Metal 3 work before that
+first Metal 4 begin can fall outside the capture.
+
+A Metal 4 buffer that has ended and is awaiting submission on any queue blocks the start. Fencepost
+tries the first begin of each eligible frame and logs a refusal after three blocked frame starts.
+An ended buffer discarded without a commit can keep the gate closed. Metal 4 captures stop at a frame
+boundary once submission feedback has arrived. If the app starts another frame while feedback is pending,
+the capture can extend to its end. The idle and hard-cap timers still apply.
+
+Fencepost ignores requests while a capture is active. Open the logged
 `<prefix>-<pid>-f<frame>-<reason>.gputrace` in Xcode with **File → Open**.
 
 ## How Metal 3 analysis works
@@ -389,7 +401,7 @@ The summary reports blind spots where it can identify them.
 | `FENCEPOST_MAX_AUTO_DUMPS` | 20 | timeline dumps per process from race, GPU-error and spike triggers |
 | `FENCEPOST_MAX_MANUAL_DUMPS` | 20 | timeline dumps per process from file, hotkey, CLI and API requests |
 | `FENCEPOST_MAX_DUMPS` | 20 | fallback for either timeline dump quota when its own knob is unset |
-| `FENCEPOST_CAPTURE` | unset | filename prefix for Metal 3 Xcode captures, requires `MTL_CAPTURE_ENABLED=1` |
+| `FENCEPOST_CAPTURE` | unset | filename prefix for Xcode GPU traces, requires `MTL_CAPTURE_ENABLED=1` |
 | `FENCEPOST_CAPTURE_FILE` | `/tmp/fencepost-capture-<uid>` | request file, empty disables polling |
 | `FENCEPOST_CAPTURE_ON` | empty | comma-separated `race`, `gpu-error`, `spike` auto triggers |
 | `FENCEPOST_CAPTURE_FRAMES` | 1 | frame ends to record |
@@ -437,7 +449,8 @@ git clone https://github.com/jacksonking109/fencepost && cd fencepost
 ./build.sh release 0.3.0  # also build a stripped release archive
 ```
 
-Run the Metal 3 detector, trace, ring, trigger and capture checks on each slice:
+Run the detector, trace, ring, trigger and capture checks on each slice.
+The capture check runs Metal 3 cases and, on macOS 26 or later, repeats the Metal 4 cases three times:
 
 ```sh
 for slice in arm64 x86_64; do
