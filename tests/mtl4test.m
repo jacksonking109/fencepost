@@ -112,6 +112,56 @@ static int timing_dispatches(id<MTLDevice> device, BOOL ordered)
 }
 
 API_AVAILABLE(macos(26.0))
+static int timing_render(id<MTLDevice> device)
+{
+    NSError *error = nil;
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTL4CommandBuffer> cb = [device newCommandBuffer];
+    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+    if (!queue || !cb || !allocator || !residency) return failure(@"timing render command setup failed", error);
+
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct VOut { float4 position [[position]]; };\n"
+        "vertex VOut vtx(uint vid [[vertex_id]]) {\n"
+        "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
+        "  VOut out; out.position = float4(p * 2.0f - 1.0f, 0.0f, 1.0f); return out;\n"
+        "}\n"
+        "fragment float4 frag(VOut in [[stage_in]]) { return float4(0.0f, 1.0f, 0.0f, 1.0f); }\n";
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+    rd.vertexFunction = [library newFunctionWithName:@"vtx"];
+    rd.fragmentFunction = [library newFunctionWithName:@"frag"];
+    rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pipeline = library
+        ? [device newRenderPipelineStateWithDescriptor:rd error:&error] : nil;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:64 height:64 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> target = [device newTextureWithDescriptor:td];
+    if (!pipeline || !target) return failure(@"timing render pipeline setup failed", error);
+    [residency addAllocation:target];
+    [residency commit];
+    [queue addResidencySet:residency];
+
+    [cb beginCommandBufferWithAllocator:allocator];
+    cb.label = @"timing render";
+    MTL4RenderPassDescriptor *pass = [MTL4RenderPassDescriptor new];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+    if (!enc) return failure(@"timing render encoder creation failed", nil);
+    enc.label = @"MTL4 timing render";
+    [enc setRenderPipelineState:pipeline];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    [cb endCommandBuffer];
+    return !timing_commit(queue, &cb, 1);
+}
+
+API_AVAILABLE(macos(26.0))
 static int timing_overflow(id<MTLDevice> device)
 {
     enum { BufferCount = 4, EncodersPerBuffer = 513, Outputs = BufferCount * EncodersPerBuffer };
@@ -331,9 +381,10 @@ int main(int argc, const char *argv[])
     @autoreleasepool {
         NSString *test = argc == 2 ? [NSString stringWithUTF8String:argv[1]] : nil;
         if (!test || ![@[@"ok", @"nobarrier", @"wrongstage", @"event", @"eventlate",
-                        @"timing-ordered", @"timing-overlap", @"timing-overflow"] containsObject:test]) {
+                        @"timing-ordered", @"timing-overlap", @"timing-render",
+                        @"timing-overflow"] containsObject:test]) {
             fprintf(stderr, "usage: mtl4test {ok|nobarrier|wrongstage|event|eventlate|"
-                            "timing-ordered|timing-overlap|timing-overflow}\n");
+                            "timing-ordered|timing-overlap|timing-render|timing-overflow}\n");
             return 2;
         }
         setvbuf(stdout, NULL, _IOLBF, 0);
@@ -342,6 +393,7 @@ int main(int argc, const char *argv[])
             if (device) {
                 if ([test hasPrefix:@"timing-"]) {
                     if (![device supportsFamily:MTLGPUFamilyMetal4]) return failure(@"Metal 4 unavailable", nil);
+                    if ([test isEqualToString:@"timing-render"]) return timing_render(device);
                     if ([test isEqualToString:@"timing-overflow"]) return timing_overflow(device);
                     return timing_dispatches(device, [test isEqualToString:@"timing-ordered"]);
                 }

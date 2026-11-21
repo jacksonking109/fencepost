@@ -411,6 +411,8 @@ python3 -I tests/mtl4_check.py arm64 --threads
 python3 -I tests/mtl4_check.py x86_64 --threads
 python3 -I tests/mtl4_race_check.py arm64
 python3 -I tests/mtl4_race_check.py x86_64
+python3 -I tests/mtl4_timing_check.py arm64                  # every Metal 4 timing case 3 times
+python3 -I tests/mtl4_timing_check.py x86_64
 python3 -I tests/mtl4_overhead.py                            # CPU overhead table, both slices
 python3 -I tests/mtl4_overhead.py --trace-timing arm64 x86_64 # CPU cost of estimated and sampled traces
 ```
