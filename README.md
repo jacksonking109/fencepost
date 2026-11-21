@@ -326,24 +326,30 @@ processes unless you pass `--pid N`. You can also call `void fencepost_capture(c
 `FENCEPOST_CAPTURE_FILE` in the Metal program. Like the timeline trigger file, it uses its modification
 time, a reason on line one, and an optional `pid=N` on line two.
 
-After the program has ended at least one frame, fencepost captures the device used by the next frame's
-first Metal 3 command buffer allocation or Metal 4 `beginCommandBufferWithAllocator:`. A present,
-`signalDrawable:`, or an explicit `fencepost_frame` marker ends the frame. In a mixed process either
-Metal API can open the next frame, and both entry points check the shared Metal 4 gate.
+After the first frame ends, fencepost can start recording at the next frame's first Metal 3 command buffer
+allocation or Metal 4 `beginCommandBufferWithAllocator:`. A present, `signalDrawable:`, or explicit
+`fencepost_frame` marker ends a frame. Both entry points check for ended Metal 4 command buffers across
+all queues. Starting Xcode capture while one awaits submission can crash the app. Fencepost defers the
+request until a later frame start and logs a refusal after three blocked frame starts. Successful
+submission or deallocation clears an ended buffer.
 
-A Metal 4 buffer that has ended and is awaiting submission on any queue blocks the start. Fencepost
-tries the first allocation or begin of each eligible frame and logs a refusal after three blocked frame starts.
-An ended buffer stops blocking capture when it is successfully submitted or deallocated. If an end waits three seconds
-for a capture start, fencepost logs the timeout, disables capture for the process, and lets the end proceed.
-If fencepost cannot allocate submission tracking, it logs the failure and disables capture while the app continues
-submitting. Metal 4 captures stop at a frame boundary once submission feedback has arrived.
-If fencepost cannot get feedback for a submission, it logs
-that it will stop at the frame boundary. If the app starts another frame while feedback is pending, the
-capture can extend to its end. The idle and hard-cap timers still apply.
+A Metal 4 end that races a capture start waits up to three seconds. On timeout, fencepost lets the
+end proceed, logs the timeout and disables further capture in that process. A narrow crash window remains
+if the starting thread stalls for more than three seconds between its final check and the call into Metal.
+If fencepost runs out of memory for submission tracking, it disables capture and lets the app submit.
+
+Metal 4 recording ends at a frame boundary once submission feedback has arrived. If another frame starts
+while feedback is pending, recording can extend through that frame. Missing feedback switches recording
+to a logged frame-boundary stop. The idle timer and maximum recording time still apply.
 
 Fencepost ignores requests while a capture is active and keeps the first request that arrives during
 teardown for the next eligible frame. The cooldown and capture limit still apply. Open the logged
 `<prefix>-<pid>-f<frame>-<reason>.gputrace` in Xcode with **File → Open**.
+
+On arm64 and Rosetta, automated checks cover cross-queue deferral, failed and discarded submissions,
+mixed Metal 3/4 frame starts, capture timeouts and the encoder labels in recorded frames. In a separate
+manual check, a fencepost-triggered mid-run Metal 4 capture of `mtl4frames` opened, replayed and profiled
+in Xcode. Metal 4 game capture under Wine and simultaneous native ends on the same buffer remain untested.
 
 ## How Metal 3 analysis works
 
@@ -380,8 +386,11 @@ The summary reports blind spots where it can identify them.
 
 ## Knobs (environment)
 
-If the log sink stays blocked at exit or before a fatal hook error, Fencepost saves the summary or
-diagnostic in a private `/tmp/fencepost-final-<pid>-*` file.
+Fencepost drains a bounded queue of 2,048 log lines outside the detector lock. If output backs up and the
+queue fills, it counts dropped lines and reports the count when output resumes. If the log stays blocked
+at exit or during a fatal hook error, fencepost writes the final summary or diagnostic to a private
+`/tmp/fencepost-final-<pid>-*` file. The detector also reclaims slots for encoders released without
+`endEncoding` and keeps a description of resources for reports produced after their release.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -408,7 +417,7 @@ diagnostic in a private `/tmp/fencepost-final-<pid>-*` file.
 | `FENCEPOST_MAX_AUTO_DUMPS` | 20 | timeline dumps per process from race, GPU-error and spike triggers |
 | `FENCEPOST_MAX_MANUAL_DUMPS` | 20 | timeline dumps per process from file, hotkey, CLI and API requests |
 | `FENCEPOST_MAX_DUMPS` | 20 | fallback for either timeline dump quota when its own knob is unset |
-| `FENCEPOST_CAPTURE` | unset | filename prefix for Xcode GPU traces, requires `MTL_CAPTURE_ENABLED=1` |
+| `FENCEPOST_CAPTURE` | unset | filename prefix for Metal 3 or Metal 4 Xcode captures, requires `MTL_CAPTURE_ENABLED=1` at launch |
 | `FENCEPOST_CAPTURE_FILE` | `/tmp/fencepost-capture-<uid>` | request file, empty disables polling |
 | `FENCEPOST_CAPTURE_ON` | empty | comma-separated `race`, `gpu-error`, `spike` auto triggers |
 | `FENCEPOST_CAPTURE_FRAMES` | 1 | frame ends to record |
@@ -434,9 +443,9 @@ Prebuilt (universal: Apple Silicon and x86_64/Rosetta, macOS 13+) on the
 macOS then refuses to load the library ("library load disallowed by system policy"); clear the mark after extracting:
 
 ```
-tar -xzf fencepost-0.3.0-macos.tar.gz
-xattr -dr com.apple.quarantine fencepost-0.3.0-macos
-DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.3.0-macos/libfencepost.dylib  your-metal-program
+tar -xzf fencepost-0.3.1-macos.tar.gz
+xattr -dr com.apple.quarantine fencepost-0.3.1-macos
+DYLD_INSERT_LIBRARIES=$PWD/fencepost-0.3.1-macos/libfencepost.dylib  your-metal-program
 ```
 
 The archive also holds the trigger tools: `fencepost-trigger` (command line) and `Fencepost Trigger.app` (menu-bar
@@ -511,26 +520,27 @@ pipeline retries and simulated feedback errors. `mtl4frames --long` exercises fr
 
 ## Results so far
 
-**Metal 4 on arm64 and Rosetta (0.3.0).** All 61 race verdicts passed three times per slice.
+**Metal 4 on arm64 and Rosetta (0.3.1).** All 61 race verdicts passed three times per slice.
 The detector caught the missing barrier, wrong-stage barrier and premature event signal.
 The frame workload and the 10,000-draw benchmark produced zero race reports.
 
 ### Overhead
 
-Median CPU times from three runs per configuration on Apple silicon after the Metal 4 per-commit optimizations.
+Median CPU times from three runs per configuration. In the 0.3.0 release measurements, fencepost added
+69% per commit on arm64 and 62% under Rosetta. In the 0.3.1 runs, it added 38% and 35%, respectively.
 The draw workload changes a buffer address and a texture binding on every draw. The commit workload encodes four
 draws per submission. Pipeline builds use a warm shader cache. The x86_64 slice runs under Rosetta.
 
 | Slice | CPU measure | Without fencepost | With fencepost | Overhead |
 |---|---|---:|---:|---:|
-| arm64 | µs/draw | 0.0864 | 0.1049 | +21% |
-| arm64 | µs/commit | 5.0417 | 6.7083 | +33% |
-| arm64 | ms/pipeline (MTL4Compiler) | 0.0183 | 0.0214 | +17% |
-| arm64 | ms/pipeline (device) | 0.0132 | 0.0151 | +14% |
-| x86_64 | µs/draw | 0.1378 | 0.1761 | +28% |
-| x86_64 | µs/commit | 8.0420 | 10.3750 | +29% |
-| x86_64 | ms/pipeline (MTL4Compiler) | 0.0395 | 0.0444 | +12% |
-| x86_64 | ms/pipeline (device) | 0.0318 | 0.0356 | +12% |
+| arm64 | µs/draw | 0.0860 | 0.1065 | +24% |
+| arm64 | µs/commit | 4.7917 | 6.6250 | +38% |
+| arm64 | ms/pipeline (MTL4Compiler) | 0.0193 | 0.0223 | +16% |
+| arm64 | ms/pipeline (device) | 0.0133 | 0.0154 | +16% |
+| x86_64 | µs/draw | 0.1412 | 0.1780 | +26% |
+| x86_64 | µs/commit | 7.9580 | 10.7080 | +35% |
+| x86_64 | ms/pipeline (MTL4Compiler) | 0.0432 | 0.0461 | +7% |
+| x86_64 | ms/pipeline (device) | 0.0339 | 0.0366 | +8% |
 
 ### Earlier Metal 3 results
 
