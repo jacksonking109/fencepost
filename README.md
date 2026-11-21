@@ -376,6 +376,9 @@ The summary reports blind spots where it can identify them.
 
 ## Knobs (environment)
 
+If the log sink stays blocked at exit or before a fatal hook error, Fencepost saves the summary or
+diagnostic in a private `/tmp/fencepost-final-<pid>-*` file.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `FENCEPOST_LOG` | stderr | append reports to this file; `%p` in the name becomes the process id |

@@ -284,19 +284,34 @@ static char g_log_lines[FP_LOG_LINES][FP_LOG_LINE_BYTES];
 static unsigned g_log_head, g_log_count;
 static unsigned long long g_log_dropped;
 static int g_log_active, g_log_fd = STDERR_FILENO;
+static __thread FILE *tl_log_final;
+static char *g_log_final;
+
+static int fp_log_write(int fd, const char *text)
+{
+    size_t left = strlen(text);
+    while (left) {
+        ssize_t written = write(fd, text, left);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return 0;
+        text += written;
+        left -= (size_t)written;
+    }
+    return 1;
+}
 
 static void fp_log_drain(void *unused)
 {
     for (;;) {
         char line[FP_LOG_LINE_BYTES];
         pthread_mutex_lock(&g_log_lock);
-        if (g_log_count) {
+        if (g_log_dropped) {
+            snprintf(line, sizeof line, "fencepost: %llu log lines dropped while output was backed up\n", g_log_dropped);
+            g_log_dropped = 0;
+        } else if (g_log_count) {
             memcpy(line, g_log_lines[g_log_head], sizeof line);
             g_log_head = (g_log_head + 1) % FP_LOG_LINES;
             g_log_count--;
-        } else if (g_log_dropped) {
-            snprintf(line, sizeof line, "fencepost: %llu log lines dropped while output was backed up\n", g_log_dropped);
-            g_log_dropped = 0;
         } else {
             g_log_active = 0;
             dispatch_group_leave(g_log_group);
@@ -304,29 +319,25 @@ static void fp_log_drain(void *unused)
             return;
         }
         pthread_mutex_unlock(&g_log_lock);
-        const char *next = line;
-        size_t left = strlen(line);
-        while (left) {
-            ssize_t written = write(g_log_fd, next, left);
-            if (written < 0 && errno == EINTR) continue;
-            if (written <= 0) break;
-            next += written;
-            left -= (size_t)written;
-        }
+        fp_log_write(g_log_fd, line);
     }
 }
 
 static void fp_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void fp_log(const char *fmt, ...)
 {
+    va_list ap;
+    va_start(ap, fmt);
+    if (tl_log_final) {
+        vfprintf(tl_log_final, fmt, ap);
+        va_end(ap);
+        return;
+    }
     pthread_mutex_lock(&g_log_lock);
     if (g_log_count == FP_LOG_LINES) g_log_dropped++;
     else {
         char *line = g_log_lines[(g_log_head + g_log_count) % FP_LOG_LINES];
-        va_list ap;
-        va_start(ap, fmt);
         int length = vsnprintf(line, FP_LOG_LINE_BYTES, fmt, ap);
-        va_end(ap);
         if (length >= FP_LOG_LINE_BYTES) line[FP_LOG_LINE_BYTES - 2] = '\n';
         if (length >= 0) g_log_count++;
     }
@@ -336,12 +347,36 @@ static void fp_log(const char *fmt, ...)
         dispatch_async_f(g_log_queue, NULL, fp_log_drain);
     }
     pthread_mutex_unlock(&g_log_lock);
+    va_end(ap);
+}
+
+static void fp_log_flush(const char *required)
+{
+    /* A final summary or fatal diagnostic must have room even in a full FIFO. */
+    char *copy = required && *required ? strdup(required) : NULL;
+    __block int delivered = 0;
+    if (copy) dispatch_group_async(g_log_group, g_log_queue, ^{
+        delivered = fp_log_write(g_log_fd, copy);
+        free(copy);
+    });
+    long pending = dispatch_group_wait(g_log_group, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
+    if (required && *required && (pending || !delivered)) {
+        /* Writing again to a full pipe could stall exit. Save the complete
+         * diagnostic directly to a private file without using the log queue. */
+        char path[96];
+        snprintf(path, sizeof path, "/tmp/fencepost-final-%d-XXXXXX", getpid());
+        int fd = mkstemp(path);
+        if (fd >= 0) {
+            fp_log_write(fd, required);
+            close(fd);
+        }
+    }
 }
 
 static void fp_log_finish(void)
 {
-    /* Give the final report time to reach a healthy sink without waiting forever on a pipe. */
-    dispatch_group_wait(g_log_group, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC));
+    fp_log_flush(g_log_final);
+    free(g_log_final);
 }
 
 static fp_node *node_get(uint64_t uid)
@@ -4282,7 +4317,10 @@ static IMP orig_imp(int h, id self)
     for (Class c = object_getClass(self); c; c = class_getSuperclass(c))
         for (int i = 0; i < count; i++)
             if (g_orig[h][i].c == c) return g_orig[h][i].imp;
-    fp_log("fencepost: internal error: no original for hook %d on %s\n", h, class_getName(object_getClass(self)));
+    char message[FP_LOG_LINE_BYTES];
+    snprintf(message, sizeof message, "fencepost: internal error: no original for hook %d on %s\n",
+             h, class_getName(object_getClass(self)));
+    fp_log_flush(message);
     abort();
 }
 
@@ -7406,7 +7444,10 @@ static void final_summary(void)
         pthread_mutex_unlock(&g_capture_lock);
     }
     if (g_capture_reporter) dispatch_sync(g_capture_reporter, ^{});
-    if (g_st[ST_NODES] || g_mtl4_gpu_errors) summary(1);   /* helper processes that never encoded: quiet */
+    size_t length = 0;
+    tl_log_final = open_memstream(&g_log_final, &length);
+    if (g_st[ST_NODES] || g_mtl4_gpu_errors ||
+        g_st[ST_ABANDONED_ENCODERS] || g_st[ST_NODE_POOL_EXHAUSTED]) summary(1);
     if (g_mtl4_ml_encoders) fp_log("fencepost: Metal 4 machine-learning encoders: %ld\n", g_mtl4_ml_encoders);
     if (g_trace_enabled) {
         pthread_mutex_lock(&g_lock);
@@ -7417,6 +7458,10 @@ static void final_summary(void)
                    TRACE_U64(g_trace_alloc_dropped));
         pthread_mutex_unlock(&g_lock);
         if (g_ring_writer) dispatch_sync(g_ring_writer, ^{});
+    }
+    if (tl_log_final) {
+        fclose(tl_log_final);
+        tl_log_final = NULL;
     }
 }
 
