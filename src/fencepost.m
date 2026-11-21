@@ -3806,13 +3806,16 @@ static void fp4_bind_pipeline(id encoder, id pipeline)
 {
     fp_node *n = cur_node(encoder);
     if (!n || !n->mtl4 || n->mtl4_pipeline_object == (void *)pipeline) return;
-    FP4PipelineTable *table = fp4_pipeline_table(pipeline);
-    n->mtl4_pipeline_object = (void *)pipeline;
-    if (table == n->mtl4_pipeline) return;
-    [n->mtl4_pipeline release];
-    n->mtl4_pipeline = [table retain];
-    n->mtl4_pipeline_serial++;
-    memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);   /* resample every bound table */
+    /* Reflection and the associated table may autorelease on the app's encoder thread. */
+    @autoreleasepool {
+        FP4PipelineTable *table = fp4_pipeline_table(pipeline);
+        n->mtl4_pipeline_object = (void *)pipeline;
+        if (table == n->mtl4_pipeline) return;
+        [n->mtl4_pipeline release];
+        n->mtl4_pipeline = [table retain];
+        n->mtl4_pipeline_serial++;
+        memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);   /* resample every bound table */
+    }
 }
 
 /* The access a draw or dispatch makes through slot i of a table bound at stage. */
