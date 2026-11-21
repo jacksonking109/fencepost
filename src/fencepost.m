@@ -7626,16 +7626,32 @@ static const hook_def blit_hooks[] = {
     HD(H_B_SYNCT, "synchronizeTexture:slice:level:", h_b_synct),
 };
 
-static struct { Class c; int kind; } g_hooked[64]; static int g_nhooked;
+typedef struct { Class cls; int kind; } fp_hooked_class;
+static fp_hooked_class g_hooked[64];
+static int g_nhooked;
+static _Atomic(const fp_hooked_class *) g_last_hooked;
 
 static void install(Class cls, int kind, const hook_def *defs, size_t n)
 {
     if (!cls) return;
+    const fp_hooked_class *last = atomic_load_explicit(&g_last_hooked, memory_order_acquire);
+    if (last && last->cls == cls && last->kind == kind) return;
+
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_nhooked; i++)
-        if (g_hooked[i].c == cls && g_hooked[i].kind == kind) { pthread_mutex_unlock(&g_lock); return; }
-    if (g_nhooked < 64) { g_hooked[g_nhooked].c = cls; g_hooked[g_nhooked].kind = kind; g_nhooked++; }
+    for (int i = 0; i < g_nhooked; i++) {
+        if (g_hooked[i].cls == cls && g_hooked[i].kind == kind) {
+            atomic_store_explicit(&g_last_hooked, &g_hooked[i], memory_order_release);
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+    }
     for (size_t i = 0; i < n; i++) hook(cls, defs[i].h, defs[i].sel, defs[i].imp);
+    /* Publish an immutable entry only after the class has been hooked. */
+    if (g_nhooked < (int)(sizeof g_hooked / sizeof g_hooked[0])) {
+        fp_hooked_class *entry = &g_hooked[g_nhooked++];
+        *entry = (fp_hooked_class){ cls, kind };
+        atomic_store_explicit(&g_last_hooked, entry, memory_order_release);
+    }
     pthread_mutex_unlock(&g_lock);
 }
 #define N(a) (sizeof a / sizeof a[0])
