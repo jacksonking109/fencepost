@@ -49,7 +49,6 @@
 #define FP_POOL         16384           /* live nodes (encoders + event signals) */
 #define FP_CBPOOL       4096
 #define FP_OPENCB       1024
-#define FP_OPENENC      256
 #define FP_QRECENT      1024
 #define FP_MAXQ         32
 #define FP_OBJBITS      18
@@ -88,7 +87,7 @@ enum { ST_RACE_UNIQ, ST_POSS_UNIQ, ST_RACE_HITS, ST_POSS_HITS, ST_NODES, ST_ACCE
        ST_OBJS, ST_OBJ_DROPS, ST_ANALYSIS_NS,
        ST_FRAMES, ST_FRAME_ENC, ST_FRAME_CHAIN, ST_GPU_IDLE,   /* last finished frame's encoders and chain */
        ST_EVENT_LOOKUP_MISSES, ST_EVENT_UNKNOWN_SIGNALS,
-       ST_COUNT };
+       ST_NODE_POOL_EXHAUSTED, ST_COUNT };
 
 typedef struct { uint64_t w[FP_WORDS]; } fp_bits;
 
@@ -136,6 +135,7 @@ typedef struct fp_node {
     uint64_t cb_uid, commit_tick, done_tick, pend_since;
     int kind, state, idx;           /* state: 1 encoding, 2 ended, 3 committed, 4 analysed */
     void *enc;
+    struct fp_node *next_open;
     uint8_t uncertain, exempt, mtl4, mtl4_drawn;   /* mtl4_drawn: a draw or dispatch was encoded */
     uint8_t mtl4_has_attachment, mtl4_render_options;
     fp_deferred_att *deferred_att; int ndeferred_att, cdeferred_att;
@@ -211,7 +211,7 @@ static fp_node g_pool[FP_POOL];
 static fp_cb g_cbs[FP_CBPOOL];
 static fp_queue g_q[FP_MAXQ]; static int g_nq;
 static struct { void *cb; uint64_t uid; } g_opencb[FP_OPENCB]; static unsigned g_opencb_rr;
-static struct { void *enc; uint64_t uid; } g_openenc[FP_OPENENC]; static unsigned g_openenc_rr;
+static fp_node *g_open_encoders;
 static struct { void *f; uint64_t uid; uint8_t after; } g_fence[FP_FENCEMAP];
 static CFMutableDictionaryRef g_events;   /* event lifetime key -> fp_ev owned by its association */
 static uintptr_t g_next_event_key;
@@ -360,8 +360,17 @@ static void clear_deferred_attachments(fp_node *n)
 
 static fp_node *node_new(int kind)   /* lock held */
 {
-    uint64_t uid = ++g_uid;
+    uint64_t uid = g_uid + 1;
     fp_node *n = &g_pool[uid % FP_POOL];
+    /* Open encoders use their slot without g_lock and still own its tables and attachments. */
+    while (n->state == 1) {
+        if (uid - g_uid == FP_POOL) {
+            g_st[ST_NODE_POOL_EXHAUSTED]++;
+            return NULL;
+        }
+        n = &g_pool[++uid % FP_POOL];
+    }
+    g_uid = uid;
     if (n->mtl4)
         for (int i = 0; i < FP4_TABLES; i++) [n->mtl4_tables[i] release];
     if (n->mtl4) [n->mtl4_pipeline release];
@@ -375,7 +384,7 @@ static fp_node *node_new(int kind)   /* lock held */
     memset(n->mtl4_last, 0, sizeof n->mtl4_last);
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
-    n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
+    n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->next_open = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
     n->mtl4 = 0; n->mtl4_drawn = 0; n->mtl4_has_attachment = n->mtl4_render_options = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->frame = 0; n->queue_seq = 0; n->chain_prev = 0; n->depth = 0;
@@ -1954,7 +1963,7 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
         "heap_uses", "parallel", "tracked", "timeouts", "uncertain", "window", "lost",
         "order_unique", "order_hits", "partial_unique", "partial_hits", "barriers",
         "objs", "obj_drops", "analysis_ns", "frames", "frame_enc", "frame_chain", "gpu_idle",
-        "event_wait_lookup_misses", "event_wait_unknown_signals"
+        "event_wait_lookup_misses", "event_wait_unknown_signals", "node_pool_exhausted"
     };
     _Static_assert(sizeof stats / sizeof *stats == ST_COUNT, "trace summary must include all detector counters");
     trace_header_at(f, 'i', 0, timestamp, "fencepost", "fencepost summary", state->origin ?: timestamp);
@@ -2520,6 +2529,9 @@ static void summary(int final)
                "%ld checks past the %d-encoder window, %ld nodes dropped\n",
                g_st[ST_HEAP_USES], g_st[ST_PARALLEL], g_st[ST_TIMEOUTS], g_st[ST_UNCERTAIN], g_st[ST_WINDOW],
                FP_W, g_st[ST_LOST]);
+    if (g_st[ST_NODE_POOL_EXHAUSTED])
+        fp_log("fencepost:   node pool exhausted: %ld nodes skipped while all slots were open\n",
+               g_st[ST_NODE_POOL_EXHAUSTED]);
     if (g_st[ST_EVENT_LOOKUP_MISSES])
         fp_log("fencepost:   event waits with missing records: %ld\n", g_st[ST_EVENT_LOOKUP_MISSES]);
     if (g_st[ST_EVENT_UNKNOWN_SIGNALS])
@@ -3114,6 +3126,7 @@ static void frame_boundary(uint64_t timestamp, fp_trace_cb *trace)
 static fp_node *phase_signal(fp_queue *q, uint64_t cb_uid, uint64_t tick, fp_item *it)
 {
     fp_node *n = node_new(FPK_SIGNAL);
+    if (!n) return NULL;
     it->uid = n->uid;
     n->cb_uid = cb_uid; n->state = 2;
     unsigned first = q->nrecent > FP_QRECENT ? q->nrecent - FP_QRECENT : 0;
@@ -3178,6 +3191,7 @@ static void phase1(fp_cb *c, fp_node **suspended)
         fp_node *n;
         if (it->type == 1) {
             n = phase_signal(q, c->uid, c->commit_tick, it);
+            if (!n) continue;
         } else {
             n = node_get(it->uid);
             if (!n) {
@@ -3273,13 +3287,11 @@ static fp_node *cur_node(id enc)
         fp_node *n = node_get(tl_cache.uid);
         if (n && n->enc == (void *)enc && n->state == 1) return n;
     }
-    uint64_t uid = 0;
     pthread_mutex_lock(&g_lock);
-    for (unsigned i = 0; i < FP_OPENENC; i++) if (g_openenc[i].enc == (void *)enc) { uid = g_openenc[i].uid; break; }
+    fp_node *n = g_open_encoders;
+    while (n && n->enc != (void *)enc) n = n->next_open;
+    if (n) { tl_cache.enc = (void *)enc; tl_cache.uid = n->uid; }
     pthread_mutex_unlock(&g_lock);
-    fp_node *n = node_get(uid);
-    if (!n || n->state != 1 || n->enc != (void *)enc) return NULL;
-    tl_cache.enc = (void *)enc; tl_cache.uid = uid;
     return n;
 }
 
@@ -4595,22 +4607,16 @@ static fp_node *on_encoder_kind(id cb, id enc, int kind, fp_trace_encoder *trace
     else hook_encoder(object_getClass(enc), kind);
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)cb);
-    fp_node *n = NULL;
-    if (c) {
-        n = node_new(kind);
+    fp_node *n = c ? node_new(kind) : NULL;
+    if (n) {
         n->mtl4 = mtl4;
         n->enc = (void *)enc; n->cb_uid = c->uid; n->idx = ++c->nenc;
         if (g_ring) g_ring_encoded = 1;
         if (trace) trace_encoder_register(trace, n);
         fp_item it = { 0, n->uid, NULL, 0 };
         PUSH(c->it, c->nit, c->cit, it);
-        unsigned slot = FP_OPENENC;
-        for (unsigned i = 0; i < FP_OPENENC; i++) {
-            if (g_openenc[i].enc == (void *)enc) { slot = i; break; }
-            if (slot == FP_OPENENC && !g_openenc[i].enc) slot = i;
-        }
-        if (slot == FP_OPENENC) slot = g_openenc_rr++ % FP_OPENENC;
-        g_openenc[slot].enc = (void *)enc; g_openenc[slot].uid = n->uid;
+        n->next_open = g_open_encoders;
+        g_open_encoders = n;
         tl_cache.enc = (void *)enc; tl_cache.uid = n->uid;
     }
     pthread_mutex_unlock(&g_lock);
@@ -6175,6 +6181,10 @@ static void mtl4_record_event(id queue, fp_item item)
     fp_queue *q = queue_get_kind((void *)queue, 1);
     if (q && item.type == 1) {
         fp_node *n = phase_signal(q, 0, ++g_tick, &item);
+        if (!n) {
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
         n->mtl4 = 1;
         phase_node(q, n, g_tick, NULL, q->mtl4_waits, q->mtl4_nwaits);
         while (q->mtl4_sig_first < q->mtl4_nsignals && !node_get(q->mtl4_signals[q->mtl4_sig_first].uid))
@@ -6321,7 +6331,10 @@ static void h_end(id self, SEL _cmd)
     else if (l) snprintf(n->label, sizeof n->label, "%s", l.UTF8String);
     if (g_trace_enabled) trace_encoder_end(n);
     n->state = 2;
-    for (unsigned i = 0; i < FP_OPENENC; i++) if (g_openenc[i].enc == (void *)self) { g_openenc[i].enc = NULL; g_openenc[i].uid = 0; }
+    fp_node **link = &g_open_encoders;
+    while (*link != n) link = &(*link)->next_open;
+    *link = n->next_open;
+    n->next_open = NULL;
     pthread_mutex_unlock(&g_lock);
     tl_cache.enc = NULL;
 }
