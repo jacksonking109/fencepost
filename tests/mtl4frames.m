@@ -413,6 +413,12 @@ int main(int argc, const char **argv)
             puts("signal outside the queue window retired");
             return 0;
         }
+        if (argc == 2 && !strcmp(argv[1], "--event-lifetime")) {
+            int (*test_lifetime)(void) = dlsym(RTLD_DEFAULT, "fencepost_test_event_lifetime");
+            if (!test_lifetime || !test_lifetime()) return fail("expired event record leaked or its wait went uncounted");
+            puts("an expired event record was removed and its wait was counted without an edge");
+            return 0;
+        }
         if (argc == 2 && !strcmp(argv[1], "--reflection-retry")) {
             if (@available(macOS 26.0, *))
                 return reflection_retry(MTLCreateSystemDefaultDevice());

@@ -57,7 +57,6 @@
 #define FP_OBJPROBE     4096            /* give up a lookup after this many slots */
 #define FP_SWEEP        2048            /* shadow slots cleaned per commit */
 #define FP_FENCEMAP     8192
-#define FP_EVMAP        2048
 #define FP_EVHIST       64
 #define FP_SIGMAP       (1 << 14)
 #define FP_ENTCAP       512
@@ -88,6 +87,7 @@ enum { ST_RACE_UNIQ, ST_POSS_UNIQ, ST_RACE_HITS, ST_POSS_HITS, ST_NODES, ST_ACCE
        ST_ORDER_UNIQ, ST_ORDER_HITS, ST_PARTIAL_UNIQ, ST_PARTIAL_HITS, ST_BARRIERS,
        ST_OBJS, ST_OBJ_DROPS, ST_ANALYSIS_NS,
        ST_FRAMES, ST_FRAME_ENC, ST_FRAME_CHAIN, ST_GPU_IDLE,   /* last finished frame's encoders and chain */
+       ST_EVENT_LOOKUP_MISSES,
        ST_COUNT };
 
 typedef struct { uint64_t w[FP_WORDS]; } fp_bits;
@@ -189,7 +189,7 @@ typedef struct fp_queue {
 
 typedef struct { fp_acc a; uint64_t uid, aseq; } fp_ent;
 typedef struct { void *key; fp_ent *w; int nw, cw; fp_ent *r; int nr, cr; } fp_obj;   /* writes (incl. may-write) and pure reads */
-typedef struct { void *ev; int known, gpu; uint64_t cpu_max; struct { uint64_t val, uid; } h[FP_EVHIST]; unsigned nh; } fp_ev;
+typedef struct { int known, gpu; uint64_t cpu_max; struct { uint64_t val, uid; } h[FP_EVHIST]; unsigned nh; } fp_ev;
 
 #define PUSH(arr, n, cap, val) do { if ((n) == (cap)) { (cap) = (cap) ? (cap) * 2 : 8; \
     (arr) = realloc((arr), (size_t)(cap) * sizeof *(arr)); } (arr)[(n)++] = (val); } while (0)
@@ -202,7 +202,9 @@ static fp_queue g_q[FP_MAXQ]; static int g_nq;
 static struct { void *cb; uint64_t uid; } g_opencb[FP_OPENCB]; static unsigned g_opencb_rr;
 static struct { void *enc; uint64_t uid; } g_openenc[FP_OPENENC]; static unsigned g_openenc_rr;
 static struct { void *f; uint64_t uid; uint8_t after; } g_fence[FP_FENCEMAP];
-static fp_ev g_ev[FP_EVMAP];
+static CFMutableDictionaryRef g_events;   /* event lifetime key -> fp_ev owned by its association */
+static uintptr_t g_next_event_key;
+static char g_event_owner_key;
 static fp_obj g_obj[FP_OBJMAP];
 static uint64_t g_sig[FP_SIGMAP];
 static uint64_t *g_pend; static int g_npend, g_cpend;
@@ -341,19 +343,54 @@ static fp_queue *queue_get_kind(void *q, int mtl4)   /* lock held */
 
 static fp_queue *queue_get(void *q) { return queue_get_kind(q, 0); }
 
-static fp_ev *ev_get(void *ev, int create)   /* lock held */
+@interface FPEventOwner : NSObject {
+@public
+    void *key;
+    fp_ev history;
+}
+@end
+
+@implementation FPEventOwner
+- (void)dealloc
 {
-    unsigned h = ptr_hash(ev, 11);
-    for (unsigned i = 0; i < FP_EVMAP; i++) {
-        fp_ev *e = &g_ev[(h + i) & (FP_EVMAP - 1)];
-        if (e->ev == ev) return e;
-        if (!e->ev) {
-            if (!create) return NULL;
-            memset(e, 0, sizeof *e); e->ev = ev;
-            return e;
+    if (key) {
+        pthread_mutex_lock(&g_lock);
+        CFDictionaryRemoveValue(g_events, key);
+        pthread_mutex_unlock(&g_lock);
+    }
+    [super dealloc];
+}
+@end
+
+static void *event_key(id event, int known)
+{
+    if (!event) return NULL;
+    FPEventOwner *owner = objc_getAssociatedObject(event, &g_event_owner_key);
+    if (owner && !known) return owner->key;
+    FPEventOwner *created = nil;
+    pthread_mutex_lock(&g_lock);
+    if (!owner) owner = objc_getAssociatedObject(event, &g_event_owner_key);
+    if (!owner) {
+        if (!g_events) g_events = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+        if (g_events) owner = created = [[FPEventOwner alloc] init];
+        if (owner) {
+            /* An outstanding wait must never bind to an object that reused
+             * this event's address. */
+            owner->key = (void *)++g_next_event_key;
+            CFDictionarySetValue(g_events, owner->key, &owner->history);
+            objc_setAssociatedObject(event, &g_event_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
-    return NULL;
+    if (owner && known) owner->history.known = 1;
+    void *key = owner ? owner->key : NULL;
+    pthread_mutex_unlock(&g_lock);
+    [created release];
+    return key;
+}
+
+static fp_ev *ev_get(void *key)   /* lock held */
+{
+    return key && g_events ? (fp_ev *)CFDictionaryGetValue(g_events, key) : NULL;
 }
 
 static int fence_slot(void *f, int create)   /* lock held */
@@ -1850,7 +1887,8 @@ static void trace_summary(FILE *f, fp_trace_counts totals, const fp_trace_summar
         "race_unique", "possible_unique", "race_hits", "possible_hits", "nodes", "accesses", "cbs",
         "heap_uses", "parallel", "tracked", "timeouts", "uncertain", "window", "lost",
         "order_unique", "order_hits", "partial_unique", "partial_hits", "barriers",
-        "objs", "obj_drops", "analysis_ns", "frames", "frame_enc", "frame_chain", "gpu_idle"
+        "objs", "obj_drops", "analysis_ns", "frames", "frame_enc", "frame_chain", "gpu_idle",
+        "event_wait_lookup_misses"
     };
     _Static_assert(sizeof stats / sizeof *stats == ST_COUNT, "trace summary must include all detector counters");
     trace_header_at(f, 'i', 0, timestamp, "fencepost", "fencepost summary", state->origin ?: timestamp);
@@ -2416,6 +2454,8 @@ static void summary(int final)
                "%ld checks past the %d-encoder window, %ld nodes dropped\n",
                g_st[ST_HEAP_USES], g_st[ST_PARALLEL], g_st[ST_TIMEOUTS], g_st[ST_UNCERTAIN], g_st[ST_WINDOW],
                FP_W, g_st[ST_LOST]);
+    if (g_st[ST_EVENT_LOOKUP_MISSES])
+        fp_log("fencepost:   event waits with missing records: %ld\n", g_st[ST_EVENT_LOOKUP_MISSES]);
     if (g_trace) fflush(g_trace);
     pthread_mutex_unlock(&g_lock);
 }
@@ -2896,8 +2936,9 @@ static int ready(fp_node *n, int force)
     int i, j;
     for (i = 0, j = 0; i < n->nev; i++) {
         fp_evwait w = n->ew[i];
-        fp_ev *ev = ev_get(w.ev, 0);
+        fp_ev *ev = ev_get(w.ev);
         int done = 0;
+        if (!ev) g_st[ST_EVENT_LOOKUP_MISSES]++;
         if (!ev || !ev->known) done = 1;   /* event made outside our view (e.g. from a mach port): CPU-side */
         else {
             int gone;
@@ -2998,7 +3039,7 @@ static fp_node *phase_signal(fp_queue *q, uint64_t cb_uid, uint64_t tick, fp_ite
         fp_edge e = { p->uid, 1, 0 };
         PUSH(n->ed, n->ned, n->ced, e);
     }
-    fp_ev *ev = ev_get(it->ev, 1);
+    fp_ev *ev = ev_get(it->ev);
     if (ev) {
         ev->gpu = 1;
         ev->known = 1;
@@ -4094,10 +4135,7 @@ static void on_queue(id q)
 static void on_event(id ev)
 {
     if (!ev) return;
-    pthread_mutex_lock(&g_lock);
-    fp_ev *e = ev_get((void *)ev, 1);
-    if (e) e->known = 1;
-    pthread_mutex_unlock(&g_lock);
+    event_key(ev, 1);
     hook_event(object_getClass(ev));
 }
 
@@ -5506,13 +5544,13 @@ static void h_mtl4_fence_wait(id self, SEL _cmd, id fence, NSUInteger stages)
     if (OUTER) fp4_record_sync(self, FP4_FENCE_WAIT, fence, 0, stages);
 }
 
-static void cb_item(id cb, int type, id ev, uint64_t val)
+static void cb_item(id cb, int type, void *ev, uint64_t val)
 {
     pthread_mutex_lock(&g_lock);
     fp_cb *c = cb_find_open((void *)cb);
     if (c) {
         if (g_trace_enabled && type == 4) val = trace_clock();
-        fp_item it = { (uint8_t)type, 0, (void *)ev, val };
+        fp_item it = { (uint8_t)type, 0, ev, val };
         PUSH(c->it, c->nit, c->cit, it);
     }
     pthread_mutex_unlock(&g_lock);
@@ -5520,12 +5558,12 @@ static void cb_item(id cb, int type, id ev, uint64_t val)
 static void h_cb_sig(id self, SEL _cmd, id ev, uint64_t v)
 {
     ENTER; ORIG(H_CB_SIG, void (*)(id, SEL, id, uint64_t))(self, _cmd, ev, v); LEAVE;
-    if (OUTER) cb_item(self, 1, ev, v);
+    if (OUTER) cb_item(self, 1, event_key(ev, 0), v);
 }
 static void h_cb_wait(id self, SEL _cmd, id ev, uint64_t v)
 {
     ENTER; ORIG(H_CB_WAIT, void (*)(id, SEL, id, uint64_t))(self, _cmd, ev, v); LEAVE;
-    if (OUTER) cb_item(self, 2, ev, v);
+    if (OUTER) cb_item(self, 2, event_key(ev, 0), v);
 }
 static void h_cb_enq(id self, SEL _cmd)
 {
@@ -5817,7 +5855,7 @@ static void mtl4_retire_waits(fp_queue *q, uint64_t limit)
     int retired = 0;
     while (retired < q->mtl4_nwaits && q->mtl4_waits[retired].ticket <= limit) {
         fp_evwait wait = q->mtl4_waits[retired++];
-        fp_ev *event = ev_get(wait.ev, 0);
+        fp_ev *event = ev_get(wait.ev);
         if (event && event->cpu_max >= wait.val) continue;
         fp_node *signal = first_event_signal(event, q, wait, NULL);
         if (!signal || !signal->mtl4) continue;
@@ -6052,7 +6090,7 @@ static void mtl4_record_event(id queue, fp_item item)
 static void h_mtl4_signal(id self, SEL _cmd, id event, uint64_t value)
 {
     ENTER;
-    if (OUTER) mtl4_record_event(self, (fp_item){ 1, 0, (void *)event, value });
+    if (OUTER) mtl4_record_event(self, (fp_item){ 1, 0, event_key(event, 0), value });
     ORIG(H_4_SIGNAL, void (*)(id, SEL, id, uint64_t))(self, _cmd, event, value);
     LEAVE;
 }
@@ -6060,7 +6098,7 @@ static void h_mtl4_signal(id self, SEL _cmd, id event, uint64_t value)
 static void h_mtl4_wait(id self, SEL _cmd, id event, uint64_t value)
 {
     ENTER;
-    if (OUTER) mtl4_record_event(self, (fp_item){ 2, 0, (void *)event, value });
+    if (OUTER) mtl4_record_event(self, (fp_item){ 2, 0, event_key(event, 0), value });
     ORIG(H_4_WAIT, void (*)(id, SEL, id, uint64_t))(self, _cmd, event, value);
     LEAVE;
 }
@@ -6094,9 +6132,10 @@ static void h_ev_set(id self, SEL _cmd, uint64_t v)
 {
     ENTER; ORIG(H_EV_SET, void (*)(id, SEL, uint64_t))(self, _cmd, v); LEAVE;
     if (!OUTER) return;
+    FPEventOwner *owner = objc_getAssociatedObject(self, &g_event_owner_key);
+    if (!owner) return;
     pthread_mutex_lock(&g_lock);
-    fp_ev *e = ev_get((void *)self, 0);
-    if (e && v > e->cpu_max) { e->cpu_max = v; process_pending(0); }
+    if (v > owner->history.cpu_max) { owner->history.cpu_max = v; process_pending(0); }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -7048,26 +7087,27 @@ __attribute__((visibility("default"))) int fencepost_stats(long *out, int n)
  * encoding a GPU wait that depends on an unsubmitted signal. */
 __attribute__((visibility("default"))) int fencepost_test_wait_source(void)
 {
+    NSObject *object = [[NSObject alloc] init];
+    void *key = event_key(object, 1);
     pthread_mutex_lock(&g_lock);
     static fp_queue producer, consumer;
-    static char event_key;
     fp_node *first = node_new(FPK_SIGNAL), *second = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
     first->req_q = second->req_q = &producer;
     second->aseq = 1;
     waiter->req_q = &consumer;
-    fp_ev *event = ev_get(&event_key, 1);
+    fp_ev *event = ev_get(key);
     event->known = event->gpu = 1;
     event->h[0].uid = first->uid; event->h[0].val = 1;
     event->h[1].uid = second->uid; event->h[1].val = 2;
     event->nh = 2;
-    fp_evwait wait = { &event_key, 1, 0, 0, 0 };
+    fp_evwait wait = { key, 1, 0, 0, 0 };
     PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
     int pending = !ready(waiter, 0) && !waiter->ned;
     first->aseq = 2;
     int selected = ready(waiter, 0) && waiter->ned == 1 && waiter->ed[0].src == first->uid;
-    memset(event, 0, sizeof *event);
     first->state = second->state = waiter->state = 0;
     pthread_mutex_unlock(&g_lock);
+    [object release];
     return pending && selected;
 }
 
@@ -7075,25 +7115,47 @@ __attribute__((visibility("default"))) int fencepost_test_wait_source(void)
  * not with an edge to the later, analysed signal. */
 __attribute__((visibility("default"))) int fencepost_test_recycled_signal(void)
 {
+    NSObject *object = [[NSObject alloc] init];
+    void *key = event_key(object, 1);
     pthread_mutex_lock(&g_lock);
     static fp_queue producer, consumer;
-    static char event_key;
     fp_node *later = node_new(FPK_SIGNAL), *waiter = node_new(FPK_COMPUTE);
     later->req_q = &producer;
     later->aseq = 1;
     waiter->req_q = &consumer;
     uint64_t recycled = later->uid > FP_POOL ? later->uid - FP_POOL : later->uid + FP_POOL;
-    fp_ev *event = ev_get(&event_key, 1);
+    fp_ev *event = ev_get(key);
     event->known = event->gpu = 1;
     event->h[0].uid = recycled; event->h[0].val = 1;
     event->h[1].uid = later->uid; event->h[1].val = 2;
     event->nh = 2;
-    fp_evwait wait = { &event_key, 1, 0, 0, 0 };
+    fp_evwait wait = { key, 1, 0, 0, 0 };
     PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
     int settled = !node_get(recycled) && ready(waiter, 0) && !waiter->ned && !waiter->nev;
-    memset(event, 0, sizeof *event);
     later->state = waiter->state = 0;
     pthread_mutex_unlock(&g_lock);
+    [object release];
+    return settled;
+}
+
+__attribute__((visibility("default"))) int fencepost_test_event_lifetime(void)
+{
+    NSObject *old = [[NSObject alloc] init];
+    void *expired = event_key(old, 1);
+    [old release];
+    NSObject *replacement = [[NSObject alloc] init];
+    void *fresh = event_key(replacement, 1);
+
+    pthread_mutex_lock(&g_lock);
+    long before = g_st[ST_EVENT_LOOKUP_MISSES];
+    fp_node *waiter = node_new(FPK_COMPUTE);
+    fp_evwait wait = { expired, 1, 0, 0, 0 };
+    PUSH(waiter->ew, waiter->nev, waiter->cev, wait);
+    int settled = expired && fresh && fresh != expired && ev_get(fresh) && !ev_get(expired) &&
+        ready(waiter, 0) && !waiter->ned && !waiter->nev && g_st[ST_EVENT_LOOKUP_MISSES] == before + 1;
+    waiter->state = 0;
+    pthread_mutex_unlock(&g_lock);
+    [replacement release];
     return settled;
 }
 

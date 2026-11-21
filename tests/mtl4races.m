@@ -427,6 +427,45 @@ static int run_mixed_event(id<MTLDevice> device, NSString *mode)
     return 0;
 }
 
+API_AVAILABLE(macos(26.0))
+static int run_event_churn(id<MTLDevice> device)
+{
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTL4CommandBuffer> cb = [device newCommandBuffer];
+    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    __attribute__((objc_precise_lifetime)) id<MTLBuffer> buffer =
+        [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    __attribute__((objc_precise_lifetime)) id<MTLResidencySet> residency =
+        [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    if (!queue || !cb || !allocator || !buffer || !residency) return fail("event churn setup failed");
+    [residency addAllocation:buffer];
+    [residency commit];
+    [queue addResidencySet:residency];
+    NSMutableArray<id<MTLEvent>> *events = [NSMutableArray arrayWithCapacity:5000];
+    /* Keep 5,000 distinct allocations live, but submit in batches so each
+     * wait retires before encoding the next batch. */
+    for (unsigned i = 0; i < 5000; i += 25) @autoreleasepool {
+        for (unsigned j = 0; j < 25; j++) {
+            id<MTLEvent> event = [device newEvent];
+            if (!event) return fail("event churn allocation failed");
+            [events addObject:event];
+            [queue signalEvent:event value:1];
+            [queue waitForEvent:event value:1];
+        }
+        [cb beginCommandBufferWithAllocator:allocator];
+        id<MTL4ComputeCommandEncoder> blit = [cb computeCommandEncoder];
+        if (!blit) return fail("event churn encoder creation failed");
+        [blit fillBuffer:buffer range:NSMakeRange(0, 16) value:0x5A];
+        [blit endEncoding];
+        [cb endCommandBuffer];
+        if (commit_and_wait(queue, cb)) return 1;
+        [allocator reset];
+    }
+    [events removeAllObjects];
+    puts("5000 events signaled, waited, and released");
+    return run_mixed_event(device, @"mixed-3to4");
+}
+
 /* A clear-and-store pass followed by a load-and-store pass with Fragment synchronization. */
 API_AVAILABLE(macos(26.0))
 static int run_attachments(id<MTLDevice> device, NSString *mode)
@@ -732,6 +771,7 @@ static int run(id<MTLDevice> device, NSString *mode)
     if ([mode hasPrefix:@"store-"]) return run_attachment_stores(device, mode);
     if ([mode hasPrefix:@"stitched"]) return run_stitched(device, mode);
     if ([mode hasPrefix:@"mixed-"]) return run_mixed_event(device, mode);
+    if ([mode isEqualToString:@"event-churn"]) return run_event_churn(device);
     if ([mode hasPrefix:@"consumer-"] || [mode hasPrefix:@"chain-"]) return run_consumer_barriers(device, mode);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
@@ -893,6 +933,7 @@ int main(int argc, const char **argv)
                         @"store-depth-discard", @"store-depth", @"store-resolve-separate", @"store-resolve-same",
                         @"stitched", @"stitched-load", @"stitched-writer",
                         @"mixed-3to4", @"mixed-3to4-early", @"mixed-4to3", @"mixed-4to3-early",
+                        @"event-churn",
                         @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
                         @"consumer-intervening", @"chain-empty", @"chain-before-blit", @"chain-blit", @"chain-fence",
                         @"copy-compute", @"copy-compute-async", @"copy-render", @"copy-render-async", @"rw-texture"]

@@ -100,6 +100,9 @@ def check_run(arch, directory, program, mode, env, run_index, baseline, **extra)
         assert 'MTL4 outside writer' in result.stderr and 'MTL4 resume' in result.stderr, result.stderr
     if mode.startswith("mixed-") and expected:
         assert "read-after-write" in races[0] and "Metal 3 " in result.stderr and "Metal 4 " in result.stderr, result.stderr
+    if mode == "event-churn":
+        assert "5000 events signaled, waited, and released" in result.stdout, result.stdout
+        assert summary["event_wait_lookup_misses"] == 0 and summary["timeouts"] == 0, summary
     if mode == "order":
         assert "Blit -> Blit is unordered" in result.stderr, result.stderr
     if mode == "partial":
@@ -122,6 +125,7 @@ def check_suite(arch, directory):
                  "store-depth-discard", "store-depth", "store-resolve-separate", "store-resolve-same",
                  "stitched", "stitched-load", "stitched-writer",
                  "mixed-3to4", "mixed-3to4-early", "mixed-4to3", "mixed-4to3-early",
+                 "event-churn",
                  "consumer-buffer", "consumer-buffers", "consumer-commits",
                  "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence",
                  "copy-compute", "copy-compute-async", "copy-render", "copy-render-async", "rw-texture"):
@@ -147,4 +151,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 60 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 61 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
