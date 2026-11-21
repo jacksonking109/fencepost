@@ -173,7 +173,9 @@ registration is consumed once, including when the app reuses its options.
 
 With GPU tracing on, fencepost inserts two Relaxed timestamp writes into each sampled app encoder. Relaxed
 sampling keeps overhead low and avoids the encoder splitting that Precise sampling can cause. The writes can
-shift GPU timing slightly. Render samples go from the vertex stage before the first draw to the fragment
+shift GPU timing slightly. Spans are approximate: in repeated runs of fixed workloads, an occasional
+encoder span came out shorter than its work, by up to half, with Relaxed and Precise stamps alike. Use
+them for ordering, overlap and rough cost, not exact durations. Render samples go from the vertex stage before the first draw to the fragment
 stage after the last draw. Fencepost resolves samples on commit feedback from its own timestamp heap per
 device. The heap holds 4,096 entries, enough for 2,048 encoder pairs across outstanding submissions.
 Excess encoders, machine-learning encoders, suspend/resume render segments and encoders without a valid

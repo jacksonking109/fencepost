@@ -112,12 +112,12 @@ def check_mtl4_timing(case, encoders, command_buffers, markers, summary):
         if case == "ordered":
             first, middle, last = spans
             assert slice_end(first) <= middle["ts"] and slice_end(middle) <= last["ts"], spans
-            # A relaxed start stamp can land late inside an encoder, and a
-            # preempted span can end early, so one duration alone is approximate.
-            # The 1x/4x/16x workload still has to span well over four times its
-            # shortest span; equal spans would mean nothing was really sampled.
-            shortest = min(first["dur"], middle["dur"], last["dur"])
-            assert shortest > 0 and slice_end(last) - first["ts"] >= 4 * shortest, spans
+            # Over 20 runs per slice the 1x/4x/16x spans mostly measured 1:4:16, but
+            # now and then one span came out up to half its expected length (Precise
+            # stamps did the same). So require growth and a clear overall ratio,
+            # not exact per-span ratios.
+            assert 0 < first["dur"] < middle["dur"] < last["dur"], spans
+            assert last["dur"] >= 4 * first["dur"], spans
         else:
             by_time = sorted(spans, key=lambda e: e["ts"])
             overlapping = [(a, b) for i, a in enumerate(by_time) for b in by_time[i + 1:] if b["ts"] < slice_end(a)]
