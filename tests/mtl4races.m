@@ -225,6 +225,52 @@ static id compile_with_defaults(id<MTL4Compiler> compiler, MTL4PipelineDescripto
     return result;
 }
 
+API_AVAILABLE(macos(26.0))
+static int run_attachment_stores(id<MTLDevice> device, NSString *mode)
+{
+    BOOL resolve = [mode hasPrefix:@"store-resolve"];
+    BOOL sameResolve = [mode hasSuffix:@"-same"];
+    BOOL store = [mode isEqualToString:@"store-depth"];
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    id<MTL4CommandBuffer> cb = [device newCommandBuffer];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+        resolve ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatDepth32Float width:4 height:4 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> resolveA = resolve ? [device newTextureWithDescriptor:td] : nil;
+    id<MTLTexture> resolveB = resolve && !sameResolve ? [device newTextureWithDescriptor:td] : resolveA;
+    if (resolve) {
+        td.textureType = MTLTextureType2DMultisample;
+        td.sampleCount = 4;
+    }
+    id<MTLTexture> target = [device newTextureWithDescriptor:td];
+    __attribute__((objc_precise_lifetime)) id<MTLResidencySet> residency =
+        [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:NULL];
+    if (!queue || !allocator || !cb || !target || !residency || (resolve && (!resolveA || !resolveB)))
+        return fail("attachment store setup failed");
+    [residency addAllocation:target];
+    if (resolveA) [residency addAllocation:resolveA];
+    if (resolveB != resolveA) [residency addAllocation:resolveB];
+    [residency commit];
+    [queue addResidencySet:residency];
+
+    [cb beginCommandBufferWithAllocator:allocator];
+    for (int pass = 0; pass < 2; pass++) {
+        MTL4RenderPassDescriptor *desc = [MTL4RenderPassDescriptor new];
+        MTLRenderPassAttachmentDescriptor *attachment = resolve ? desc.colorAttachments[0] : desc.depthAttachment;
+        attachment.texture = target;
+        attachment.resolveTexture = pass ? resolveB : resolveA;
+        attachment.loadAction = MTLLoadActionClear;
+        attachment.storeAction = resolve ? MTLStoreActionMultisampleResolve : store ? MTLStoreActionStore : MTLStoreActionDontCare;
+        id<MTL4RenderCommandEncoder> draw = [cb renderCommandEncoderWithDescriptor:desc];
+        if (!draw) return fail("attachment store encoder creation failed");
+        [draw endEncoding];
+    }
+    [cb endCommandBuffer];
+    return commit_and_wait(queue, cb);
+}
+
 /* A clear-and-store pass followed by a load-and-store pass with Fragment synchronization. */
 API_AVAILABLE(macos(26.0))
 static int run_attachments(id<MTLDevice> device, NSString *mode)
@@ -527,6 +573,7 @@ static int run(id<MTLDevice> device, NSString *mode)
     if ([mode hasPrefix:@"copy-"]) return run_reflection(device, mode);
     if ([mode isEqualToString:@"rw-texture"]) return run_rw_texture(device);
     if ([mode hasPrefix:@"load-"]) return run_attachments(device, mode);
+    if ([mode hasPrefix:@"store-"]) return run_attachment_stores(device, mode);
     if ([mode hasPrefix:@"consumer-"] || [mode hasPrefix:@"chain-"]) return run_consumer_barriers(device, mode);
 
     id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
@@ -685,6 +732,7 @@ int main(int argc, const char **argv)
                         @"load-early", @"load-late", @"load-fence-early", @"load-fence-late", @"load-fence-drawless",
                         @"load-fence-multiple", @"load-fence-before", @"load-fence-split",
                         @"load-fence-late-split", @"load-producer", @"load-producer-before",
+                        @"store-depth-discard", @"store-depth", @"store-resolve-separate", @"store-resolve-same",
                         @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
                         @"consumer-intervening", @"chain-empty", @"chain-before-blit", @"chain-blit", @"chain-fence",
                         @"copy-compute", @"copy-compute-async", @"copy-render", @"copy-render-async", @"rw-texture"]

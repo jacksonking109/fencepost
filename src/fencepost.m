@@ -116,6 +116,12 @@ typedef struct {
 typedef struct { uint64_t uid, seq; uint32_t epoch; } fp4_prefix;
 typedef struct { fp4_prefix cut[FP4_STAGE_COUNT][FP4_STAGE_COUNT]; } fp4_prefixes;
 typedef struct { uint32_t epoch; uint16_t mask; } fp4_work_epoch;
+typedef struct {
+    MTLRenderPassAttachmentDescriptor *desc;
+    NSUInteger layers;
+    MTLStoreAction action;
+    int slot;
+} fp_deferred_att;
 
 struct fp_queue;
 typedef struct fp_node {
@@ -124,7 +130,8 @@ typedef struct fp_node {
     int kind, state, idx;           /* state: 1 encoding, 2 ended, 3 committed, 4 analysed */
     void *enc;
     uint8_t uncertain, exempt, mtl4, mtl4_drawn;   /* mtl4_drawn: a draw or dispatch was encoded */
-    int att[10];                    /* acc index of colour 0-7, depth, stencil attachments */
+    uint8_t mtl4_has_attachment;
+    fp_deferred_att *deferred_att; int ndeferred_att, cdeferred_att;
     char label[64];
     fp_acc *acc;     int nacc, cacc;
     fp_fwait *fw;    int nfw, cfw;
@@ -270,6 +277,12 @@ static fp_node *node_get(uint64_t uid)
     return uid && n->uid == uid ? n : NULL;
 }
 
+static void clear_deferred_attachments(fp_node *n)
+{
+    for (int i = 0; i < n->ndeferred_att; i++) [n->deferred_att[i].desc release];
+    n->ndeferred_att = 0;
+}
+
 static fp_node *node_new(int kind)   /* lock held */
 {
     uint64_t uid = ++g_uid;
@@ -288,11 +301,11 @@ static fp_node *node_new(int kind)   /* lock held */
     if (n->uid && n->state && n->state < 4) g_st[ST_LOST]++;
     n->uid = uid; n->aseq = 0; n->cb_uid = 0; n->commit_tick = 0; n->done_tick = 0; n->pend_since = 0;
     n->kind = kind; n->state = 1; n->idx = 0; n->enc = NULL; n->uncertain = 0; n->exempt = 0; n->label[0] = 0;
-    n->mtl4 = 0; n->mtl4_drawn = 0;
+    n->mtl4 = 0; n->mtl4_drawn = 0; n->mtl4_has_attachment = 0;
     n->req_q = NULL; n->req_mark = 0; n->bar_cb = 0; n->bar_idx = 0;
     n->frame = 0; n->queue_seq = 0; n->chain_prev = 0; n->depth = 0;
     n->nacc = n->nfw = n->nfu = n->ned = n->nev = 0;
-    for (int i = 0; i < 10; i++) n->att[i] = -1;
+    clear_deferred_attachments(n);
     return n;
 }
 
@@ -3781,26 +3794,41 @@ static int stages_last(NSUInteger st)
     return (st & (MTLRenderStageFragment | MTLRenderStageTile)) ? 1 : 0;
 }
 
+static void record_attachment(fp_node *n, id<MTLTexture> t, MTLRenderPassAttachmentDescriptor *d,
+                              NSUInteger layers, MTLStoreAction sa)
+{
+    MTLLoadAction la = d.loadAction;
+    int rw = la == MTLLoadActionLoad ? FP_RD : 0;
+    if (sa == MTLStoreActionStore || sa == MTLStoreActionStoreAndMultisampleResolve ||
+        sa == MTLStoreActionCustomSampleDepthStore) rw |= FP_WR;
+    if (rw) {
+        uint32_t slice = t.textureType == MTLTextureType3D ? 0 : (uint32_t)d.slice;
+        acc_tex(n, t, d.level, 1, slice, (uint32_t)MAX(1, layers), rw, 1, 1,
+                la == MTLLoadActionLoad ? VIA_ATT_LOAD : VIA_ATT);
+    }
+    if (sa == MTLStoreActionMultisampleResolve || sa == MTLStoreActionStoreAndMultisampleResolve)
+        acc_tex(n, d.resolveTexture, d.resolveLevel, 1, (uint32_t)d.resolveSlice, 1, FP_WR, 1, 1, VIA_RESOLVE);
+}
+
 static void att(fp_node *n, int slot, MTLRenderPassAttachmentDescriptor *d, NSUInteger layers)
 {
     id<MTLTexture> t = d.texture;
     if (!t) return;
-    MTLLoadAction la = d.loadAction;
     MTLStoreAction sa = d.storeAction;
-    int rw = (la == MTLLoadActionLoad ? FP_RD : 0) | ((la == MTLLoadActionLoad && sa == MTLStoreActionDontCare) ? 0 : FP_WR);
-    uint32_t slice = t.textureType == MTLTextureType3D ? 0 : (uint32_t)d.slice;
-    n->att[slot] = acc_tex(n, t, d.level, 1, slice, layers > 1 ? (uint32_t)layers : 1, rw, 1, 1,
-                           la == MTLLoadActionLoad ? VIA_ATT_LOAD : VIA_ATT);
-    if (d.resolveTexture && (sa == MTLStoreActionMultisampleResolve || sa == MTLStoreActionStoreAndMultisampleResolve))
-        acc_tex(n, d.resolveTexture, d.resolveLevel, 1, (uint32_t)d.resolveSlice, 1, FP_WR, 1, 1, VIA_RESOLVE);
+    if (n->mtl4) n->mtl4_has_attachment = 1;
+    if (!n->mtl4 && sa == MTLStoreActionUnknown) {
+        /* Metal 3 finalizes Unknown with set*StoreAction: before endEncoding. */
+        fp_deferred_att deferred = { [d copy], layers, sa, slot };
+        PUSH(n->deferred_att, n->ndeferred_att, n->cdeferred_att, deferred);
+    } else record_attachment(n, t, d, layers, sa);
 }
 
 static void store_action(id enc, int slot, MTLStoreAction sa)   /* a deferred store action arrives */
 {
     fp_node *n = cur_node(enc);
-    if (!n || n->att[slot] < 0 || n->att[slot] >= n->nacc) return;
-    fp_acc *a = &n->acc[n->att[slot]];
-    if (a->via == VIA_ATT_LOAD) a->rw = sa == MTLStoreActionDontCare ? FP_RD : (FP_RD | FP_WR);
+    if (!n) return;
+    for (int i = 0; i < n->ndeferred_att; i++)
+        if (n->deferred_att[i].slot == slot) n->deferred_att[i].action = sa;
 }
 
 /* ---------------------------------------------------------------- hooking */
@@ -6042,7 +6070,7 @@ static void trace_mtl4_end_encoder(id enc, const fp_node *n)
 
     int work = n->mtl4_drawn;
     if (n->kind == FPK_RENDER) {
-        for (int i = 0; !work && i < 10; i++) work = n->att[i] >= 0;
+        work |= n->mtl4_has_attachment;
     } else {
         work = [(id<MTL4ComputeCommandEncoder>)enc stages] != 0;
     }
@@ -6067,6 +6095,11 @@ static void h_end(id self, SEL _cmd)
     if (!OUTER) return;
     if (!n) n = cur_node(self);
     if (!n) return;
+    for (int i = 0; i < n->ndeferred_att; i++) {
+        fp_deferred_att *deferred = &n->deferred_att[i];
+        record_attachment(n, deferred->desc.texture, deferred->desc, deferred->layers, deferred->action);
+    }
+    clear_deferred_attachments(n);
     NSString *l = [self label];
     if (n->mtl4) {
         if (!n->mtl4_drawn && n->kind == FPK_RENDER) fp4_note_attachment_loads(n);

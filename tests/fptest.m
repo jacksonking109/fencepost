@@ -137,6 +137,67 @@ static void checkframe(const char *name, long want_frames, long want_enc, long w
 #define VERT MTLRenderStageVertex
 #define RD MTLResourceUsageRead
 
+static int attachment_tests(void)
+{
+    MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        width:64 height:64 mipmapped:NO];
+    depthDesc.usage = MTLTextureUsageRenderTarget;
+    depthDesc.storageMode = MTLStorageModePrivate;
+    depthDesc.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+    MTLTextureDescriptor *msaaDesc = [depthDesc copy];
+    msaaDesc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    msaaDesc.textureType = MTLTextureType2DMultisample;
+    msaaDesc.sampleCount = 4;
+    const struct {
+        const char *name;
+        MTLStoreAction action;
+        BOOL deferred, load, sameResolve;
+        long races;
+    } cases[] = {
+        { "depth clear discard", MTLStoreActionDontCare, NO, NO, NO, 0 },
+        { "depth clear store", MTLStoreActionStore, NO, NO, NO, 1 },
+        { "depth clear deferred discard", MTLStoreActionDontCare, YES, NO, NO, 0 },
+        { "depth clear deferred store", MTLStoreActionStore, YES, NO, NO, 1 },
+        { "depth load deferred discard still reads", MTLStoreActionDontCare, YES, YES, NO, 1 },
+        { "MSAA resolve to separate targets", MTLStoreActionMultisampleResolve, NO, NO, NO, 0 },
+        { "deferred MSAA resolve to separate targets", MTLStoreActionMultisampleResolve, YES, NO, NO, 0 },
+        { "deferred MSAA resolve writes the target", MTLStoreActionMultisampleResolve, YES, NO, YES, 1 },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+        BOOL resolve = cases[i].action == MTLStoreActionMultisampleResolve;
+        id<MTLTexture> target = [dev newTextureWithDescriptor:resolve ? msaaDesc : depthDesc];
+        id<MTLTexture> resolveA = resolve ? tex(1, 1) : nil;
+        id<MTLTexture> resolveB = resolve && !cases[i].sameResolve ? tex(1, 1) : resolveA;
+        id<MTLCommandBuffer> cb = [q1 commandBuffer];
+        if (!target || !cb || (resolve && (!resolveA || !resolveB))) return 1;
+        for (int pass = 0; pass < 2; pass++) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            MTLRenderPassAttachmentDescriptor *att = resolve ? rp.colorAttachments[0] : rp.depthAttachment;
+            BOOL load = pass && cases[i].load;
+            BOOL deferred = cases[i].deferred && (pass || !cases[i].load);
+            MTLStoreAction action = !pass && cases[i].load ? MTLStoreActionStore : cases[i].action;
+            att.texture = target;
+            att.resolveTexture = pass ? resolveB : resolveA;
+            att.loadAction = load ? MTLLoadActionLoad : MTLLoadActionClear;
+            att.storeAction = deferred ? MTLStoreActionUnknown : action;
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+            if (!enc) return 1;
+            if (deferred && resolve) [enc setColorStoreAction:action atIndex:0];
+            if (deferred && !resolve) [enc setDepthStoreAction:action];
+            [enc endEncoding];
+        }
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return 1;
+        check(cases[i].name, cases[i].races, 0);
+        if (resolveB != resolveA) [resolveB release];
+        [resolveA release];
+        [target release];
+    }
+    [msaaDesc release];
+    return 0;
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -347,6 +408,10 @@ int main(void)
             long got = s1[S_GPU_IDLE] - s0[S_GPU_IDLE];
             total++; if (got != 1) fails++;
             fprintf(stderr, "%s %-58s idle %ld/1 (got/want)\n\n", got == 1 ? "[ok]  " : "[FAIL]", "commit after the GPU ran dry", got);
+        }
+        if (attachment_tests()) {
+            fprintf(stderr, "fptest: attachment test setup or execution failed\n");
+            return 1;
         }
         fprintf(stderr, "fptest: %d/%d passed\n", total - fails, total);
     }
