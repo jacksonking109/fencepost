@@ -23,6 +23,7 @@ WHY = {
     "fragment-vertex": "queue barrier Blit -> Vertex does not order Blit -> Fragment",
     "compiler-race": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "load-late": "queue barrier Fragment -> Fragment does not order Fragment -> Fragment",
+    "load-fence-late": "no Metal 4 ordering covers Fragment -> Fragment",
     "consumer-intervening": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-empty": "no Metal 4 ordering covers Dispatch -> Dispatch",
     "chain-before-blit": "no Metal 4 ordering covers Dispatch -> Dispatch",
@@ -70,7 +71,7 @@ def check_run(arch, directory, program, mode, env, run_index, **extra):
         assert summary["accesses"] == 4, summary
     if mode == "placement":
         assert summary["accesses"] == 3, summary
-    if mode == "load-late":
+    if mode in ("load-late", "load-fence-late"):
         assert "  second: " in result.stderr and "attachment load" in result.stderr, result.stderr
     if mode == "order":
         assert "Blit -> Blit is unordered" in result.stderr, result.stderr
@@ -88,7 +89,8 @@ def check_suite(arch, directory):
     for mode in ("producer", "fence", "fence-missing", "commits", "commits-barrier", "color-fragment",
                  "color-vertex", "mutate", "disjoint", "overlap", "placement", "order", "partial",
                  "const-shared", "fragment-only", "fragment-vertex", "reflect-app", "compiler-race",
-                 "load-early", "load-late", "consumer-buffer", "consumer-buffers", "consumer-commits",
+                 "load-early", "load-late", "load-fence-early", "load-fence-late", "load-fence-drawless",
+                 "load-fence-multiple", "load-producer", "consumer-buffer", "consumer-buffers", "consumer-commits",
                  "consumer-intervening", "chain-empty", "chain-before-blit", "chain-blit", "chain-fence"):
         check_case(arch, directory, "mtl4races", mode, env)
     possible = directory / "rw"
@@ -111,4 +113,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 34 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 39 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")

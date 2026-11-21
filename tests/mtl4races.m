@@ -183,8 +183,7 @@ static BOOL binding_access(NSArray<id<MTLBinding>> *bindings, NSUInteger index, 
     return NO;
 }
 
-/* Attachment loads against queue barriers: a clear-and-store pass, then a load-and-store pass
- * whose Fragment -> Fragment consumer barrier comes before its first draw or between draws. */
+/* A clear-and-store pass followed by a load-and-store pass with Fragment synchronization. */
 API_AVAILABLE(macos(26.0))
 static int run_attachments(id<MTLDevice> device, NSString *mode)
 {
@@ -210,8 +209,13 @@ static int run_attachments(id<MTLDevice> device, NSString *mode)
     [residency commit];
     [queue addResidencySet:residency];
 
+    BOOL fences = [mode hasPrefix:@"load-fence-"], drawless = [mode hasSuffix:@"-drawless"];
+    BOOL early = ![mode hasSuffix:@"-late"], producer = [mode hasSuffix:@"-producer"];
+    BOOL multiple = [mode hasSuffix:@"-multiple"];
+    __attribute__((objc_precise_lifetime)) id<MTLFence> first = fences ? [device newFence] : nil;
+    __attribute__((objc_precise_lifetime)) id<MTLFence> second = multiple ? [device newFence] : nil;
+    if ((fences && !first) || (multiple && !second)) return fail("fence creation failed");
     [cb beginCommandBufferWithAllocator:allocator];
-    BOOL early = [mode isEqualToString:@"load-early"];
     for (int pass = 0; pass < 2; pass++) {
         MTL4RenderPassDescriptor *desc = [MTL4RenderPassDescriptor new];
         desc.colorAttachments[0].texture = target;
@@ -221,14 +225,24 @@ static int run_attachments(id<MTLDevice> device, NSString *mode)
         if (!draw) return fail("render encoder creation failed");
         draw.label = pass ? @"load" : @"clear";
         [draw setRenderPipelineState:pipeline];
-        if (pass && early)
-            [draw barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageFragment
+        if (pass && early) {
+            if (first) [draw waitForFence:first beforeEncoderStages:MTLStageFragment];
+            else if (!producer) [draw barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageFragment
                         visibilityOptions:MTL4VisibilityOptionDevice];
-        [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            if (second) [draw waitForFence:second beforeEncoderStages:MTLStageFragment];
+        }
+        if (!drawless) [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         if (pass && !early) {
-            [draw barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageFragment
+            if (first) [draw waitForFence:first beforeEncoderStages:MTLStageFragment];
+            else [draw barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageFragment
                         visibilityOptions:MTL4VisibilityOptionDevice];
             [draw drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        if (!pass) {
+            if (first) [draw updateFence:first afterEncoderStages:MTLStageFragment];
+            if (second) [draw updateFence:second afterEncoderStages:MTLStageFragment];
+            if (producer) [draw barrierAfterStages:MTLStageFragment beforeQueueStages:MTLStageFragment
+                                  visibilityOptions:MTL4VisibilityOptionDevice];
         }
         [draw endEncoding];
     }
@@ -530,7 +544,8 @@ int main(int argc, const char **argv)
         if (!mode || ![@[@"producer", @"fence", @"fence-missing", @"commits", @"commits-barrier", @"color-fragment",
                         @"color-vertex", @"mutate", @"disjoint", @"overlap", @"placement", @"order", @"partial",
                         @"const-shared", @"fragment-only", @"fragment-vertex", @"reflect-app", @"compiler-race",
-                        @"load-early", @"load-late", @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
+                        @"load-early", @"load-late", @"load-fence-early", @"load-fence-late", @"load-fence-drawless",
+                        @"load-fence-multiple", @"load-producer", @"consumer-buffer", @"consumer-buffers", @"consumer-commits",
                         @"consumer-intervening", @"chain-empty", @"chain-before-blit", @"chain-blit", @"chain-fence"]
                        containsObject:mode])
             return fail("expected a named Metal 4 race case");

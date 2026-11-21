@@ -136,7 +136,7 @@ typedef struct fp_node {
     int bar_idx;
     uint64_t frame, queue_seq, chain_prev;   /* chain_prev: earlier node on the longest ordered chain */
     uint32_t depth;                 /* encoders on that chain within the frame, this one included */
-    uint32_t mtl4_epoch, mtl4_work;
+    uint32_t mtl4_epoch, mtl4_work, mtl4_store_epoch;
     uint32_t mtl4_first[FP4_STAGE_COUNT], mtl4_last[FP4_STAGE_COUNT];
     uint64_t mtl4_previous;
     fp4_sync *mtl4_sync; int mtl4_nsync, mtl4_csync;
@@ -279,7 +279,7 @@ static fp_node *node_new(int kind)   /* lock held */
     memset(n->mtl4_tables, 0, sizeof n->mtl4_tables);
     n->mtl4_pipeline = nil; n->mtl4_pipeline_object = NULL; n->mtl4_pipeline_serial = 0;
     memset(n->mtl4_versions, 0, sizeof n->mtl4_versions);
-    n->mtl4_epoch = 1; n->mtl4_work = 0;
+    n->mtl4_epoch = 1; n->mtl4_work = 0; n->mtl4_store_epoch = 0;
     n->mtl4_previous = 0; n->mtl4_nsync = 0; n->mtl4_nwork_epochs = 0;
     free(n->mtl4_prefixes); n->mtl4_prefixes = NULL;
     memset(n->mtl4_first, 0, sizeof n->mtl4_first);
@@ -2355,37 +2355,50 @@ static int covers(const fp_acc *a, const fp_acc *b)   /* a's range contains b's 
     return a->a0 <= b->a0 && a->a1 >= b->a1 && (!a->is_tex || (a->s0 <= b->s0 && a->s1 >= b->s1));
 }
 
-typedef struct { fp_node *node; uint32_t epoch; uint8_t stage; } fp4_visit;
+typedef struct { fp_node *node; uint32_t epoch; uint8_t stage, stores_only; } fp4_visit;
 static fp4_visit *g_fp4_worklist;
 static int g_fp4_nwork, g_fp4_cwork;
 static uint64_t g_fp4_query;
-static struct { uint64_t query; uint32_t epoch; } g_fp4_seen[FP_POOL][FP4_STAGE_COUNT];
+static struct { uint64_t query; uint32_t epoch; } g_fp4_seen[FP_POOL][FP4_STAGE_COUNT + 1];
 
-static void fp4_push_visit(fp_node *n, unsigned mask, uint32_t epoch)
+static void fp4_visit_work(fp_node *n, int stage, uint32_t epoch, int stores_only)
 {
-    if (n->kind == FPK_SIGNAL) mask = 1;
+    unsigned slot = n->uid % FP_POOL, lane = stores_only ? FP4_STAGE_COUNT : stage;
+    if (g_fp4_seen[slot][lane].query == g_fp4_query && g_fp4_seen[slot][lane].epoch >= epoch) return;
+    g_fp4_seen[slot][lane].query = g_fp4_query;
+    g_fp4_seen[slot][lane].epoch = epoch;
+    fp4_visit visit = { n, epoch, stage, stores_only };
+    PUSH(g_fp4_worklist, g_fp4_nwork, g_fp4_cwork, visit);
+}
+
+static uint32_t fp4_last_work_before(const fp_node *n, int stage, uint32_t epoch)
+{
+    if (n->mtl4_first[stage] > epoch) return 0;
+    if (n->mtl4_last[stage] <= epoch) return n->mtl4_last[stage];
+    for (int i = n->mtl4_nwork_epochs - 1; i >= 0; i--) {
+        const fp4_work_epoch *work = &n->mtl4_work_epochs[i];
+        if (work->epoch <= epoch && (work->mask & FP4_STAGE(stage))) return work->epoch;
+    }
+    return 0;
+}
+
+static void fp4_push_visit(fp_node *n, unsigned mask, uint32_t epoch, int include_stores)
+{
+    if (n->kind == FPK_SIGNAL) {
+        fp4_visit_work(n, 0, epoch, 0);
+        return;
+    }
     /* A barrier alone cannot bridge a stage. Visit only recorded work at or before the cut. */
-    else mask &= n->mtl4_work;
+    mask &= n->mtl4_work;
+    /* A render update/producer barrier covers attachment stores at pass end without
+     * moving its cutoff for ordinary commands encoded after it. */
+    if (include_stores && (mask & FP4_STAGE(FP4_FRAGMENT)) && n->mtl4_store_epoch > epoch)
+        fp4_visit_work(n, FP4_FRAGMENT, n->mtl4_store_epoch, 1);
     while (mask) {
         int stage = __builtin_ctz(mask);
         mask &= mask - 1;
-        uint32_t last = epoch;
-        if (n->kind != FPK_SIGNAL) {
-            if (n->mtl4_first[stage] > epoch) continue;
-            last = n->mtl4_last[stage];
-            if (last > epoch) {
-                for (int i = n->mtl4_nwork_epochs - 1; i >= 0; i--) {
-                    const fp4_work_epoch *work = &n->mtl4_work_epochs[i];
-                    if (work->epoch <= epoch && (work->mask & FP4_STAGE(stage))) { last = work->epoch; break; }
-                }
-            }
-        }
-        unsigned slot = n->uid % FP_POOL;
-        if (g_fp4_seen[slot][stage].query == g_fp4_query && g_fp4_seen[slot][stage].epoch >= last) continue;
-        g_fp4_seen[slot][stage].query = g_fp4_query;
-        g_fp4_seen[slot][stage].epoch = last;
-        fp4_visit visit = { n, last, stage };
-        PUSH(g_fp4_worklist, g_fp4_nwork, g_fp4_cwork, visit);
+        uint32_t last = fp4_last_work_before(n, stage, epoch);
+        if (last) fp4_visit_work(n, stage, last, 0);
     }
 }
 
@@ -2394,14 +2407,15 @@ static int fp4_walk_prefix(const fp_node *dst, fp4_prefix prefix, unsigned after
 {
     if (!prefix.uid) return 0;
     if (dst->req_q == from->req_q && (after & FP4_STAGE(from_stage)) &&
-        (from->queue_seq < prefix.seq || (from->queue_seq == prefix.seq && from_epoch <= prefix.epoch)))
+        (from->queue_seq < prefix.seq || (from->queue_seq == prefix.seq &&
+         (from_epoch <= prefix.epoch || (from_stage == FP4_FRAGMENT && from_epoch == from->mtl4_store_epoch)))))
         return 1;
 
     uint32_t epoch = prefix.epoch;
     for (fp_node *p = node_get(prefix.uid); p && p->aseq >= from->aseq; p = node_get(p->mtl4_previous)) {
         /* A queue barrier names work stages, not queue signal operations.
          * The signal's own prefix is entered via an event edge instead. */
-        if (p->kind != FPK_SIGNAL) fp4_push_visit(p, after, epoch);
+        if (p->kind != FPK_SIGNAL) fp4_push_visit(p, after, epoch, 1);
         epoch = UINT32_MAX;
     }
     return 0;
@@ -2421,11 +2435,12 @@ static int fp4_reaches(fp_node *from, int from_stage, uint32_t from_epoch,
     if (from->done_tick && from->done_tick < to->commit_tick) return 1;
     g_fp4_query++;
     g_fp4_nwork = 0;
-    fp4_push_visit(to, FP4_STAGE(to_stage), to_epoch);
+    fp4_push_visit(to, FP4_STAGE(to_stage), to_epoch, 0);
     while (g_fp4_nwork) {
         fp4_visit v = g_fp4_worklist[--g_fp4_nwork];
         fp_node *n = v.node;
-        if (from == n && v.stage == from_stage && from_epoch <= v.epoch) return 1;
+        if (from == n && v.stage == from_stage &&
+            (v.stores_only ? from_epoch == v.epoch : from_epoch <= v.epoch)) return 1;
         if (from->done_tick && from->done_tick < n->commit_tick) return 1;
         if (n->kind == FPK_SIGNAL && n->mtl4 &&
             fp4_walk_prefix(n, fp4_previous_prefix(n), FP4_ALL, from, from_stage, from_epoch))
@@ -2433,7 +2448,7 @@ static int fp4_reaches(fp_node *from, int from_stage, uint32_t from_epoch,
         for (int i = 0; i < n->ned; i++) {
             fp_node *p = node_get(n->ed[i].src);
             if (p && p->aseq >= from->aseq)
-                fp4_push_visit(p, FP4_ALL, UINT32_MAX);
+                fp4_push_visit(p, FP4_ALL, UINT32_MAX, 0);
         }
         if (n->mtl4_prefixes) {
             for (int a = 0; a < FP4_STAGE_COUNT; a++)
@@ -2452,7 +2467,7 @@ static int fp4_reaches(fp_node *from, int from_stage, uint32_t from_epoch,
                     for (int j = 0; j < p->mtl4_nsync; j++) {
                         const fp4_sync *update = &p->mtl4_sync[j];
                         if (update->kind == FP4_FENCE_UPDATE && update->fence == sync->fence)
-                            fp4_push_visit(p, update->after, update->epoch);
+                            fp4_push_visit(p, update->after, update->epoch, 1);
                     }
                 }
             }
@@ -2497,7 +2512,11 @@ static int fp4_barrier_stages(fp_node *x, fp_node *y)
         int covered = 1;
         for (unsigned after = x->mtl4_work; after; after &= after - 1) {
             int a = __builtin_ctz(after);
-            if (!fp4_reaches(x, a, x->mtl4_last[a], y, b, y->mtl4_first[b])) {
+            uint32_t last = x->mtl4_last[a];
+            uint32_t before_store = a == FP4_FRAGMENT && last == x->mtl4_store_epoch
+                ? fp4_last_work_before(x, a, last - 1) : 0;
+            if (!fp4_reaches(x, a, last, y, b, y->mtl4_first[b]) ||
+                (before_store && !fp4_reaches(x, a, before_store, y, b, y->mtl4_first[b]))) {
                 covered = 0;
                 break;
             }
@@ -5693,10 +5712,12 @@ static void h_end(id self, SEL _cmd)
     NSString *l = [self label];
     if (n->mtl4) {
         if (!n->mtl4_drawn && n->kind == FPK_RENDER) fp4_note_attachment_loads(n);
+        if (n->kind == FPK_RENDER) n->mtl4_epoch++;   /* distinguish stores from the last ordinary commands */
         for (int i = 0, count = n->nacc; i < count; i++) {
             fp_acc *access = &n->acc[i];
             if (access->via != VIA_ATT && access->via != VIA_ATT_LOAD && access->via != VIA_RESOLVE) continue;
             if (!(access->rw & FP_WR)) continue;
+            n->mtl4_store_epoch = n->mtl4_epoch;
             fp4_note_work(n, FP4_FRAGMENT);
             /* The store happens at the end of the pass (see fp4_record_sync). */
             if (access->via == VIA_ATT_LOAD) {

@@ -158,7 +158,8 @@ submission. Reports name the stages of both accesses.
 Render attachments load at the start of the pass and store at its end, both in the Fragment stage. Apple's
 documentation does not say whether a consumer barrier or fence wait inside a render encoder orders the load, so
 fencepost decides conservatively: one encoded before the encoder's first draw covers the attachment loads and
-stores; one encoded after a draw covers the stores only.
+stores; one encoded after a draw covers the stores only. A Fragment fence update or producer barrier on the
+render pass covers its attachment stores at pass end.
 
 Fencepost submits `commit:count:` as `commit:count:options:` with fresh options for its own feedback. For
 app options it tracks, it transfers the registered handlers to fresh options for that submission. Each handler
