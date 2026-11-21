@@ -150,34 +150,14 @@ static int probe(id<MTLDevice> device, NSString *test)
         }];
     }
 
-    dispatch_semaphore_t releaseFeedback = nil;
-    __attribute__((objc_precise_lifetime)) id<MTLBuffer> warmBuffer = nil;
-    __attribute__((objc_precise_lifetime)) id<MTL4CommandAllocator> warmAllocator = nil;
+    id<MTLSharedEvent> gate = nil;
     if (late) {
-        /* Block delivery on this queue's serial feedback queue only. A
-         * fast GPU must not make the producer complete from the CPU's
-         * point of view before the deliberately early wait is submitted. */
-        releaseFeedback = dispatch_semaphore_create(0);
-        dispatch_semaphore_t blocked = dispatch_semaphore_create(0);
-        warmBuffer = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
-        warmAllocator = [device newCommandAllocator];
-        id<MTL4CommandBuffer> warm = [device newCommandBuffer];
-        if (!warmBuffer || !warmAllocator || !warm) return failure(@"warm-up setup failed", nil);
-        [residency addAllocation:warmBuffer];
-        [residency commit];
-        [warm beginCommandBufferWithAllocator:warmAllocator];
-        id<MTL4ComputeCommandEncoder> fill = [warm computeCommandEncoder];
-        if (!fill) return failure(@"warm-up encoder creation failed", nil);
-        [fill fillBuffer:warmBuffer range:NSMakeRange(0, 16) value:0];
-        [fill endEncoding];
-        [warm endCommandBuffer];
-        MTL4CommitOptions *warmOptions = [MTL4CommitOptions new];
-        [warmOptions addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
-            dispatch_semaphore_signal(blocked);
-            dispatch_semaphore_wait(releaseFeedback, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
-        }];
-        [producer commit:&warm count:1 options:warmOptions];
-        if (!waitForFeedback(blocked, @"warm-up", nil)) return 1;
+        /* The producer queue waits for a gate the CPU opens only after the consumer is
+         * committed, so the producer cannot complete, from the CPU's point of view, before
+         * the deliberately early wait is submitted. Every wait has a committed or CPU signal. */
+        gate = [device newSharedEvent];
+        if (!gate) return failure(@"gate event creation failed", nil);
+        [producer waitForEvent:gate value:1];
         [producer signalEvent:event value:1];
     }
     [producer commit:&commands count:1 options:writeCommit];
@@ -187,7 +167,7 @@ static int probe(id<MTLDevice> device, NSString *test)
         [consumer waitForEvent:event value:late ? 1 : 2];
         [consumer commit:&readCommands count:1 options:readCommit];
     }
-    if (releaseFeedback) dispatch_semaphore_signal(releaseFeedback);
+    if (gate) gate.signaledValue = 1;
     if (!waitForFeedback(writeDone, crossQueue ? @"producer" : @"workload", event) ||
         (crossQueue && !waitForFeedback(readDone, @"consumer", event))) return 1;
     if (writeError) return failure(@"producer workload failed", writeError);

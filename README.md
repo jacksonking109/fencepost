@@ -391,6 +391,7 @@ python3 -I tests/mtl4_check.py arm64 --threads
 python3 -I tests/mtl4_check.py x86_64 --threads
 python3 -I tests/mtl4_race_check.py arm64
 python3 -I tests/mtl4_race_check.py x86_64
+python3 -I tests/mtl4_overhead.py                            # CPU overhead table, both slices
 ```
 
 `tests/fptest.m` holds 35 small Metal programs with and without the synchronisation they need, each with the number of
@@ -410,7 +411,9 @@ to check that the app still gets its own timestamps when tracing is on.
 macOS session. Check the global hotkey by hand as described above.
 
 On a Metal 4 device, `mtl4bench metal4-commit` measures CPU time for small submissions with up to eight in
-flight. `mtl4frames --long` checks frame chain depth over 512 frames. `./build.sh` also builds
+flight, and `mtl4bench pipelines` times compute pipeline builds through `MTL4Compiler` and the device.
+`tests/mtl4_overhead.py` runs each with and without fencepost, three times per slice, and prints the medians.
+`tests/mtl4_race_check.py` runs every Metal 4 verdict case three times per slice. `mtl4frames --long` checks frame chain depth over 512 frames. `./build.sh` also builds
 `out/libfencepost-testhooks.dylib` for checking live trace records, retired queue signals, and synthetic errors.
 In that build,
 `FENCEPOST_MTL4_TEST_ERROR_COMMIT` selects a submission by its one-based number for simulated feedback errors.

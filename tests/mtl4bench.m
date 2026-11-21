@@ -70,12 +70,11 @@ static BOOL runMetal3(id<MTLDevice> device, id<MTLRenderPipelineState> pipeline,
 }
 
 API_AVAILABLE(macos(26.0))
-static BOOL runMetal4(id<MTLDevice> device, id<MTLRenderPipelineState> pipeline,
+static BOOL runMetal4(id<MTLDevice> device, id<MTL4CommandQueue> queue, id<MTLRenderPipelineState> pipeline,
                       id<MTLBuffer> vertexBuffer, NSArray<id<MTLTexture>> *textures,
                       NSArray<id<MTLTexture>> *targets, NSUInteger draws, BOOL commit_heavy,
                       uint64_t *ticks)
 {
-    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
     id<MTL4CommandBuffer> commands = [device newCommandBuffer];
     if (!queue || !commands) return failure(@"Metal 4 command setup failed", nil);
 
@@ -162,6 +161,57 @@ static int compareTicks(const void *a, const void *b)
     return (first > second) - (first < second);
 }
 
+/* Pipeline creation time, the cost of the binding reflection fencepost requests. A distinct
+ * constant per library keeps the pipelines distinct within a run; repeated runs reuse
+ * Metal's shader cache, so the medians measure pipeline building rather than compiling. */
+API_AVAILABLE(macos(26.0))
+static int pipelines(void)
+{
+    enum { Count = 20 };
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device || ![device supportsFamily:MTLGPUFamilyMetal4]) { puts("skip: Metal 4 family unsupported"); return 0; }
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    NSError *error = nil;
+    id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+    if (!queue || !compiler) { failure(@"Metal 4 compiler setup failed", error); return 1; }
+    mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    double medians[2];
+    for (int path = 0; path < 2; path++) {
+        uint64_t ticks[Count];
+        for (int i = 0; i < Count; i++) @autoreleasepool {
+            NSString *source = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
+                "constant uint salt = %d;\n"
+                "kernel void k(const device uint *in [[buffer(0)]], device uint *out [[buffer(1)]],"
+                " uint i [[thread_position_in_grid]]) { out[i] = in[i] + salt; }\n", path * Count + i];
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+            if (!library) { failure(@"shader compilation failed", error); return 1; }
+            id pipeline;
+            uint64_t start;
+            if (path == 0) {
+                MTL4LibraryFunctionDescriptor *function = [MTL4LibraryFunctionDescriptor new];
+                function.library = library;
+                function.name = @"k";
+                MTL4ComputePipelineDescriptor *desc = [MTL4ComputePipelineDescriptor new];
+                desc.computeFunctionDescriptor = function;
+                start = mach_absolute_time();
+                pipeline = [compiler newComputePipelineStateWithDescriptor:desc compilerTaskOptions:nil error:&error];
+            } else {
+                id<MTLFunction> function = [library newFunctionWithName:@"k"];
+                start = mach_absolute_time();
+                pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+            }
+            ticks[i] = mach_absolute_time() - start;
+            if (!pipeline) { failure(@"pipeline creation failed", error); return 1; }
+        }
+        qsort(ticks, Count, sizeof ticks[0], compareTicks);
+        medians[path] = (ticks[Count / 2 - 1] + ticks[Count / 2]) / 2.0 * timebase.numer / timebase.denom / 1e6;
+    }
+    printf("pipelines: %d fresh compute pipelines each, median %.4f ms MTL4Compiler, %.4f ms device\n",
+           Count, medians[0], medians[1]);
+    return 0;
+}
+
 static int benchmark(BOOL metal4, BOOL commit_heavy, NSUInteger draws)
 {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -181,6 +231,11 @@ static int benchmark(BOOL metal4, BOOL commit_heavy, NSUInteger draws)
         }
     }
 
+    // A Metal 4 program makes its queue before its pipelines, so they carry binding reflection.
+    id queue = nil;
+    if (metal4) {
+        if (@available(macOS 26.0, *)) queue = [device newMTL4CommandQueue];
+    }
     NSError *error = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:shader options:nil error:&error];
     if (!library) { failure(@"shader compilation failed", error); return 1; }
@@ -225,7 +280,7 @@ static int benchmark(BOOL metal4, BOOL commit_heavy, NSUInteger draws)
     BOOL complete;
     if (metal4) {
         if (@available(macOS 26.0, *))
-            complete = runMetal4(device, pipeline, vertexBuffer, textures, targets, draws, commit_heavy, ticks);
+            complete = runMetal4(device, queue, pipeline, vertexBuffer, textures, targets, draws, commit_heavy, ticks);
         else return 1;
     } else {
         complete = runMetal3(device, pipeline, vertexBuffer, textures, targets[0], draws, ticks);
@@ -260,8 +315,13 @@ int main(int argc, const char *argv[])
 {
     @autoreleasepool {
         BOOL commit_heavy = argc >= 2 && strcmp(argv[1], "metal4-commit") == 0;
+        if (argc == 2 && !strcmp(argv[1], "pipelines")) {
+            if (@available(macOS 26.0, *)) return pipelines();
+            puts("skip: Metal 4 requires macOS 26 or later");
+            return 0;
+        }
         if (argc < 2 || argc > 3 || (!commit_heavy && strcmp(argv[1], "metal3") && strcmp(argv[1], "metal4"))) {
-            fprintf(stderr, "usage: mtl4bench {metal3|metal4} [draws-per-frame] | metal4-commit [draws-per-commit]\n");
+            fprintf(stderr, "usage: mtl4bench {metal3|metal4} [draws-per-frame] | metal4-commit [draws-per-commit] | pipelines\n");
             return 2;
         }
         unsigned long draws = commit_heavy ? 4 : 10000;

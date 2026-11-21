@@ -10,6 +10,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNS = 3   # every verdict must hold on every run
 OUT = ROOT / "out"
 WHY = {
     "nobarrier": "no Metal 4 ordering covers Dispatch -> Dispatch",
@@ -35,7 +36,12 @@ def run(arch, program, mode, env, **knobs):
 
 
 def check_case(arch, directory, program, mode, env, **extra):
-    path = directory / (mode + ".json")
+    for run_index in range(RUNS):
+        check_run(arch, directory, program, mode, env, run_index, **extra)
+
+
+def check_run(arch, directory, program, mode, env, run_index, **extra):
+    path = directory / f"{mode}-{run_index}.json"
     knobs = {"FENCEPOST_TRACE": path, **extra}
     result = run(arch, program, mode, env, **knobs)
     races = [line for line in result.stderr.splitlines() if line.startswith(("fencepost: RACE ", "fencepost: possible race "))]
@@ -55,7 +61,8 @@ def check_case(arch, directory, program, mode, env, **extra):
             assert "bytes [0,262144)" in races[0], races
         if mode == "overlap":
             assert "bytes [16,64)" in races[0]
-        print(f"{arch} {mode} {races[0]}\n  {reason}", flush=True)
+        if not run_index:
+            print(f"{arch} {mode} {races[0]}\n  {reason}", flush=True)
     if mode == "mutate":
         assert summary["accesses"] == 4, summary
     if mode == "placement":
@@ -66,7 +73,8 @@ def check_case(arch, directory, program, mode, env, **extra):
         assert "Blit -> Blit is unordered" in result.stderr, result.stderr
     if mode == "partial":
         assert "Blit -> Dispatch|Blit is ordered only before Dispatch" in result.stderr, result.stderr
-    subprocess.run([sys.executable, "-I", ROOT / "tests/trace_check.py", path], check=True)
+    subprocess.run([sys.executable, "-I", ROOT / "tests/trace_check.py", path], check=True,
+                   stdout=subprocess.DEVNULL)
 
 
 def check_suite(arch, directory):
@@ -99,4 +107,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-races-") as directory:
         check_suite(args.arch, Path(directory))
-    print(f"{args.arch}: 26 Metal 4 verdicts, race ring dump and clean benchmark passed")
+    print(f"{args.arch}: 26 Metal 4 verdicts {RUNS} times each, race ring dump and clean benchmark passed")
