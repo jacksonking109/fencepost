@@ -757,6 +757,15 @@ static dispatch_queue_t g_capture_reporter;
 static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 static void capture_feedback_done(uint64_t generation, int failed);
 
+static void capture_mtl4_tracking_lost(void)
+{
+    pthread_mutex_lock(&g_lock);
+    g_capture_mtl4_unsafe = 1;
+    /* A factory must finish the transition before returning an unhooked object. */
+    while (g_capture_starting) pthread_cond_wait(&g_capture_started_cond, &g_lock);
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* Called with g_lock held. Keep the first request for the next unopened frame. */
 static void capture_request(const char *reason)
 {
@@ -4569,9 +4578,11 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
         if (blocked) return 1;
 
         BOOL started = NO;
+        BOOL threw = NO;
         @try {
             started = [manager startCaptureWithDescriptor:desc error:&error];
         } @catch (NSException *exception) {
+            threw = YES;
             fp_log("fencepost: capture failed: %s\n", exception.reason.UTF8String ?: exception.name.UTF8String);
         } @finally {
             pthread_mutex_lock(&g_lock);
@@ -4586,7 +4597,7 @@ static int capture_start(id owner, uint64_t frame, const char *reason)
             pthread_mutex_unlock(&g_lock);
         }
         if (!started) {
-            if (error) fp_log("fencepost: capture failed: %s\n", error.localizedDescription.UTF8String ?: "unknown error");
+            if (!threw) fp_log("fencepost: capture failed: %s\n", error.localizedDescription.UTF8String ?: "unknown error");
             return 0;
         }
 
@@ -4762,14 +4773,12 @@ static void capture_before_cb(id owner, int mtl4)
     pthread_mutex_lock(&g_capture_lock);
     capture_stop_at_boundary();
     pthread_mutex_lock(&g_lock);
-    uint64_t frame = g_capture_frame;
+    uint64_t frame = mtl4 ? g_frame_cur : g_capture_frame;
     int new_frame = frame > g_capture_opened && mtl4 == g_capture_mtl4;
-    /* A boundary whose submission has not returned is also too late if a
-     * concurrent begin has already started encoding the following frame. */
-    if (mtl4 && g_frame_cur > frame) {
-        g_capture_opened = MAX(g_capture_opened, g_frame_cur);
-        new_frame = 0;
-    }
+    /* Do not hold a new frame hostage to feedback that could depend on its
+     * work. If recording continues into this frame, wait for its end too. */
+    if (g_capture_generation && g_capture_mtl4)
+        g_capture_until = MAX(g_capture_until, g_frame_cur + 1);
     pthread_mutex_unlock(&g_lock);
     if (new_frame) {
         g_capture_opened = frame;
@@ -5068,12 +5077,9 @@ static id h_mtl4_dev_cb(id self, SEL _cmd)
         hook_mtl4_cb(cls);
         if (g_capture_available) {
             IMP end = class_getMethodImplementation(cls, sel_registerName("endCommandBuffer"));
+            if (end != (IMP)h_mtl4_end) capture_mtl4_tracking_lost();
             pthread_mutex_lock(&g_lock);
             g_capture_mtl4 = 1;
-            if (end != (IMP)h_mtl4_end) {
-                g_capture_mtl4_unsafe = 1;
-                while (g_capture_starting) pthread_cond_wait(&g_capture_started_cond, &g_lock);
-            }
             pthread_mutex_unlock(&g_lock);
         }
     }
@@ -6558,18 +6564,26 @@ static void h_mtl4_wait(id self, SEL _cmd, id event, uint64_t value)
 static void h_mtl4_drawable_signal(id self, SEL _cmd, id drawable)
 {
     ENTER;
-    uint64_t timestamp = OUTER && g_trace_enabled ? trace_clock() : 0;
-    ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
+    int capture_boundary = 0, returned = 0;
     if (OUTER) {
         pthread_mutex_lock(&g_lock);
         if (!g_frame_api) {
-            frame_boundary(timestamp, NULL);
+            if (g_capture_available) {
+                g_capture_commits++;
+                capture_boundary = 1;
+            }
+            frame_boundary(g_trace_enabled ? trace_clock() : 0, NULL);
             process_pending(0);
-            if (g_capture_available) capture_publish_frame();
         }
         pthread_mutex_unlock(&g_lock);
     }
-    LEAVE;
+    @try {
+        ORIG(H_4_DRAWABLE_SIGNAL, void (*)(id, SEL, id))(self, _cmd, drawable);
+        returned = 1;
+    } @finally {
+        if (capture_boundary) capture_after_commit(1, returned);
+        LEAVE;
+    }
 }
 
 static void h_mtl4_drawable_wait(id self, SEL _cmd, id drawable)
@@ -7264,7 +7278,14 @@ static void install(Class cls, int kind, const hook_def *defs, size_t n)
 static void hook_device(Class cls)
 {
     install(cls, 100, device_hooks, N(device_hooks));
-    if (@available(macOS 26.0, *)) install(cls, 104, mtl4_device_hooks, N(mtl4_device_hooks));
+    if (@available(macOS 26.0, *)) {
+        install(cls, 104, mtl4_device_hooks, N(mtl4_device_hooks));
+        if (g_capture_available) {
+            Method factory = class_getInstanceMethod(cls, sel_registerName("newCommandBuffer"));
+            if (factory && method_getImplementation(factory) != (IMP)h_mtl4_dev_cb)
+                capture_mtl4_tracking_lost();
+        }
+    }
 }
 static void hook_queue(Class cls) { install(cls, 101, queue_hooks, N(queue_hooks)); }
 static void hook_cb(Class cls) { install(cls, 102, cb_hooks, N(cb_hooks)); }
