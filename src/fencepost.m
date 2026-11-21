@@ -161,7 +161,7 @@ typedef struct fp_node {
     id mtl4_pipeline;               /* FP4PipelineTable of the bound pipeline, nil = access unknown */
     void *mtl4_pipeline_object;     /* the bound pipeline itself, compared only */
     uint32_t mtl4_pipeline_serial;
-    fp_bits anc[2];                 /* what is ordered before this node's vertex / fragment work */
+    fp_bits anc[2];                 /* ordered before vertex / fragment work; logically empty when ned == 0 */
 } fp_node;
 
 typedef struct { uint8_t type; uint64_t uid; void *ev; uint64_t val; } fp_item;   /* 0 encoder, 1 signal, 2 wait, 3 barrier, 4 frame end */
@@ -3003,7 +3003,7 @@ static int ordered(const fp_ent *e, fp_node *x, fp_node *y, const fp_acc *a)
     uint64_t d = y->aseq - e->aseq;
     if (d >= FP_W) { g_st[ST_WINDOW]++; return 1; }
     if (!e->a.mtl4_stage && !a->mtl4_stage) {
-        if (bit_test(&y->anc[a->sf], 2 * d + e->a.sl)) return 1;
+        if (y->ned && bit_test(&y->anc[a->sf], 2 * d + e->a.sl)) return 1;
         if (!atomic_load_explicit(&g_fp4_active, memory_order_relaxed)) return 0;
     }
     int from_stage = e->a.mtl4_stage ? __builtin_ctz(e->a.mtl4_stage) : e->a.sl;
@@ -3117,7 +3117,7 @@ static void check_barrier(fp_node *y)
                 if (!part) { part = x; partial_stages = covered; }
                 continue;
             }
-        } else {
+        } else if (y->ned) {
             if (bit_test(&y->anc[0], 2 * d + 1)) continue;
             if (bit_test(&y->anc[1], 2 * d + 1)) { if (!part) part = x; continue; }
         }
@@ -3200,7 +3200,7 @@ static void check_barrier(fp_node *y)
 static void analyse(fp_node *y)   /* lock held; every edge source is analysed or gone */
 {
     y->aseq = ++g_aseq;
-    memset(y->anc, 0, sizeof y->anc);
+    if (y->ned) memset(y->anc, 0, sizeof y->anc);
     uint32_t best = 0;
     if (y->mtl4 && y->kind == FPK_SIGNAL) {
         for (fp_node *x = node_get(y->mtl4_previous); x && x->frame == y->frame; x = node_get(x->mtl4_previous)) {
@@ -3218,9 +3218,11 @@ static void analyse(fp_node *y)   /* lock held; every edge source is analysed or
         fp_bits *t = &y->anc[e->before];
         bit_set(t, 2 * d);
         if (e->after) bit_set(t, 2 * d + 1);
-        bits_or_shift(t, &x->anc[e->after], 2 * d);
+        if (x->ned) bits_or_shift(t, &x->anc[e->after], 2 * d);
     }
-    for (int i = 0; i < FP_WORDS; i++) y->anc[1].w[i] |= y->anc[0].w[i];   /* fragment work starts after vertex work */
+    if (y->ned) {   /* fragment work starts after vertex work */
+        for (int i = 0; i < FP_WORDS; i++) y->anc[1].w[i] |= y->anc[0].w[i];
+    }
     y->state = 4;
     y->depth = best + (y->kind != FPK_SIGNAL);   /* an event signal passes its chain on */
     fp_frame *r = frame_of(y->frame);
