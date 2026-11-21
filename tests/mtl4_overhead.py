@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 from statistics import median
 import subprocess
+import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "out"
@@ -40,12 +42,42 @@ def samples(arch, mode, injected, env):
     return [bench(arch, mode, injected, env) for _ in range(RUNS)]
 
 
+def trace_timing(arches, env):
+    modes = ("metal4", "metal4-commit")
+    settings = ("off", "estimates", "samples")
+    print("| slice | measure | trace off | estimates | samples |\n|---|---|---|---|---|", flush=True)
+    with tempfile.TemporaryDirectory(prefix="fencepost-mtl4-timing-") as directory:
+        for arch in arches:
+            for mode, unit, pattern in (m for m in MEASURES if m[0] in modes):
+                timings = {setting: [] for setting in settings}
+                for run in range(RUNS):
+                    # Rotate the settings so none always runs with a cold GPU.
+                    for setting in settings[run:] + settings[:run]:
+                        knobs = dict(env)
+                        trace = Path(directory) / f"{arch}-{mode}-{setting}-{run}.json"
+                        if setting != "off":
+                            knobs.update(FENCEPOST_TRACE=str(trace), FENCEPOST_TRACE_GPU=str(int(setting == "samples")))
+                        result = bench(arch, mode, True, knobs)
+                        timings[setting].append(float(re.search(pattern, result)[1]))
+                        if setting != "off":
+                            cmd = [sys.executable, "-I", ROOT / "tests/trace_check.py", trace]
+                            if setting == "estimates":
+                                cmd.append("--cpu-only")
+                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+                values = " | ".join(f"{median(timings[setting]):.6f}" for setting in settings)
+                print(f"| {arch} | {mode} {unit} | {values} |", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("arch", nargs="*", choices=("arm64", "x86_64"), default=["arm64", "x86_64"])
+    parser.add_argument("--trace-timing", action="store_true", help="compare tracing off, estimates, and GPU samples")
     args = parser.parse_args()
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("FENCEPOST_") and k not in ("DYLD_INSERT_LIBRARIES", "MTL_CAPTURE_ENABLED")}
+    if args.trace_timing:
+        trace_timing(args.arch, env)
+        return
     print("Pipeline timings are measured with a warm shader cache.\n", flush=True)
     print("| slice | measure | without | with fencepost | change |\n|---|---|---|---|---|")
     for arch in args.arch:
